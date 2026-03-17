@@ -1,0 +1,909 @@
+"""IR → ISA instruction sequence code generator."""
+import struct
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from ..isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
+from ..isa.instructions import (
+    MatmulInsn, RequantInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
+    ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
+)
+from .ir import IRNode, IRGraph
+from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
+from .memory_alloc import MemoryAllocator
+
+UNIT = 16
+
+
+def _fp16_to_uint16(val: float) -> int:
+    """Convert FP32 value to FP16 bit pattern as uint16 (little-endian)."""
+    fp16 = np.float16(val)
+    # tobytes() on little-endian system gives LE bytes; interpret as uint16
+    return int(np.frombuffer(fp16.tobytes(), dtype=np.uint16)[0])
+
+
+def _set_addr(addr_reg: int, byte_addr: int) -> List[Instruction]:
+    """Emit SET_ADDR_LO + SET_ADDR_HI to set a 56-bit DRAM address."""
+    lo = byte_addr & 0xFFFFFFF
+    hi = (byte_addr >> 28) & 0xFFFFFFF
+    return [
+        SetAddrLoInsn(addr_reg=addr_reg, imm28=lo),
+        SetAddrHiInsn(addr_reg=addr_reg, imm28=hi),
+    ]
+
+
+class CodeGenerator:
+    """Generate ISA instructions from IR graph."""
+
+    def __init__(self, weight_data: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]],
+                 calibration_scales: Dict[str, float],
+                 prescaled_biases: Dict[str, np.ndarray]):
+        """
+        Args:
+            weight_data: name → (quantized_data, per_channel_scales)
+            calibration_scales: tensor_name → per-tensor activation scale
+            prescaled_biases: name → INT32 pre-scaled bias array
+        """
+        self.weight_data = weight_data
+        self.calibration_scales = calibration_scales
+        self.prescaled_biases = prescaled_biases
+        self.mem = MemoryAllocator()
+        self.instructions: List[Instruction] = []
+        self.dram_layout: Dict[str, int] = {}  # name → dram byte offset
+        self.dram_blob = bytearray()
+        self.next_sreg_single = 0  # index into odd sreg pool (1,3,5,...)
+        self.next_sreg_pair = 0    # index into even sreg pool (0,2,4,...)
+        # Track node outputs that live in DRAM temp (from strip-mined spills)
+        # Maps output_name → DRAM byte offset of the spilled data
+        self.dram_temp_outputs: Dict[str, int] = {}
+
+    def generate(self, graph: IRGraph) -> Tuple[List[Instruction], bytes]:
+        """Generate instructions for the entire IR graph.
+
+        Returns (instructions, dram_data_blob).
+        """
+        # First pass: lay out weights in DRAM
+        self._layout_weights(graph)
+
+        # Compute last-use index for each node output so we can free ABUF
+        last_uses = graph.compute_last_uses()
+
+        # Second pass: emit instructions
+        for idx, node in enumerate(graph.nodes):
+            # Compact ABUF before each layernorm to prevent fragmentation.
+            # Strip-mined MLP ops leave holes; compacting before each LN gives
+            # subsequent head matmuls a contiguous free region.
+            if node.op == "layernorm":
+                self._compact_abuf()
+            self._emit_node(node)
+            # Free ABUF allocations whose last use was this node
+            for inp_name, last_idx in last_uses.items():
+                if last_idx == idx:
+                    alloc = self.mem.abuf.get(inp_name)
+                    if alloc is not None:
+                        self.mem.abuf.free(inp_name)
+                    # Also free per-head sub-allocations (e.g. k_head0, q_head1)
+                    for h in range(3):
+                        self.mem.abuf.free(f"{inp_name}_head{h}")
+
+        self.instructions.append(HaltInsn())
+        return self.instructions, bytes(self.dram_blob)
+
+    def _layout_weights(self, graph: IRGraph):
+        """Pack all weights into DRAM data blob."""
+        offset = 0
+        for name, (data, scales) in self.weight_data.items():
+            blob = data.tobytes()
+            self.dram_layout[name] = offset
+            self.dram_blob.extend(blob)
+            offset += len(blob)
+            # Also store scales if present
+            if scales is not None:
+                scale_name = f"{name}__scales"
+                self.dram_layout[scale_name] = offset
+                scale_blob = scales.tobytes()
+                self.dram_blob.extend(scale_blob)
+                offset += len(scale_blob)
+
+        # Pre-scaled biases
+        for name, bias_i32 in self.prescaled_biases.items():
+            self.dram_layout[name] = offset
+            blob = bias_i32.tobytes()
+            self.dram_blob.extend(blob)
+            offset += len(blob)
+
+        # DRAM temp region for strip-mining starts after all weights
+        self.dram_temp_start = offset
+        # Pad DRAM to alignment
+        while len(self.dram_blob) % UNIT != 0:
+            self.dram_blob.append(0)
+
+    def _alloc_sreg(self) -> int:
+        """Allocate a single scale register from the odd pool (1,3,5,7,9,11,13).
+
+        Singles and pairs use separate pools so they never overwrite each other.
+        Scale registers are set immediately before use so wrapping is safe.
+        """
+        ODD_POOL = [1, 3, 5, 7, 9, 11, 13]
+        reg = ODD_POOL[self.next_sreg_single % len(ODD_POOL)]
+        self.next_sreg_single = (self.next_sreg_single + 1) % len(ODD_POOL)
+        return reg
+
+    def _alloc_sreg_pair(self) -> int:
+        """Allocate a consecutive pair of scale registers from the even pool (0,2,4,...,12).
+
+        Returns the lower (even) register; caller uses (reg, reg+1).
+        Pairs and singles use separate pools so they never overwrite each other.
+        """
+        PAIR_POOL = [0, 2, 4, 6, 8, 10, 12]
+        reg = PAIR_POOL[self.next_sreg_pair % len(PAIR_POOL)]
+        self.next_sreg_pair = (self.next_sreg_pair + 1) % len(PAIR_POOL)
+        return reg
+
+    def _emit(self, insn: Instruction):
+        self.instructions.append(insn)
+
+    def _emit_node(self, node: IRNode):
+        """Emit instructions for a single IR node."""
+        op = node.op
+        if op == "matmul":
+            self._emit_matmul(node)
+        elif op == "matmul_qkt":
+            self._emit_qkt(node)
+        elif op == "matmul_attn_v":
+            self._emit_attn_v(node)
+        elif op == "layernorm":
+            self._emit_layernorm(node)
+        elif op == "softmax":
+            self._emit_softmax(node)
+        elif op == "gelu":
+            self._emit_gelu(node)
+        elif op == "scale_mul":
+            self._emit_scale_mul(node)
+        elif op == "vadd":
+            self._emit_vadd(node)
+        elif op == "cls_prepend":
+            self._emit_cls_prepend(node)
+        elif op == "pos_embed_add":
+            self._emit_pos_embed_add(node)
+        elif op == "cls_extract":
+            self._emit_cls_extract(node)
+        elif op == "reshape_heads":
+            pass  # No-op, handled by matmul_qkt
+        elif op == "concat_heads":
+            self._emit_concat_heads(node)
+
+    def _emit_matmul(self, node: IRNode):
+        """Emit a standard linear matmul with optional bias."""
+        M, N = node.output_shape
+        weight_name = node.inputs[1]
+        weight_data = self.weight_data.get(weight_name)
+        if weight_data is None:
+            return
+
+        w_q, w_scales = weight_data
+        # Weights are stored transposed as [K_in_pad, N_out_pad]; K is dim 0.
+        K = w_q.shape[0] if w_q.ndim == 2 else w_q.shape[0]
+
+        # Check if strip-mining is needed:
+        # - INT8 output exceeds ABUF (128 KB), OR
+        # - INT32 intermediate exceeds ACCUM (64 KB)
+        strip_mine = node.attrs.get("strip_mine", False)
+        output_bytes = pad_dim(M) * pad_dim(N)
+        accum_bytes = pad_dim(M) * pad_dim(N) * 4  # INT32 intermediate
+        if output_bytes > 128 * 1024 or accum_bytes > 64 * 1024:
+            strip_mine = True
+
+        if strip_mine:
+            self._emit_matmul_strip_mined(node, M, N, K, w_q, w_scales)
+        else:
+            self._emit_matmul_simple(node, M, N, K, w_q, w_scales)
+
+    def _emit_matmul_simple(self, node: IRNode, M: int, N: int, K: int,
+                            w_q: np.ndarray, w_scales: np.ndarray):
+        """Emit a simple (non-strip-mined) matmul."""
+        weight_name = node.inputs[1]
+        M_pad = pad_dim(M)
+        N_pad = pad_dim(N)
+        # Weights are stored transposed as [K_in_pad, N_out_pad]; K is dim 0.
+        K = w_q.shape[0] if w_q.ndim == 2 else w_q.shape[0]
+        K_pad = pad_dim(K)
+
+        # Load weights to WBUF via allocator so live attn@V outputs are not clobbered.
+        # (Previously hardcoded to offset 0, which overwrote head N-1's attn@V output
+        # when loading head N's Q/K/V weights, destroying per-image information.)
+        dram_off = self.dram_layout.get(weight_name, 0)
+        weight_bytes = w_q.size
+        w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
+        self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))  # wait DMA
+
+        # CONFIG_TILE
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        k_tiles = K_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))
+
+        # Allocate ABUF regions
+        act_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                    self.mem.abuf.alloc(node.inputs[0], M_pad * K_pad)
+        act_off = act_alloc.offset_units
+
+        # MATMUL
+        self._emit(MatmulInsn(
+            src1_buf=BUF_ABUF, src1_off=act_off,
+            src2_buf=BUF_WBUF, src2_off=w_alloc.offset_units,
+            dst_buf=BUF_ACCUM, dst_off=0,
+            flags=0,
+        ))
+        self._emit(SyncInsn(resource_mask=0b010))  # wait systolic
+
+        # Free weight allocation (no longer needed after MATMUL)
+        self.mem.wbuf.free(f"_w_{weight_name}")
+
+        # Bias add if present
+        bias_name = node.attrs.get("bias")
+        if bias_name and bias_name in self.prescaled_biases:
+            self._emit_bias_add(bias_name, N_pad, m_tiles)
+
+        # Requantize: scale = input_act_scale × mean(weight_scale) / target_act_scale
+        input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+        mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+        requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+        sreg = self._alloc_sreg()
+        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+
+        # Allocate output in ABUF
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+        self._emit(RequantInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            sreg=sreg,
+        ))
+
+    def _emit_matmul_strip_mined(self, node: IRNode, M: int, N: int, K: int,
+                                  w_q: np.ndarray, w_scales: np.ndarray):
+        """Emit strip-mined matmul for large outputs (e.g., FC1 768-wide).
+
+        Handles two input modes:
+          - Input in ABUF: read strips directly (FC1 case)
+          - Input in DRAM temp: load each strip from DRAM to ABUF first (FC2 case)
+        """
+        weight_name = node.inputs[1]
+        M_pad = pad_dim(M)
+        N_pad = pad_dim(N)
+        # Weights stored transposed as [K_in_pad, N_out_pad]; K is dim 0.
+        K = w_q.shape[0] if w_q.ndim == 2 else w_q.shape[0]
+        K_pad = pad_dim(K)
+        strip_rows = TILE
+
+        # Load weights to WBUF via allocator so live WBUF data is not clobbered.
+        dram_off = self.dram_layout.get(weight_name, 0)
+        weight_bytes = w_q.size
+        w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
+        self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        # Allocate DRAM temp for output strips
+        dram_temp_off = self.dram_temp_start + self.mem.alloc_dram_temp(
+            f"{node.name}_temp", M_pad * N_pad)
+
+        num_strips = M_pad // strip_rows
+
+        # Determine if input is in DRAM temp (spilled by a previous strip-mined op)
+        input_name = node.inputs[0]
+        input_dram_off = self.dram_temp_outputs.get(input_name)
+        input_from_dram = input_dram_off is not None
+
+        if not input_from_dram:
+            act_alloc = self.mem.abuf.get(input_name) or \
+                        self.mem.abuf.alloc(input_name, M_pad * K_pad)
+
+        for s in range(num_strips):
+            # If input is in DRAM, load this strip to a temp ABUF region
+            if input_from_dram:
+                strip_input_alloc = self.mem.abuf.alloc(
+                    f"{node.name}_instrip{s}", strip_rows * K_pad)
+                strip_src_dram = input_dram_off + s * strip_rows * K_pad
+                self._emit_dma_load(BUF_ABUF, strip_input_alloc.offset_units,
+                                    strip_rows * K_pad, 3, strip_src_dram)
+                self._emit(SyncInsn(resource_mask=0b001))
+                strip_act_off = strip_input_alloc.offset_units
+            else:
+                strip_act_off = act_alloc.offset_units + (s * strip_rows * K_pad) // UNIT
+
+            # CONFIG_TILE for one strip
+            n_tiles = N_pad // TILE
+            k_tiles = K_pad // TILE
+            self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
+
+            # MATMUL for strip
+            self._emit(MatmulInsn(
+                src1_buf=BUF_ABUF, src1_off=strip_act_off,
+                src2_buf=BUF_WBUF, src2_off=w_alloc.offset_units,
+                dst_buf=BUF_ACCUM, dst_off=0,
+                flags=0,
+            ))
+            self._emit(SyncInsn(resource_mask=0b010))
+
+            # Free input strip if loaded from DRAM
+            if input_from_dram:
+                self.mem.abuf.free(f"{node.name}_instrip{s}")
+
+            # Bias add
+            bias_name = node.attrs.get("bias")
+            if bias_name and bias_name in self.prescaled_biases:
+                self._emit_bias_add(bias_name, N_pad, 1)
+
+            # Requantize strip: scale = input_act_scale × mean(weight_scale) / target_act_scale
+            input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+            target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+            mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+            requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+            sreg = self._alloc_sreg()
+            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+
+            strip_out_off = self.mem.abuf.alloc(f"{node.name}_strip{s}", strip_rows * N_pad).offset_units
+            self._emit(RequantInsn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                sreg=sreg,
+            ))
+
+            # Inline GELU if requested
+            gelu_name = node.attrs.get("inline_gelu")
+            if gelu_name:
+                gelu_sreg = self._alloc_sreg_pair()
+                gelu_in_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+                gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
+                self._emit(SetScaleInsn(sreg=gelu_sreg, src_mode=0,
+                                        imm16=_fp16_to_uint16(gelu_in_scale)))
+                self._emit(SetScaleInsn(sreg=gelu_sreg + 1, src_mode=0,
+                                        imm16=_fp16_to_uint16(gelu_out_scale)))
+                self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
+                self._emit(GeluInsn(
+                    src1_buf=BUF_ABUF, src1_off=strip_out_off,
+                    dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                    sreg=gelu_sreg,
+                ))
+                self._emit(SyncInsn(resource_mask=0b100))
+
+            # Spill strip (post-GELU if inline) to DRAM
+            strip_dram_off = dram_temp_off + s * strip_rows * N_pad
+            self._emit_dma_store(BUF_ABUF, strip_out_off, strip_rows * N_pad, 2, strip_dram_off)
+            self._emit(SyncInsn(resource_mask=0b001))
+            self.mem.abuf.free(f"{node.name}_strip{s}")
+
+        # Free weight allocation (no longer needed after all strips are processed)
+        self.mem.wbuf.free(f"_w_{weight_name}")
+
+        # Register output as DRAM-temp resident
+        self.dram_temp_outputs[node.name] = dram_temp_off
+
+        # Record placeholder allocation for downstream nodes
+        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
+        out_alloc.size_bytes = M_pad * N_pad  # real size is in DRAM
+
+    def _emit_bias_add(self, bias_name: str, N_pad: int, m_tiles: int):
+        """Emit bias load + VADD to accumulator."""
+        bias_dram_off = self.dram_layout.get(bias_name, 0)
+        bias_bytes = N_pad * 4  # INT32
+
+        # Load bias to WBUF (temporary location after weights)
+        bias_wbuf_off = self.mem.wbuf.alloc(f"bias_{bias_name}", bias_bytes).offset_units
+        self._emit_dma_load(BUF_WBUF, bias_wbuf_off, bias_bytes, 1, bias_dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        # VADD: ACCUM += WBUF[bias] (INT32 add with broadcast)
+        self._emit(VaddInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_WBUF, src2_off=bias_wbuf_off,
+            dst_buf=BUF_ACCUM, dst_off=0,
+        ))
+
+        self.mem.wbuf.free(f"bias_{bias_name}")
+
+    def _emit_qkt(self, node: IRNode):
+        """Emit Q@K^T attention matmul, strip-mined over Q's M dimension.
+
+        Full [208,208] INT32 would need 173KB in ACCUM (only 64KB available).
+        Instead process 16-row strips: each [16,208] INT32 = 13KB ≤ 64KB.
+        REQUANT each strip to INT8 → WBUF immediately.
+        After all strips, WBUF holds [208,208] INT8 = 43KB for downstream softmax.
+        """
+        head_idx = node.attrs["head_idx"]
+        seq_len = node.output_shape[0]
+        head_dim = 64  # DeiT-tiny
+        M_pad = pad_dim(seq_len)
+        K_pad = pad_dim(head_dim)
+        num_strips = M_pad // TILE  # 13 strips of 16 rows
+
+        # BUF_COPY K_h → WBUF (transpose) to get K^T [64,208]
+        k_alloc = self.mem.abuf.get(node.inputs[1])
+        if k_alloc is None:
+            k_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * head_dim)
+
+        src_rows = M_pad // TILE
+        length_units = (M_pad * K_pad) // UNIT
+        kt_wbuf = self.mem.wbuf.alloc(f"kt_head{head_idx}", K_pad * M_pad)
+        self._emit(BufCopyInsn(
+            src_buf=BUF_ABUF, src_off=k_alloc.offset_units,
+            dst_buf=BUF_WBUF, dst_off=kt_wbuf.offset_units,
+            length=length_units,
+            src_rows=src_rows,
+            transpose=1,
+        ))
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        q_alloc = self.mem.abuf.get(node.inputs[0])
+        if q_alloc is None:
+            q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * head_dim)
+
+        # Output: full [208,208] INT8 in WBUF
+        qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * M_pad)
+
+        n_tiles = M_pad // TILE
+        k_tiles = K_pad // TILE
+        act_scale_q = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+        act_scale_k = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
+        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+
+        for s in range(num_strips):
+            # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
+            self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
+
+            # Q strip offset: s * 16 rows * K_pad cols
+            q_strip_off = q_alloc.offset_units + (s * TILE * K_pad) // UNIT
+            self._emit(MatmulInsn(
+                src1_buf=BUF_ABUF, src1_off=q_strip_off,
+                src2_buf=BUF_WBUF, src2_off=kt_wbuf.offset_units,
+                dst_buf=BUF_ACCUM, dst_off=0,
+                flags=0,
+            ))
+            self._emit(SyncInsn(resource_mask=0b010))
+
+            # REQUANT [16,208] strip: scale = q_act_scale * k_act_scale * attn_scale / target_act_scale
+            # NOTE: ×0.125 (1/sqrt(d_head=64)) is folded in here because
+            #       _emit_scale_mul is a no-op that expects it already baked in.
+            attn_scaling = node.attrs.get("scale", 0.125)
+            requant_scale_f = act_scale_q * act_scale_k * attn_scaling / max(target_act_scale, 1e-12)
+            sreg = self._alloc_sreg()
+            self._emit(SetScaleInsn(sreg=sreg, src_mode=0,
+                                    imm16=_fp16_to_uint16(requant_scale_f)))
+            strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
+            self._emit(RequantInsn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
+                sreg=sreg,
+            ))
+
+        self.mem.wbuf.free(f"kt_head{head_idx}")
+
+    def _emit_attn_v(self, node: IRNode):
+        """Emit attention @ V matmul.
+
+        attn scores are in WBUF (from softmax in-place).
+        V_h is in ABUF. MATMUL src1=WBUF[attn], src2=ABUF[V].
+        After matmul, free both attn (WBUF) and V (ABUF via last-use).
+        """
+        head_idx = node.attrs["head_idx"]
+        seq_len = node.output_shape[0]
+        head_dim = node.output_shape[1]
+        M_pad = pad_dim(seq_len)
+        N_pad = pad_dim(head_dim)
+
+        # attn scores in WBUF under the softmax node name
+        attn_alloc = self.mem.wbuf.get(node.inputs[0])
+        if attn_alloc is None:
+            attn_alloc = self.mem.wbuf.alloc(node.inputs[0], M_pad * M_pad)
+
+        # V_h is the per-head ABUF allocation
+        v_alloc = self.mem.abuf.get(node.inputs[1])
+        if v_alloc is None:
+            v_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * N_pad)
+
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        k_tiles = M_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=k_tiles - 1))
+
+        # MATMUL: attn(WBUF) @ V(ABUF) → ACCUM
+        self._emit(MatmulInsn(
+            src1_buf=BUF_WBUF, src1_off=attn_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=v_alloc.offset_units,
+            dst_buf=BUF_ACCUM, dst_off=0,
+            flags=0,
+        ))
+        self._emit(SyncInsn(resource_mask=0b010))
+
+        # Free attn scores from WBUF
+        self.mem.wbuf.free(node.inputs[0])
+        # Also free the scale_mul intermediate if still present
+        for inp in node.inputs:
+            self.mem.wbuf.free(inp)
+
+        # Requantize: attn (INT8 softmax output) @ V (INT8 activation)  → INT32
+        # requant_scale = attn_scale * v_scale / target_act_scale
+        # attn_scale is the calibrated softmax output scale (max_prob/127 per head).
+        # Using 1/127 would overestimate by 1/max_prob (up to 4×), causing heavy clipping.
+        attn_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
+        v_scale = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
+        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+        requant_scale_f = attn_scale * v_scale / max(target_act_scale, 1e-12)
+        sreg = self._alloc_sreg()
+        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+        out_alloc = self.mem.wbuf.alloc(node.name, M_pad * N_pad)
+        self._emit(RequantInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            dst_buf=BUF_WBUF, dst_off=out_alloc.offset_units,
+            sreg=sreg,
+        ))
+
+    def _emit_concat_heads(self, node: IRNode):
+        """BUF_COPY per-head outputs from WBUF into a contiguous ABUF region.
+
+        Each head's attn_v output [M_pad, head_dim] is in WBUF. We interleave
+        them into ABUF to form the correct [M_pad, num_heads*head_dim] layout
+        required by the out_proj matmul.
+
+        The matmul reads activations as row-major [M, K], so each output row t
+        must contain all heads' data for that token:
+            ABUF[out + t*K_total : out + t*K_total + K_total] = [h0[t], h1[t], ..., hH[t]]
+
+        BufCopy only supports flat (non-strided) copies, so we emit one copy
+        per token per head (row_units = head_dim / UNIT = 4 units per copy):
+            src: WBUF[head_h + t * row_units]
+            dst: ABUF[out  + t * out_row_units + h * row_units]
+        """
+        head_dim = 64
+        seq_len = node.output_shape[0]
+        M_pad = pad_dim(seq_len)
+        N_pad = pad_dim(head_dim)
+        num_heads = len(node.inputs)
+
+        total_out_dim = num_heads * N_pad          # 192 bytes per token
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * total_out_dim)
+
+        row_units     = N_pad // UNIT              # units per token row per head (=4)
+        out_row_units = total_out_dim // UNIT      # units per token row total   (=12)
+
+        for h, inp_name in enumerate(node.inputs):
+            src_alloc = self.mem.wbuf.get(inp_name)
+            if src_alloc is None:
+                continue
+            for t in range(M_pad):                 # one copy per token
+                src_off = src_alloc.offset_units + t * row_units
+                dst_off = out_alloc.offset_units + t * out_row_units + h * row_units
+                self._emit(BufCopyInsn(
+                    src_buf=BUF_WBUF, src_off=src_off,
+                    dst_buf=BUF_ABUF, dst_off=dst_off,
+                    length=row_units,
+                ))
+                self._emit(SyncInsn(resource_mask=0b001))
+            self.mem.wbuf.free(inp_name)
+
+    def _emit_scale_mul(self, node: IRNode):
+        """Attention scale_mul (×0.125) is already baked into QKT's REQUANT.
+
+        The QKT strip-mined codegen folds the ×0.125 scale into the requant
+        scale and writes INT8 directly to WBUF. So this node is a no-op:
+        just rename the WBUF allocation from the QKT node to this node's name.
+
+        Critically, we propagate the calibration scale from the QKT input to
+        this output name so that downstream SFU nodes (softmax) dequantize at
+        the correct scale.  Without this, softmax would fall back to 1/127
+        (6× too small), producing near-uniform attention weights that destroy
+        image-specific information in the CLS token.
+        """
+        in_alloc = self.mem.wbuf.get(node.inputs[0])
+        if in_alloc is not None:
+            # Rename in-place: pop the old key and re-insert under the new name
+            # without touching the free list (free() would double-book the region).
+            alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
+            self.mem.wbuf.allocations[node.name] = alloc
+
+        # Propagate the QKT output scale to this node's name.  The underlying
+        # WBUF data was quantized at the QKT target scale; override whatever
+        # the caller supplied so softmax uses the right dequant scale.
+        self.calibration_scales[node.name] = self.calibration_scales.get(
+            node.inputs[0], 6.0 / 127.0
+        )
+
+    def _emit_softmax(self, node: IRNode):
+        """Emit SOFTMAX SFU instruction.
+
+        Attention scores live in WBUF (placed there by _emit_scale_mul).
+        Softmax is done in-place: same WBUF slot, renamed for downstream.
+        """
+        M_pad = pad_dim(node.output_shape[0])
+        N_pad = pad_dim(node.output_shape[1])
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+
+        sreg = self._alloc_sreg_pair()
+        in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
+        out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
+        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+
+        # Input is in WBUF (from scale_mul); output written to same slot (in-place)
+        in_alloc = self.mem.wbuf.get(node.inputs[0])
+        if in_alloc is None:
+            in_alloc = self.mem.wbuf.alloc(node.inputs[0], M_pad * N_pad)
+        # Rename in-place: pop old key, re-insert under output name.
+        # Do NOT call free() here — that would double-book the region in the free list.
+        if node.inputs[0] in self.mem.wbuf.allocations:
+            alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
+            self.mem.wbuf.allocations[node.name] = alloc
+        self._emit(SoftmaxInsn(
+            src1_buf=BUF_WBUF, src1_off=in_alloc.offset_units,
+            dst_buf=BUF_WBUF, dst_off=in_alloc.offset_units,
+            sreg=sreg,
+        ))
+        self._emit(SyncInsn(resource_mask=0b100))
+
+    def _emit_gelu(self, node: IRNode):
+        """Emit GELU SFU instruction (no-op if inlined with a strip-mined matmul)."""
+        if node.attrs.get("inline_with"):
+            # GELU was applied inline in the strip-mined FC1 loop.
+            # Propagate DRAM temp tracking and rename the ABUF placeholder.
+            fc1_name = node.inputs[0]
+            if fc1_name in self.dram_temp_outputs:
+                self.dram_temp_outputs[node.name] = self.dram_temp_outputs[fc1_name]
+            # Rename fc1's allocation to the gelu node name (transfer ownership).
+            # Do NOT create a second Allocation pointing at the same bytes — that
+            # would cause a double-free when the generate loop frees both fc1 and
+            # gelu at their respective last-use indices.
+            fc1_alloc = self.mem.abuf.allocations.pop(fc1_name, None)
+            if fc1_alloc is not None:
+                fc1_alloc.name = node.name
+                self.mem.abuf.allocations[node.name] = fc1_alloc
+            return
+        M_pad = pad_dim(node.output_shape[0])
+        N_pad = pad_dim(node.output_shape[1])
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+
+        sreg = self._alloc_sreg_pair()
+        in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
+        out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
+        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+
+        in_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                   self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+        self._emit(GeluInsn(
+            src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            sreg=sreg,
+        ))
+        self._emit(SyncInsn(resource_mask=0b100))
+
+    def _emit_layernorm(self, node: IRNode):
+        """Emit LAYERNORM SFU instruction."""
+        M_pad = pad_dim(node.output_shape[0])
+        N_pad = pad_dim(node.output_shape[1])
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+
+        sreg = self._alloc_sreg_pair()
+        in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
+        out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
+        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
+
+        # Load gamma/beta to WBUF
+        gamma_name = node.inputs[1]
+        beta_name = node.inputs[2]
+        gamma_data = self.weight_data.get(gamma_name)
+        beta_data = self.weight_data.get(beta_name)
+
+        if gamma_data is not None and beta_data is not None:
+            gamma_dram = self.dram_layout.get(gamma_name, 0)
+            beta_dram = self.dram_layout.get(beta_name, 0)
+            # Pack gamma then beta in WBUF
+            gb_bytes = N_pad * 4  # gamma[N] FP16 + beta[N] FP16 = N*4 bytes
+            gb_alloc = self.mem.wbuf.alloc(f"gb_{node.name}", gb_bytes)
+            self._emit_dma_load(BUF_WBUF, gb_alloc.offset_units, N_pad * 2, 1, gamma_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+            # Load beta right after gamma
+            beta_off = gb_alloc.offset_units + (N_pad * 2) // UNIT
+            self._emit_dma_load(BUF_WBUF, beta_off, N_pad * 2, 1, beta_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+
+        in_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                   self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
+        gb_alloc = self.mem.wbuf.get(f"gb_{node.name}")
+        gb_off = gb_alloc.offset_units if gb_alloc else 0
+
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+        self._emit(LayernormInsn(
+            src1_buf=BUF_ABUF, src1_off=in_alloc.offset_units,
+            src2_buf=BUF_WBUF, src2_off=gb_off,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            sreg=sreg,
+        ))
+        self._emit(SyncInsn(resource_mask=0b100))
+
+        if gb_alloc:
+            self.mem.wbuf.free(f"gb_{node.name}")
+
+    def _load_dram_to_abuf(self, input_name: str, M_pad: int, N_pad: int) -> 'Allocation':
+        """Load a DRAM-temp-resident tensor into ABUF and return the allocation."""
+        dram_off = self.dram_temp_outputs[input_name]
+        # Free the small strip-mine placeholder before allocating the full tensor.
+        # The placeholder (strip_rows * N_pad bytes) was created by _emit_matmul_strip_mined;
+        # if we don't free it first, alloc() would overwrite it in the dict without
+        # returning its bytes to the free list, causing a permanent memory leak.
+        if self.mem.abuf.get(input_name) is not None:
+            self.mem.abuf.free(input_name)
+        alloc = self.mem.abuf.alloc(input_name, M_pad * N_pad)
+        self._emit_dma_load(BUF_ABUF, alloc.offset_units, M_pad * N_pad, 3, dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+        return alloc
+
+    def _emit_vadd(self, node: IRNode):
+        """Emit VADD for residual connection (INT8 saturating add).
+
+        Handles the case where one input is DRAM-resident (strip-mined output)
+        by loading it into ABUF first.
+        """
+        M_pad = pad_dim(node.output_shape[0])
+        N_pad = pad_dim(node.output_shape[1])
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+
+        # Resolve src1 — load from DRAM if needed
+        if node.inputs[0] in self.dram_temp_outputs:
+            src1_alloc = self._load_dram_to_abuf(node.inputs[0], M_pad, N_pad)
+            free_src1 = True
+        else:
+            src1_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                         self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
+            free_src1 = False
+
+        # Resolve src2 — load from DRAM if needed
+        if node.inputs[1] in self.dram_temp_outputs:
+            src2_alloc = self._load_dram_to_abuf(node.inputs[1], M_pad, N_pad)
+            free_src2 = True
+        else:
+            src2_alloc = self.mem.abuf.get(node.inputs[1]) or \
+                         self.mem.abuf.alloc(node.inputs[1], M_pad * N_pad)
+            free_src2 = False
+
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+
+        # Write result in-place into src2's slot to avoid a third ABUF allocation.
+        # (src2 is residual1 whose last use is this VADD, so overwriting is safe.)
+        self._emit(VaddInsn(
+            src1_buf=BUF_ABUF, src1_off=src1_alloc.offset_units,
+            src2_buf=BUF_ABUF, src2_off=src2_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=src2_alloc.offset_units,
+        ))
+
+        # Free temporary ABUF slot used for the DRAM-loaded src1
+        if free_src1:
+            self.mem.abuf.free(node.inputs[0])
+
+        # Rename src2's allocation to the output node name
+        alloc = self.mem.abuf.allocations.pop(node.inputs[1], None)
+        if alloc is not None:
+            alloc.name = node.name
+            self.mem.abuf.allocations[node.name] = alloc
+
+    def _emit_cls_prepend(self, node: IRNode):
+        """Emit CLS token prepend: load CLS to ABUF[0], patch embed starts at offset 12."""
+        cls_name = node.inputs[1]
+        cls_dram = self.dram_layout.get(cls_name, 0)
+        # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units
+        self._emit_dma_load(BUF_ABUF, 0, 192, 0, cls_dram)
+        self._emit(SyncInsn(resource_mask=0b001))
+        # Mark allocation
+        self.mem.abuf.alloc(node.name, pad_dim(197) * 192, evictable=False)
+
+    def _emit_pos_embed_add(self, node: IRNode):
+        """Emit position embedding add."""
+        pos_name = node.inputs[1]
+        pos_dram = self.dram_layout.get(pos_name, 0)
+        M_pad = pad_dim(197)
+        N = 192
+        N_pad = pad_dim(N)
+
+        # Load pos_embed to WBUF [208, 192] (pre-padded at compile time)
+        pos_bytes = M_pad * N_pad
+        pos_alloc = self.mem.wbuf.alloc("pos_embed", pos_bytes)
+        self._emit_dma_load(BUF_WBUF, pos_alloc.offset_units, pos_bytes, 0, pos_dram)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        # CONFIG_TILE for VADD
+        m_tiles = M_pad // TILE
+        n_tiles = N_pad // TILE
+        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+
+        act_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                    self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
+
+        # VADD: activations + pos_embed (both INT8, same scale)
+        out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
+        self._emit(VaddInsn(
+            src1_buf=BUF_ABUF, src1_off=act_alloc.offset_units,
+            src2_buf=BUF_WBUF, src2_off=pos_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+        ))
+
+        self.mem.wbuf.free("pos_embed")
+
+    def _emit_cls_extract(self, node: IRNode):
+        """Extract CLS token (row 0) via BUF_COPY."""
+        N = 192
+        in_alloc = self.mem.abuf.get(node.inputs[0]) or \
+                   self.mem.abuf.alloc(node.inputs[0], pad_dim(197) * pad_dim(N))
+        out_alloc = self.mem.abuf.alloc(node.name, pad_dim(N))
+        # Copy 192 bytes = 12 × 16-byte units
+        self._emit(BufCopyInsn(
+            src_buf=BUF_ABUF, src_off=in_alloc.offset_units,
+            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            length=N // UNIT,
+        ))
+
+    def _compact_abuf(self):
+        """Defragment ABUF by moving live allocations to lower addresses.
+
+        Emits BUF_COPY instructions to slide live allocations leftward so all
+        free space is consolidated into one contiguous block at the top.
+        Updates allocation offsets so subsequent alloc() calls see the new layout.
+
+        The simulator's execute_buf_copy reads source bytes before writing, so
+        overlapping intra-ABUF copies (src > dst with partial overlap) are safe.
+        """
+        if not self.mem.abuf.allocations:
+            return
+        # Sort live allocations by current offset ascending (pack left to right)
+        live = sorted(self.mem.abuf.allocations.values(), key=lambda a: a.offset_units)
+        new_offset = 0
+        any_moved = False
+        for alloc in live:
+            if alloc.offset_units != new_offset:
+                self._emit(BufCopyInsn(
+                    src_buf=BUF_ABUF, src_off=alloc.offset_units,
+                    dst_buf=BUF_ABUF, dst_off=new_offset,
+                    length=alloc.size_units,
+                ))
+                self._emit(SyncInsn(resource_mask=0b001))
+                alloc.offset_units = new_offset
+                any_moved = True
+            new_offset += alloc.size_units
+        if any_moved:
+            # Rebuild free list as one contiguous block at the top
+            self.mem.abuf._free = [(new_offset, self.mem.abuf.capacity_units - new_offset)]
+
+    def _emit_dma_load(self, buf_id: int, sram_off_units: int, size_bytes: int,
+                       addr_reg: int, dram_byte_offset: int):
+        """Emit SET_ADDR + LOAD sequence."""
+        self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        xfer_units = (size_bytes + UNIT - 1) // UNIT
+        self._emit(LoadInsn(
+            buf_id=buf_id,
+            sram_off=sram_off_units,
+            xfer_len=min(xfer_units, 0xFFFF),
+            addr_reg=addr_reg,
+            dram_off=0,
+        ))
+
+    def _emit_dma_store(self, buf_id: int, sram_off_units: int, size_bytes: int,
+                        addr_reg: int, dram_byte_offset: int):
+        """Emit SET_ADDR + STORE sequence."""
+        self.instructions.extend(_set_addr(addr_reg, dram_byte_offset))
+        xfer_units = (size_bytes + UNIT - 1) // UNIT
+        self._emit(StoreInsn(
+            buf_id=buf_id,
+            sram_off=sram_off_units,
+            xfer_len=min(xfer_units, 0xFFFF),
+            addr_reg=addr_reg,
+            dram_off=0,
+        ))
