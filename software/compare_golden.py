@@ -239,7 +239,9 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None) -> dic
 
         fc1_scale = get(f"{p}.intermediate.dense")
         scales[f"{b}_fc1"] = fc1_scale
-        scales[f"{b}_gelu"] = fc1_scale
+        # Post-GELU range is 2-3.5× smaller than pre-GELU (negatives become ~0).
+        # GELUActivation is a leaf module so calibration captures its output directly.
+        scales[f"{b}_gelu"] = get(f"{p}.intermediate.intermediate_act_fn", fc1_scale)
 
         # Force fc2 REQUANT to block_input_scale so that the residual2 VADD
         # (residual1_output + fc2_output) has both operands at the same scale.

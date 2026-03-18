@@ -112,6 +112,16 @@ class CodeGenerator:
             self.dram_blob.extend(blob)
             offset += len(blob)
 
+        # Zero-pad blob: used to mask attention padding rows (K and V) before QKT.
+        # Padding rows 197-207 are zero in the input but LN(zero_row) = beta (non-zero),
+        # which propagates through QKV projections. Zeroing K/V rows 197-207 eliminates
+        # the beta-derived attention contribution from padding tokens.
+        # Size: 11 padding rows × 64 bytes (head_dim, which equals K_pad) = 704 bytes.
+        _zero_pad_size = 11 * 64
+        self.dram_layout["__zero_pad__"] = offset
+        self.dram_blob.extend(bytes(_zero_pad_size))
+        offset += _zero_pad_size
+
         # DRAM temp region for strip-mining starts after all weights
         self.dram_temp_start = offset
         # Pad DRAM to alignment
@@ -424,6 +434,17 @@ class CodeGenerator:
         if k_alloc is None:
             k_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * head_dim)
 
+        # Zero out K rows for padding positions (197-207).
+        # LN(zero_row) = layernorm_beta (non-zero), so K[padding] = W_k @ beta + b_k.
+        # Zeroing removes this contribution so padding columns don't steer attention.
+        real_seq = node.output_shape[0]
+        if M_pad > real_seq:
+            pad_rows = M_pad - real_seq
+            k_pad_units = k_alloc.offset_units + (real_seq * K_pad) // UNIT
+            self._emit_dma_load(BUF_ABUF, k_pad_units, pad_rows * K_pad, 3,
+                                self.dram_layout.get("__zero_pad__", 0))
+            self._emit(SyncInsn(resource_mask=0b001))
+
         src_rows = M_pad // TILE
         length_units = (M_pad * K_pad) // UNIT
         kt_wbuf = self.mem.wbuf.alloc(f"kt_head{head_idx}", K_pad * M_pad)
@@ -502,6 +523,17 @@ class CodeGenerator:
         v_alloc = self.mem.abuf.get(node.inputs[1])
         if v_alloc is None:
             v_alloc = self.mem.abuf.alloc(node.inputs[1], M_pad * N_pad)
+
+        # Zero out V rows for padding positions (197-207).
+        # Same reason as K: LN(zero_row) = beta propagates non-zero values into V.
+        # Zeroing V ensures padding positions contribute nothing to attn@V output.
+        real_seq = node.output_shape[0]
+        if M_pad > real_seq:
+            pad_rows = M_pad - real_seq
+            v_pad_units = v_alloc.offset_units + (real_seq * N_pad) // UNIT
+            self._emit_dma_load(BUF_ABUF, v_pad_units, pad_rows * N_pad, 3,
+                                self.dram_layout.get("__zero_pad__", 0))
+            self._emit(SyncInsn(resource_mask=0b001))
 
         m_tiles = M_pad // TILE
         n_tiles = N_pad // TILE
