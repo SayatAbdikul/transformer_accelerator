@@ -144,6 +144,11 @@ class Simulator:
         """REQUANT: INT32 → INT8 via scale register.
 
         dst = clip(round(src1 × S[sreg]), -128, 127)
+
+        Scale register holds FP16; widened to FP32 for the multiply.
+        Rounding: round-half-to-even (numpy default).
+        INT32 inputs are exact in FP32 for the accumulator range used here
+        (max |acc| = 197 tokens × 127² ≈ 3.2M << 2^24 FP32 exact limit).
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -153,17 +158,13 @@ class Simulator:
         M = m_tiles * 16
         N = n_tiles * 16
 
-        scale = float(self.state.scale_regs[insn.sreg])
+        # FP16 scale register widened to FP32 — no extra precision introduced
+        scale = np.float32(self.state.scale_regs[insn.sreg])
 
-        # Read INT32 source
         src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
 
-        # Requantize using Python int arithmetic for bit-accuracy
-        result = np.zeros((M, N), dtype=np.int8)
-        for i in range(M):
-            for j in range(N):
-                val = int(round(float(int(src[i, j])) * scale))
-                result[i, j] = clip_int8(val)
+        # Multiply in FP32, round-half-to-even, clip to INT8
+        result = np.clip(np.round(src.astype(np.float32) * scale), -128, 127).astype(np.int8)
 
         mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
         self.state.cycle_count += M * N
@@ -171,8 +172,11 @@ class Simulator:
     def _exec_scale_mul(self, insn):
         """SCALE_MUL: multiply tile by scale.
 
-        When src is ACCUM (INT32): dst = clip(round(float(src) × float(scale)), INT32_MIN, INT32_MAX)
-        When src is ABUF (INT8): dst = clip(round(float(src) × float(scale)), -128, 127)
+        When src is ACCUM (INT32): dst = clip(round(src × scale), INT32_MIN, INT32_MAX)
+        When src is ABUF (INT8):   dst = clip(round(src × scale), -128, 127)
+
+        Scale register holds FP16; widened to FP32 for the multiply.
+        Rounding: round-half-to-even (numpy default).
         """
         if self.state.tile_config is None:
             raise ConfigError("CONFIG_TILE not set")
@@ -182,23 +186,19 @@ class Simulator:
         M = m_tiles * 16
         N = n_tiles * 16
 
-        scale = float(self.state.scale_regs[insn.sreg])
+        # FP16 scale register widened to FP32 — no extra precision introduced
+        scale = np.float32(self.state.scale_regs[insn.sreg])
 
         if insn.src1_buf == BUF_ACCUM:
-            # INT32 path
+            # INT32 path: multiply in FP32, clip to INT32
             src = mem.read_int32_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
-            result = np.zeros((M, N), dtype=np.int32)
-            for i in range(M):
-                for j in range(N):
-                    result[i, j] = clip_int32(int(round(float(int(src[i, j])) * scale)))
+            scaled = np.round(src.astype(np.float32) * scale)
+            result = np.clip(scaled, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
             mem.write_int32_tile(self.state, insn.dst_buf, insn.dst_off, result)
         else:
-            # INT8 path
+            # INT8 path: multiply in FP32, clip to INT8
             src = mem.read_int8_tile(self.state, insn.src1_buf, insn.src1_off, M, N)
-            result = np.zeros((M, N), dtype=np.int8)
-            for i in range(M):
-                for j in range(N):
-                    result[i, j] = clip_int8(int(round(float(int(src[i, j])) * scale)))
+            result = np.clip(np.round(src.astype(np.float32) * scale), -128, 127).astype(np.int8)
             mem.write_int8_tile(self.state, insn.dst_buf, insn.dst_off, result)
 
         self.state.cycle_count += M * N
