@@ -19,6 +19,8 @@ class ProgramBinary:
     data: bytes = b""
     entry_point: int = 0
     insn_count: int = 0
+    data_base: int = 0    # byte offset of data section in unified DRAM image (0 = legacy)
+    input_offset: int = 0  # byte offset of input patches region in unified DRAM image
 
     def to_bytes(self) -> bytes:
         data_offset = HEADER_SIZE + len(self.instructions)
@@ -50,6 +52,20 @@ class ProgramBinary:
             entry_point=entry_point,
             insn_count=insn_count,
         )
+
+    def to_dram_image(self) -> bytes:
+        """Return unified DRAM image: instructions + alignment padding + data.
+
+        This is the single contiguous blob the host loads into DRAM.
+        Instructions start at offset 0; data starts at data_base (16-byte aligned).
+        """
+        insn_bytes = self.instructions
+        if self.data_base > 0:
+            padding_size = self.data_base - len(insn_bytes)
+        else:
+            aligned = (len(insn_bytes) + 15) & ~15
+            padding_size = aligned - len(insn_bytes)
+        return insn_bytes + bytes(padding_size) + self.data
 
     def get_instruction_bytes(self, pc: int) -> bytes:
         """Get the 8 bytes for instruction at given PC."""

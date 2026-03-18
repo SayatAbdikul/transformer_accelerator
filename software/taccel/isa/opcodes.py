@@ -1,4 +1,25 @@
-"""ISA opcode definitions, instruction formats, and field constants."""
+"""ISA opcode definitions, instruction formats, and field constants.
+
+TACCEL ISA v1 — 64-bit fixed-width instructions, big-endian encoding.
+
+Architecture overview
+---------------------
+Three execution units operate behind an in-order issue stage:
+  - DMA   : LOAD / STORE (DRAM ↔ SRAM)
+  - Systolic : MATMUL (INT8×INT8 → INT32, 16×16 tiled)
+  - SFU   : SOFTMAX / LAYERNORM / GELU (FP32 datapath, INT8 I/O)
+
+The programmer inserts SYNC instructions with a 3-bit resource mask to
+enforce ordering between units.  Without SYNC, the hardware may overlap
+execution of independent units (e.g. a LOAD can overlap a MATMUL).
+
+Reserved fields / opcodes
+-------------------------
+- Opcodes 0x11–0x1F are reserved.  Decoding a reserved opcode raises an
+  illegal-instruction fault and the processor halts.
+- M-TYPE stride_log2 [6:3] is reserved and must be zero.
+- M-TYPE flags [2:0] are reserved and must be zero.
+"""
 from enum import IntEnum
 
 
@@ -51,11 +72,11 @@ OPCODE_FORMAT = {
     Opcode.GELU: InsnFormat.R_TYPE,
 }
 
-# Buffer IDs
-BUF_ABUF = 0b00
-BUF_WBUF = 0b01
-BUF_ACCUM = 0b10
-BUF_RESERVED = 0b11
+# Buffer IDs (2-bit, shared across R-type, M-type, B-type)
+BUF_ABUF = 0b00      # Activation buffer (128 KB, INT8)
+BUF_WBUF = 0b01      # Weight buffer     (256 KB, INT8)
+BUF_ACCUM = 0b10     # Accumulator       ( 64 KB, INT32, little-endian)
+BUF_RESERVED = 0b11  # Reserved — raises illegal-buffer fault
 
 BUFFER_NAMES = {BUF_ABUF: "ABUF", BUF_WBUF: "WBUF", BUF_ACCUM: "ACCUM"}
 
@@ -93,14 +114,15 @@ R_DST_OFF_SHIFT = 5
 R_SREG_SHIFT = 1
 R_FLAGS_SHIFT = 0
 
-# M-type fields
+# M-type fields (LOAD / STORE)
+# Effective DRAM byte address = addr_regs[ADDR_REG] + DRAM_OFF × 16
 M_BUF_ID_SHIFT = 57
 M_SRAM_OFF_SHIFT = 41
 M_XFER_LEN_SHIFT = 25
 M_ADDR_REG_SHIFT = 23
 M_DRAM_OFF_SHIFT = 7
-M_STRIDE_LOG2_SHIFT = 3
-M_FLAGS_SHIFT = 0
+M_STRIDE_LOG2_SHIFT = 3  # Reserved — must be 0
+M_FLAGS_SHIFT = 0         # Reserved — must be 0
 
 # B-type fields
 B_SRC_BUF_SHIFT = 57

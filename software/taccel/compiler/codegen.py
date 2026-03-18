@@ -11,6 +11,7 @@ from ..isa.instructions import (
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
 from .memory_alloc import MemoryAllocator
+from .graph_extract import NUM_PATCHES, EMBED_DIM
 
 UNIT = 16
 
@@ -121,6 +122,13 @@ class CodeGenerator:
         self.dram_layout["__zero_pad__"] = offset
         self.dram_blob.extend(bytes(_zero_pad_size))
         offset += _zero_pad_size
+
+        # Input patches placeholder: the host writes 196 × 192 INT8 patch embeddings
+        # here before starting the program.  The program DMAs this region to ABUF.
+        _input_patches_size = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
+        self.dram_layout["__input_patches__"] = offset
+        self.dram_blob.extend(bytes(_input_patches_size))
+        offset += _input_patches_size
 
         # DRAM temp region for strip-mining starts after all weights
         self.dram_temp_start = offset
@@ -829,13 +837,20 @@ class CodeGenerator:
             self.mem.abuf.allocations[node.name] = alloc
 
     def _emit_cls_prepend(self, node: IRNode):
-        """Emit CLS token prepend: load CLS to ABUF[0], patch embed starts at offset 12."""
+        """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches to rows 1-196."""
         cls_name = node.inputs[1]
         cls_dram = self.dram_layout.get(cls_name, 0)
-        # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units
+        # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units to ABUF row 0
         self._emit_dma_load(BUF_ABUF, 0, 192, 0, cls_dram)
         self._emit(SyncInsn(resource_mask=0b001))
-        # Mark allocation
+        # DMA input patches from DRAM to ABUF rows 1-196.
+        # Host writes INT8 patch embeddings [196, 192] to DRAM[input_offset] before run.
+        # Row 1 starts at byte offset 192 = 12 × 16-byte units in ABUF.
+        patches_dram = self.dram_layout["__input_patches__"]
+        patches_bytes = NUM_PATCHES * EMBED_DIM  # 196 × 192 = 37,632 bytes
+        self._emit_dma_load(BUF_ABUF, EMBED_DIM // UNIT, patches_bytes, 1, patches_dram)
+        self._emit(SyncInsn(resource_mask=0b001))
+        # Mark allocation for the full [208, 192] padded sequence (rows 197-207 stay zero)
         self.mem.abuf.alloc(node.name, pad_dim(197) * 192, evictable=False)
 
     def _emit_pos_embed_add(self, node: IRNode):

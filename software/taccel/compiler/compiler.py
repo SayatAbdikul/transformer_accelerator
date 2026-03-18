@@ -1,8 +1,10 @@
 """Top-level compiler: PyTorch model → ProgramBinary."""
+import struct
 import numpy as np
 from typing import Dict, Optional, List, Tuple
 from ..assembler.assembler import ProgramBinary
 from ..isa.encoding import encode
+from ..isa.opcodes import Opcode, OPCODE_SHIFT, OPCODE_MASK, A_IMM28_SHIFT, MASK_28BIT
 from ..quantizer.quantize import quantize_weights, quantize_tensor
 from ..quantizer.scales import ScalePropagator
 from ..quantizer.calibrate import CalibrationResult, calibrate_model
@@ -230,11 +232,38 @@ class Compiler:
         for insn in instructions:
             insn_bytes.extend(encode(insn))
 
+        # Step 9: Build unified DRAM layout
+        # data_base is the byte offset of the data section within the DRAM image,
+        # aligned to 16 bytes so instructions don't bleed into parameter data.
+        data_base = (len(insn_bytes) + 15) & ~15
+
+        # Patch SET_ADDR_LO instructions: all DRAM addresses emitted by codegen are
+        # data-relative (offset from start of dram_blob).  Add data_base to make them
+        # DRAM-absolute (offset from start of the unified DRAM image).
+        # SET_ADDR_HI needs no patching because all data fits within 24 bits, so the
+        # high 28-bit half is always zero and adding data_base (<256 KB) still fits in
+        # the low 28 bits with no carry.
+        patched = bytearray(insn_bytes)
+        for i in range(0, len(patched), 8):
+            word = struct.unpack(">Q", patched[i:i + 8])[0]
+            opcode_val = (word >> OPCODE_SHIFT) & OPCODE_MASK
+            if opcode_val == Opcode.SET_ADDR_LO:
+                old_imm28 = (word >> A_IMM28_SHIFT) & MASK_28BIT
+                new_imm28 = (old_imm28 + data_base) & MASK_28BIT
+                word = (word & ~(MASK_28BIT << A_IMM28_SHIFT)) | (new_imm28 << A_IMM28_SHIFT)
+                patched[i:i + 8] = struct.pack(">Q", word)
+
+        # input_offset: DRAM-absolute address where the host writes input patches
+        input_patches_dram_off = codegen.dram_layout.get("__input_patches__", 0)
+        input_offset = data_base + input_patches_dram_off
+
         return ProgramBinary(
-            instructions=bytes(insn_bytes),
+            instructions=bytes(patched),
             data=dram_data,
             entry_point=0,
             insn_count=len(instructions),
+            data_base=data_base,
+            input_offset=input_offset,
         )
 
     def _default_calibration_scales(self, state_dict: dict) -> Dict[str, float]:

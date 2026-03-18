@@ -1,4 +1,27 @@
-"""Fetch-decode-execute loop for the golden model simulator."""
+"""Fetch-decode-execute loop for the golden model simulator.
+
+Execution model
+---------------
+The golden model executes instructions **strictly sequentially** (no
+pipelining, no out-of-order).  Real hardware has three independent execution
+units (DMA, Systolic, SFU) that may operate in parallel.  The programmer
+uses SYNC with a 3-bit resource mask to enforce ordering:
+
+    SYNC 0b001   — wait for DMA   (LOAD / STORE)
+    SYNC 0b010   — wait for Systolic (MATMUL)
+    SYNC 0b100   — wait for SFU   (SOFTMAX / LAYERNORM / GELU)
+    SYNC 0b111   — wait for all
+
+In the golden model SYNC is a no-op since everything is already sequential.
+In RTL SYNC is a pipeline barrier: the issue stage stalls until the selected
+units drain.
+
+Illegal opcodes
+---------------
+Decoding a reserved opcode (0x11–0x1F) or malformed instruction raises
+IllegalOpcodeError.  RTL behaviour: the processor halts (equivalent to
+executing HALT) and sets a fault status register.
+"""
 import numpy as np
 from ..isa.encoding import decode
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
@@ -42,11 +65,21 @@ class Simulator:
         self.program = program
         self.state.pc = program.entry_point
         self.state.halted = False
-        # Load data section into DRAM at offset 0
-        if program.data:
-            if len(program.data) > len(self.state.dram):
-                self.state.dram = bytearray(len(program.data) + 1024 * 1024)
-            self.state.dram[:len(program.data)] = program.data
+        if program.data_base > 0:
+            # Unified DRAM layout: instructions at 0, data at data_base.
+            # Build the full image so DRAM addresses are DRAM-absolute.
+            insn_bytes = program.instructions
+            padding = bytes(program.data_base - len(insn_bytes))
+            image = insn_bytes + padding + program.data
+            if len(image) > len(self.state.dram):
+                self.state.dram = bytearray(len(image) + 1024 * 1024)
+            self.state.dram[:len(image)] = image
+        else:
+            # Legacy: load data section at DRAM offset 0
+            if program.data:
+                if len(program.data) > len(self.state.dram):
+                    self.state.dram = bytearray(len(program.data) + 1024 * 1024)
+                self.state.dram[:len(program.data)] = program.data
 
     def run(self, max_instructions: int = 10_000_000):
         """Run until HALT or max instructions."""
@@ -65,7 +98,11 @@ class Simulator:
         if pc >= self.program.insn_count:
             raise SimulatorError(f"PC={pc} past end of program ({self.program.insn_count} insns)")
 
-        raw = self.program.get_instruction_bytes(pc)
+        if self.program.data_base > 0:
+            # Unified layout: fetch instruction bytes from DRAM
+            raw = bytes(self.state.dram[pc * 8: pc * 8 + 8])
+        else:
+            raw = self.program.get_instruction_bytes(pc)
         try:
             insn = decode(raw)
         except ValueError:
@@ -146,7 +183,10 @@ class Simulator:
         dst = clip(round(src1 × S[sreg]), -128, 127)
 
         Scale register holds FP16; widened to FP32 for the multiply.
-        Rounding: round-half-to-even (numpy default).
+        Rounding: **round-half-to-even** (IEEE 754 default / banker's rounding).
+        RTL must implement the same mode; round-half-away-from-zero would
+        produce ±1 LSB differences on exact 0.5 boundaries.
+
         INT32 inputs are exact in FP32 for the accumulator range used here
         (max |acc| = 197 tokens × 127² ≈ 3.2M << 2^24 FP32 exact limit).
         """

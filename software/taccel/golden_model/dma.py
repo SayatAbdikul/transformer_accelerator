@@ -1,4 +1,21 @@
-"""DMA engine and buffer copy model."""
+"""DMA engine and buffer copy model.
+
+DRAM address computation
+------------------------
+Effective byte address = addr_regs[insn.addr_reg] + insn.dram_off × UNIT
+
+The 56-bit base address is loaded in two steps:
+    SET_ADDR_LO  r, imm28   →  addr_regs[r][27:0]  = imm28
+    SET_ADDR_HI  r, imm28   →  addr_regs[r][55:28] = imm28
+
+Transfer semantics
+------------------
+All transfers are contiguous, 16-byte aligned, and measured in 16-byte units.
+There is no strided or scatter/gather mode (M-TYPE stride_log2 is reserved).
+
+Out-of-bounds accesses raise DRAMAccessError.  Real hardware uses a fixed DRAM
+size; writing beyond it is a fault (the golden model matches this behaviour).
+"""
 import numpy as np
 from . import memory
 from .memory import SRAMAccessError, DRAMAccessError
@@ -9,11 +26,9 @@ CYCLE_PER_UNIT = 1
 
 def execute_load(state, insn):
     """DMA LOAD: DRAM → SRAM buffer."""
-    # Resolve DRAM address
     base_addr = int(state.addr_regs[insn.addr_reg])
     dram_byte_addr = base_addr + insn.dram_off * UNIT
     xfer_bytes = insn.xfer_len * UNIT
-    sram_byte_offset = insn.sram_off * UNIT
 
     # Bounds check DRAM
     if dram_byte_addr + xfer_bytes > len(state.dram):
@@ -33,15 +48,13 @@ def execute_store(state, insn):
     base_addr = int(state.addr_regs[insn.addr_reg])
     dram_byte_addr = base_addr + insn.dram_off * UNIT
     xfer_bytes = insn.xfer_len * UNIT
-    sram_byte_offset = insn.sram_off * UNIT
 
     # Read from SRAM
     sram_data = memory.read_bytes(state, insn.buf_id, insn.sram_off, xfer_bytes)
 
-    # Bounds check DRAM
+    # Bounds check DRAM — real hardware has fixed DRAM, no dynamic growth
     if dram_byte_addr + xfer_bytes > len(state.dram):
-        # Extend DRAM if needed
-        state.dram.extend(b'\x00' * (dram_byte_addr + xfer_bytes - len(state.dram)))
+        raise DRAMAccessError(dram_byte_addr + xfer_bytes)
 
     # Write to DRAM
     state.dram[dram_byte_addr:dram_byte_addr + xfer_bytes] = sram_data

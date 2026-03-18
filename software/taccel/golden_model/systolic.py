@@ -1,4 +1,25 @@
-"""Bit-accurate INT8 16x16 systolic array matmul model."""
+"""Bit-accurate INT8 16×16 systolic array matmul model.
+
+Arithmetic
+----------
+Each 16×16 tile computes: C[i][j] += Σ_k A[i][k] * B[k][j]
+where A, B are INT8 and C is INT32.  Partial products are 16 bits;
+the running sum is accumulated into 32 bits.
+
+Overflow
+--------
+INT32 accumulator range is ±2,147,483,647.  Maximum possible accumulator
+magnitude for a single MATMUL is M × K × 127² ≈ M × K × 16,129.
+For the DeiT-tiny workload: max(M×K) = 208 × 192 = 39,936, giving
+max |acc| ≈ 644 M, which fits in INT32.  However, if the compiler
+generates a MATMUL with M × K > ~133,000 (e.g. M=1024, K=1024), the
+accumulator wraps silently.  The compiler is responsible for tiling to
+avoid this.  RTL may optionally implement saturating accumulators.
+
+Cycle model
+-----------
+16 cycles per 16×16 tile.  Total = m_tiles × n_tiles × k_tiles × 16.
+"""
 import numpy as np
 from . import memory
 from ..isa.opcodes import BUF_ACCUM
@@ -12,6 +33,9 @@ def execute_matmul(state, insn):
 
     Performs tiled matmul using CONFIG_TILE dimensions.
     src1 = activations (INT8), src2 = weights (INT8), dst = ACCUM (INT32).
+
+    flags[0] = 0: dst = src1 @ src2       (overwrite)
+    flags[0] = 1: dst += src1 @ src2      (accumulate)
     """
     from .simulator import ConfigError
 

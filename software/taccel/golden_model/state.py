@@ -1,16 +1,37 @@
-"""Machine state for the golden model simulator."""
+"""Machine state for the golden model simulator.
+
+Byte ordering (endianness)
+--------------------------
+All multi-byte values are **little-endian** in SRAM and DRAM:
+  - ACCUM INT32 values: byte 0 is the LSB.
+  - FP16 scale parameters in WBUF: byte 0 is the LSB.
+  - Instructions in DRAM are big-endian 64-bit words (network order), but
+    data transfers (LOAD/STORE) are little-endian since they carry weights
+    and activations produced by the NumPy/PyTorch toolchain (native LE).
+
+The golden model uses NumPy arrays with native byte order (little-endian on
+ARM and x86), which matches the RTL specification.
+"""
 import numpy as np
 from ..isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE
 
 
 class MachineState:
-    """Complete state of the accelerator."""
+    """Complete state of the accelerator.
+
+    SRAM buffers (all little-endian byte order):
+      - ABUF  : 128 KB activation buffer (INT8)
+      - WBUF  : 256 KB weight buffer     (INT8 / FP16 / INT32)
+      - ACCUM :  64 KB accumulator        (INT32, 16384 elements)
+
+    DRAM: 16 MB minimum, byte-addressable, little-endian data storage.
+    """
 
     def __init__(self, dram_data: bytes = b""):
         # SRAM buffers
         self.abuf = bytearray(ABUF_SIZE)
         self.wbuf = bytearray(WBUF_SIZE)
-        # ACCUM is INT32: 64KB = 16384 int32 values
+        # ACCUM is INT32 little-endian: 64KB = 16384 int32 values
         self.accum = np.zeros(ACCUM_SIZE // 4, dtype=np.int32)
 
         # DRAM - 16MB minimum, initialized from program data section

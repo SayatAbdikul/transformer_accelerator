@@ -115,25 +115,23 @@ def patch_embed_int8(model, processor, image, act_scale=None):
 
 def golden_inference(program, patches_int8, num_classes=1000):
     """Run the golden model simulator and return INT32 logits."""
-    state = MachineState(dram_data=program.data)
+    state = MachineState()
     sim = Simulator(state)
     sim.load_program(program)
 
-    # Write embedded patches to ABUF starting at row 1 (byte offset 192)
-    # Row 0 is reserved for CLS token (loaded by the program from DRAM)
+    # Write embedded patches to DRAM at program.input_offset.
+    # The program's DMA instructions load them from there to ABUF during execution.
     M, N = patches_int8.shape  # [196, 192]
     N_pad = pad_dim(N)
-    # Pad columns to multiple of 16 if needed
     if N < N_pad:
         patches_padded = np.zeros((M, N_pad), dtype=np.int8)
         patches_padded[:M, :N] = patches_int8
     else:
         patches_padded = patches_int8
 
-    # Write row by row to ABUF starting at byte offset = 1 row * N_pad bytes
-    abuf_offset = N_pad  # skip row 0 (CLS token)
     patch_bytes = patches_padded.tobytes()
-    state.abuf[abuf_offset:abuf_offset + len(patch_bytes)] = patch_bytes
+    dram_off = program.input_offset
+    state.dram[dram_off:dram_off + len(patch_bytes)] = patch_bytes
 
     # Run simulation
     count = sim.run()

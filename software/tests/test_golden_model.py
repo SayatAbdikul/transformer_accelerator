@@ -3,7 +3,7 @@ import pytest
 import numpy as np
 from taccel.golden_model.state import MachineState
 from taccel.golden_model.simulator import Simulator, ConfigError, IllegalBufferError
-from taccel.golden_model.memory import SRAMAccessError
+from taccel.golden_model.memory import SRAMAccessError, DRAMAccessError
 from taccel.assembler.assembler import Assembler, ProgramBinary
 from taccel.isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
 
@@ -159,24 +159,14 @@ class TestVADD:
 class TestDMA:
     def test_load_store_roundtrip(self):
         """DMA load then store recovers original data."""
-        prog = Assembler().assemble(
-            "SET_ADDR_LO R0, 0x0000000\n"
-            "SET_ADDR_HI R0, 0x0000000\n"
-            "LOAD buf_id=ABUF, sram_off=0, xfer_len=16, addr_reg=0, dram_off=0\n"
-            "SYNC 0b001\n"
-            "SET_ADDR_LO R1, 0x0001000\n"
-            "SET_ADDR_HI R1, 0x0000000\n"
-            "STORE buf_id=ABUF, sram_off=0, xfer_len=16, addr_reg=1, dram_off=0\n"
-            "SYNC 0b001\n"
-            "HALT"
-        )
         data = bytes(range(256))  # 256 bytes = 16 units
+        # Store to 0x100000 (1 MB) — well within 16 MB DRAM
         prog = Assembler().assemble(
             "SET_ADDR_LO R0, 0x0000000\n"
             "SET_ADDR_HI R0, 0x0000000\n"
             "LOAD buf_id=ABUF, sram_off=0, xfer_len=16, addr_reg=0, dram_off=0\n"
             "SYNC 0b001\n"
-            "SET_ADDR_LO R1, 0x1000000\n"
+            "SET_ADDR_LO R1, 0x0100000\n"
             "SET_ADDR_HI R1, 0x0000000\n"
             "STORE buf_id=ABUF, sram_off=0, xfer_len=16, addr_reg=1, dram_off=0\n"
             "SYNC 0b001\n"
@@ -189,6 +179,8 @@ class TestDMA:
 
         # Verify ABUF contains loaded data
         assert bytes(sim.state.abuf[:256]) == data
+        # Verify DRAM store target contains the same data
+        assert bytes(sim.state.dram[0x100000:0x100000 + 256]) == data
 
 
 class TestBufCopy:
@@ -283,3 +275,55 @@ class TestErrorHandling:
         sim.load_program(prog)
         with pytest.raises(ConfigError):
             sim.run()
+
+    def test_store_oob_raises(self):
+        """STORE beyond DRAM boundary raises DRAMAccessError."""
+        # Address 0xFFFFFF = 16 MB - 1; store of 16 units (256 bytes) overflows
+        prog = Assembler().assemble(
+            "SET_ADDR_LO R0, 0xFFFFF00\n"
+            "SET_ADDR_HI R0, 0x0000000\n"
+            "STORE buf_id=ABUF, sram_off=0, xfer_len=16, addr_reg=0, dram_off=0\n"
+            "HALT",
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        with pytest.raises(DRAMAccessError):
+            sim.run()
+
+
+class TestErfPoly:
+    def test_erf_poly_matches_scipy_for_int8(self):
+        """Polynomial erf approx produces identical INT8 GELU output as scipy."""
+        from taccel.golden_model.sfu import _erf_poly
+        from scipy.special import erf
+
+        # Test over the full INT8 dequantized input range
+        # Typical scale ~ 0.05, so INT8 [-128, 127] maps to [-6.4, 6.35]
+        x = np.linspace(-8.0, 8.0, 10000, dtype=np.float32)
+        sqrt2 = np.float32(np.sqrt(2.0))
+
+        gelu_ref = x * 0.5 * (1.0 + erf(x / sqrt2).astype(np.float32))
+        gelu_poly = x * 0.5 * (1.0 + _erf_poly(x / sqrt2))
+
+        # When requantized to INT8, both must produce identical results
+        scale = np.float32(0.05)
+        ref_int8 = np.clip(np.round(gelu_ref / scale), -128, 127).astype(np.int8)
+        poly_int8 = np.clip(np.round(gelu_poly / scale), -128, 127).astype(np.int8)
+        assert np.array_equal(ref_int8, poly_int8), \
+            f"Max INT8 diff: {np.max(np.abs(ref_int8.astype(int) - poly_int8.astype(int)))}"
+
+    def test_erf_poly_max_fp32_error(self):
+        """Polynomial erf approx has max absolute error < 1e-6 in FP32.
+
+        The Abramowitz & Stegun formula achieves ~1.5e-7 in FP64, but FP32
+        rounding raises the measured error to ~5e-7.  Still far below the
+        INT8 quantization noise floor (~0.004).
+        """
+        from taccel.golden_model.sfu import _erf_poly
+        from scipy.special import erf
+
+        x = np.linspace(-6.0, 6.0, 100000, dtype=np.float32)
+        ref = erf(x).astype(np.float32)
+        poly = _erf_poly(x)
+        max_err = float(np.max(np.abs(ref - poly)))
+        assert max_err < 1e-6, f"Max erf error {max_err:.2e} exceeds 1e-6"
