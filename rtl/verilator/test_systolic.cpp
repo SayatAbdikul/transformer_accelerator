@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <vector>
 
 static int tests_run = 0;
@@ -98,6 +99,18 @@ static void matmul_ref_32(const int8_t a[32][32], const int8_t b[32][32], int32_
   }
 }
 
+static void matmul_ref_16x64x16(const int8_t a[16][64], const int8_t b[64][16], int32_t c[16][16]) {
+  for (int i = 0; i < 16; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      int32_t acc = 0;
+      for (int k = 0; k < 64; ++k) {
+        acc += int32_t(a[i][k]) * int32_t(b[k][j]);
+      }
+      c[i][j] = acc;
+    }
+  }
+}
+
 static void load_matrix_abuf(Vtaccel_top* dut, int off, const int8_t m[16][16]) {
   // Current Phase 3 controller consumes ABUF as columns-per-cycle, so we
   // place A transposed in SRAM rows here.
@@ -155,6 +168,33 @@ static int32_t read_accum_32x32(Vtaccel_top* dut, int off, int i, int j) {
   auto* r = dut->rootp;
   uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
   return static_cast<int32_t>(word);
+}
+
+static void load_abuf_ktiles_16x64(Vtaccel_top* dut, int off, const int8_t a[16][64]) {
+  // Tile order in controller: (mtile * k_tiles + ktile), with mtile=0 here.
+  for (int kt = 0; kt < 4; ++kt) {
+    int tile = kt;
+    for (int r = 0; r < 16; ++r) {
+      int8_t packed[16];
+      for (int c = 0; c < 16; ++c) {
+        // ABUF tiles stored transposed (column-major by cycle).
+        packed[c] = a[c][kt * 16 + r];
+      }
+      write_abuf_row(dut, off + tile * 16 + r, packed);
+    }
+  }
+}
+
+static void load_wbuf_ktiles_64x16(Vtaccel_top* dut, int off, const int8_t b[64][16]) {
+  // Tile order in controller: (ktile * n_tiles + ntile), with ntile=0 here.
+  for (int kt = 0; kt < 4; ++kt) {
+    int tile = kt;
+    for (int r = 0; r < 16; ++r) {
+      int8_t packed[16];
+      for (int c = 0; c < 16; ++c) packed[c] = b[kt * 16 + r][c];
+      write_wbuf_row(dut, off + tile * 16 + r, packed);
+    }
+  }
 }
 
 static void test_matmul_identity() {
@@ -325,6 +365,188 @@ static void test_matmul_multitile_2x2x2() {
   TEST_PASS(name);
 }
 
+static void test_matmul_signed_extremes_16x16() {
+  const char* name = "matmul_signed_extremes_16x16";
+  Sim s;
+
+  int8_t a[16][16] = {};
+  int8_t b[16][16] = {};
+  int32_t exp[16][16] = {};
+
+  for (int i = 0; i < 16; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      a[i][j] = ((i + j) & 1) ? int8_t(-128) : int8_t(127);
+      b[i][j] = ((i * 3 + j * 5) & 1) ? int8_t(127) : int8_t(-128);
+    }
+  }
+
+  load_matrix_abuf(s.dut.get(), 0, a);
+  load_matrix_wbuf(s.dut.get(), 0, b);
+  matmul_ref(a, b, exp);
+
+  s.load({
+      insn::CONFIG_TILE(1, 1, 1),
+      insn::MATMUL(0, 0, 1, 0, 2, 0, 0, 0),
+      insn::SYNC(0b010),
+      insn::HALT(),
+  });
+
+  s.run();
+  if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+  for (int i = 0; i < 16; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      int32_t got = read_accum_ij(s.dut.get(), 0, i, j);
+      if (got != exp[i][j]) {
+        fprintf(stderr, "signed-ext mismatch i=%d j=%d got=%d exp=%d\n", i, j, got, exp[i][j]);
+        TEST_FAIL(name, "ACCUM mismatch");
+      }
+    }
+  }
+
+  TEST_PASS(name);
+}
+
+static void test_matmul_random_regression_16x16() {
+  const char* name = "matmul_random_regression_16x16";
+  std::mt19937 rng(12345);
+  std::uniform_int_distribution<int> dist(-128, 127);
+
+  for (int tc = 0; tc < 8; ++tc) {
+    Sim s;
+    int8_t a[16][16] = {};
+    int8_t b[16][16] = {};
+    int32_t exp[16][16] = {};
+
+    for (int i = 0; i < 16; ++i) {
+      for (int j = 0; j < 16; ++j) {
+        a[i][j] = static_cast<int8_t>(dist(rng));
+        b[i][j] = static_cast<int8_t>(dist(rng));
+      }
+    }
+
+    load_matrix_abuf(s.dut.get(), 0, a);
+    load_matrix_wbuf(s.dut.get(), 0, b);
+    matmul_ref(a, b, exp);
+
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::MATMUL(0, 0, 1, 0, 2, 0, 0, 0),
+        insn::SYNC(0b010),
+        insn::HALT(),
+    });
+
+    s.run();
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+    for (int i = 0; i < 16; ++i) {
+      for (int j = 0; j < 16; ++j) {
+        int32_t got = read_accum_ij(s.dut.get(), 0, i, j);
+        if (got != exp[i][j]) {
+          fprintf(stderr, "random tc=%d mismatch i=%d j=%d got=%d exp=%d\n",
+                  tc, i, j, got, exp[i][j]);
+          TEST_FAIL(name, "ACCUM mismatch");
+        }
+      }
+    }
+  }
+
+  TEST_PASS(name);
+}
+
+static void test_matmul_k4_boundary_stress() {
+  const char* name = "matmul_k4_boundary_stress";
+  Sim s;
+
+  int8_t a[16][64] = {};
+  int8_t b[64][16] = {};
+  int32_t exp[16][16] = {};
+
+  for (int i = 0; i < 16; ++i) {
+    for (int k = 0; k < 64; ++k) {
+      a[i][k] = ((i + k) & 1) ? int8_t(127) : int8_t(-128);
+    }
+  }
+  for (int k = 0; k < 64; ++k) {
+    for (int j = 0; j < 16; ++j) {
+      b[k][j] = ((k * 7 + j) & 1) ? int8_t(-128) : int8_t(127);
+    }
+  }
+
+  load_abuf_ktiles_16x64(s.dut.get(), 0, a);
+  load_wbuf_ktiles_64x16(s.dut.get(), 0, b);
+  matmul_ref_16x64x16(a, b, exp);
+
+  s.load({
+      insn::CONFIG_TILE(1, 1, 4),
+      insn::MATMUL(0, 0, 1, 0, 2, 0, 0, 0),
+      insn::SYNC(0b010),
+      insn::HALT(),
+  });
+
+  s.run();
+  if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+  for (int i = 0; i < 16; ++i) {
+    for (int j = 0; j < 16; ++j) {
+      int32_t got = read_accum_ij(s.dut.get(), 0, i, j);
+      if (got != exp[i][j]) {
+        fprintf(stderr, "k4 mismatch i=%d j=%d got=%d exp=%d\n", i, j, got, exp[i][j]);
+        TEST_FAIL(name, "ACCUM mismatch");
+      }
+    }
+  }
+
+  TEST_PASS(name);
+}
+
+static void test_matmul_multitile_random_regression_2x2x2() {
+  const char* name = "matmul_multitile_random_regression_2x2x2";
+  std::mt19937 rng(67890);
+  std::uniform_int_distribution<int> dist(-128, 127);
+
+  for (int tc = 0; tc < 4; ++tc) {
+    Sim s;
+    int8_t a[32][32] = {};
+    int8_t b[32][32] = {};
+    int32_t exp[32][32] = {};
+
+    for (int i = 0; i < 32; ++i) {
+      for (int j = 0; j < 32; ++j) {
+        a[i][j] = static_cast<int8_t>(dist(rng));
+        b[i][j] = static_cast<int8_t>(dist(rng));
+      }
+    }
+
+    load_abuf_tiled_32x32(s.dut.get(), 0, a);
+    load_wbuf_tiled_32x32(s.dut.get(), 0, b);
+    matmul_ref_32(a, b, exp);
+
+    s.load({
+        insn::CONFIG_TILE(2, 2, 2),
+        insn::MATMUL(0, 0, 1, 0, 2, 0, 0, 0),
+        insn::SYNC(0b010),
+        insn::HALT(),
+    });
+
+    s.run();
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+    for (int i = 0; i < 32; ++i) {
+      for (int j = 0; j < 32; ++j) {
+        int32_t got = read_accum_32x32(s.dut.get(), 0, i, j);
+        if (got != exp[i][j]) {
+          fprintf(stderr, "multitile-rand tc=%d mismatch i=%d j=%d got=%d exp=%d\n",
+                  tc, i, j, got, exp[i][j]);
+          TEST_FAIL(name, "ACCUM mismatch");
+        }
+      }
+    }
+  }
+
+  TEST_PASS(name);
+}
+
 int main(int argc, char** argv) {
   Verilated::commandArgs(argc, argv);
 
@@ -332,6 +554,10 @@ int main(int argc, char** argv) {
   test_matmul_ones();
   test_matmul_accumulate_flag();
   test_matmul_multitile_2x2x2();
+  test_matmul_signed_extremes_16x16();
+  test_matmul_random_regression_16x16();
+  test_matmul_k4_boundary_stress();
+  test_matmul_multitile_random_regression_2x2x2();
 
   printf("\n%d / %d tests passed\n", tests_pass, tests_run);
   return (tests_pass == tests_run) ? 0 : 1;

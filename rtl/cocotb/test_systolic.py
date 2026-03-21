@@ -5,6 +5,8 @@ Current controller consumes ABUF in transposed layout; tests prepare ABUF rows
 accordingly to validate mathematical A @ B behavior.
 """
 
+import random
+
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge
@@ -41,6 +43,17 @@ def _matmul_ref_32(a, b):
         for j in range(32):
             acc = 0
             for k in range(32):
+                acc += int(a[i][k]) * int(b[k][j])
+            c[i][j] = acc
+    return c
+
+
+def _matmul_ref_16x64x16(a, b):
+    c = [[0 for _ in range(16)] for _ in range(16)]
+    for i in range(16):
+        for j in range(16):
+            acc = 0
+            for k in range(64):
                 acc += int(a[i][k]) * int(b[k][j])
             c[i][j] = acc
     return c
@@ -160,6 +173,25 @@ def _read_accum_32x32(dut, dst_off=0):
     return out
 
 
+def _write_abuf_ktiles_16x64(dut, mat, off=0):
+    # Tile order consumed by controller for m=1,n=1,k=4: ktile in [0..3].
+    for kt in range(4):
+        tile = kt
+        for r in range(16):
+            # ABUF tiles stored transposed per 16x16 tile.
+            vals = [mat[c][kt * 16 + r] for c in range(16)]
+            _abuf_row_handle(dut, off + tile * 16 + r).value = _pack_i8_row(vals)
+
+
+def _write_wbuf_ktiles_64x16(dut, mat, off=0):
+    # Tile order consumed by controller for m=1,n=1,k=4: ktile in [0..3].
+    for kt in range(4):
+        tile = kt
+        for r in range(16):
+            vals = [mat[kt * 16 + r][c] for c in range(16)]
+            _wbuf_row_handle(dut, off + tile * 16 + r).value = _pack_i8_row(vals)
+
+
 @cocotb.test()
 async def test_matmul_identity(dut):
     a = [[(i * 3 + j) & 0x7F for j in range(16)] for i in range(16)]
@@ -269,3 +301,101 @@ async def test_matmul_multitile_2x2x2(dut):
     assert int(dut.fault.value) == 0
     got = _read_accum_32x32(dut)
     assert got == exp, "multitile 2x2x2 matmul mismatch"
+
+
+@cocotb.test()
+async def test_matmul_signed_extremes(dut):
+    a = [[-128 if ((i + j) & 1) else 127 for j in range(16)] for i in range(16)]
+    b = [[127 if ((i * 3 + j * 5) & 1) else -128 for j in range(16)] for i in range(16)]
+    exp = _matmul_ref(a, b)
+
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        MATMUL(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ACCUM, 0, sreg=0, flags=0),
+        SYNC(0b010),
+        HALT(),
+    ]
+    await _setup(dut, prog)
+    _write_abuf_matrix_transposed(dut, a)
+    _write_wbuf_matrix(dut, b)
+    await _wait_halt(dut)
+
+    assert int(dut.done.value) == 1
+    assert int(dut.fault.value) == 0
+    got = _read_accum_16x16(dut)
+    assert got == exp, "signed extremes matmul mismatch"
+
+
+@cocotb.test()
+async def test_matmul_random_regression(dut):
+    rng = random.Random(12345)
+
+    for tc in range(8):
+        a = [[rng.randint(-128, 127) for _ in range(16)] for _ in range(16)]
+        b = [[rng.randint(-128, 127) for _ in range(16)] for _ in range(16)]
+        exp = _matmul_ref(a, b)
+
+        prog = [
+            CONFIG_TILE(1, 1, 1),
+            MATMUL(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ACCUM, 0, sreg=0, flags=0),
+            SYNC(0b010),
+            HALT(),
+        ]
+        await _setup(dut, prog)
+        _write_abuf_matrix_transposed(dut, a)
+        _write_wbuf_matrix(dut, b)
+        await _wait_halt(dut)
+
+        assert int(dut.done.value) == 1
+        assert int(dut.fault.value) == 0
+        got = _read_accum_16x16(dut)
+        assert got == exp, f"random regression mismatch on case {tc}"
+
+
+@cocotb.test()
+async def test_matmul_k4_boundary_stress(dut):
+    a = [[127 if ((i + k) & 1) else -128 for k in range(64)] for i in range(16)]
+    b = [[-128 if ((k * 7 + j) & 1) else 127 for j in range(16)] for k in range(64)]
+    exp = _matmul_ref_16x64x16(a, b)
+
+    prog = [
+        CONFIG_TILE(1, 1, 4),
+        MATMUL(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ACCUM, 0, sreg=0, flags=0),
+        SYNC(0b010),
+        HALT(),
+    ]
+    await _setup(dut, prog)
+    _write_abuf_ktiles_16x64(dut, a)
+    _write_wbuf_ktiles_64x16(dut, b)
+    await _wait_halt(dut)
+
+    assert int(dut.done.value) == 1
+    assert int(dut.fault.value) == 0
+    got = _read_accum_16x16(dut)
+    assert got == exp, "k=4 boundary stress mismatch"
+
+
+@cocotb.test()
+async def test_matmul_multitile_random_regression_2x2x2(dut):
+    rng = random.Random(67890)
+
+    for tc in range(4):
+        a = [[rng.randint(-128, 127) for _ in range(32)] for _ in range(32)]
+        b = [[rng.randint(-128, 127) for _ in range(32)] for _ in range(32)]
+        exp = _matmul_ref_32(a, b)
+
+        prog = [
+            CONFIG_TILE(2, 2, 2),
+            MATMUL(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ACCUM, 0, sreg=0, flags=0),
+            SYNC(0b010),
+            HALT(),
+        ]
+        await _setup(dut, prog)
+        _write_abuf_tiled_32x32(dut, a)
+        _write_wbuf_tiled_32x32(dut, b)
+        await _wait_halt(dut, max_cycles=700_000)
+
+        assert int(dut.done.value) == 1
+        assert int(dut.fault.value) == 0
+        got = _read_accum_32x32(dut)
+        assert got == exp, f"multitile random mismatch on case {tc}"
