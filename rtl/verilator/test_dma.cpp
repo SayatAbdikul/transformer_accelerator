@@ -11,10 +11,12 @@
 //   load_dispatch_async — LOAD dispatched (non-blocking) → SYNC(001) waits → HALT
 
 #include "Vtaccel_top.h"
+#include "Vtaccel_top___024root.h"
 #include "verilated.h"
 #include "include/testbench.h"
 
 #include <cassert>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -51,6 +53,104 @@ struct Sim {
         return run_until_halt(dut.get(), dram, timeout);
     }
 };
+
+enum BufId : int {
+    BUF_ABUF_ID  = 0,
+    BUF_WBUF_ID  = 1,
+    BUF_ACCUM_ID = 2,
+};
+
+static void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
+    auto* r = dut->rootp;
+    VlWide<4>* mem = nullptr;
+    switch (buf_id) {
+        case BUF_ABUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row]; break;
+        case BUF_WBUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row]; break;
+        case BUF_ACCUM_ID: mem = &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row]; break;
+        default: std::abort();
+    }
+    // Word packing is little-endian per 32-bit lane in Verilated VlWide.
+    for (int w = 0; w < 4; ++w) {
+        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
+                    (uint32_t(data[w * 4 + 1]) <<  8) |
+                    (uint32_t(data[w * 4 + 2]) << 16) |
+                    (uint32_t(data[w * 4 + 3]) << 24);
+    }
+}
+
+static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
+    auto* r = dut->rootp;
+    const VlWide<4>* mem = nullptr;
+    switch (buf_id) {
+        case BUF_ABUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row]; break;
+        case BUF_WBUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row]; break;
+        case BUF_ACCUM_ID: mem = &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row]; break;
+        default: std::abort();
+    }
+    for (int w = 0; w < 4; ++w) {
+        uint32_t word = (*mem)[w];
+        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
+        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
+        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
+        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
+    }
+}
+
+// ============================================================================
+// test: LOAD 1 beat writes expected bytes directly into ABUF SRAM row 0
+// ============================================================================
+static void test_load_16bytes_to_sram_direct() {
+    const char* name = "load_16bytes_to_sram_direct";
+    Sim s;
+
+    constexpr uint64_t SRC = 0x110000;
+    uint8_t src[16];
+    for (int i = 0; i < 16; i++) src[i] = (uint8_t)(0x55 + i);
+    s.dram.write_bytes(SRC, src, 16);
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(0/*ABUF*/, 0, 1, 0, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run();
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+    uint8_t got[16] = {};
+    sram_read_row(s.dut.get(), BUF_ABUF_ID, 0, got);
+    if (std::memcmp(got, src, 16) != 0) TEST_FAIL(name, "ABUF row mismatch after LOAD");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// test: STORE 1 beat reads bytes directly from ABUF SRAM row 0 into DRAM
+// ============================================================================
+static void test_store_16bytes_from_sram_direct() {
+    const char* name = "store_16bytes_from_sram_direct";
+    Sim s;
+
+    constexpr uint64_t DST = 0x210000;
+    uint8_t src[16];
+    for (int i = 0; i < 16; i++) src[i] = (uint8_t)(0xA5 ^ i);
+
+    sram_write_row(s.dut.get(), BUF_ABUF_ID, 0, src);
+
+    s.load({
+        insn::SET_ADDR_LO(1, DST), insn::SET_ADDR_HI(1, 0),
+        insn::STORE(0/*ABUF*/, 0, 1, 1, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run();
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+    for (int i = 0; i < 16; i++) {
+        if (s.dram.read_byte(DST + i) != src[i]) TEST_FAIL(name, "DRAM mismatch after STORE");
+    }
+    TEST_PASS(name);
+}
 
 // ============================================================================
 // test: LOAD 1 beat → STORE roundtrip (ABUF)
@@ -268,6 +368,29 @@ static void test_dram_oob_fault() {
 }
 
 // ============================================================================
+// test: STORE OOB -> FAULT_DRAM_OOB (code 2)
+// ============================================================================
+static void test_store_oob_fault() {
+    const char* name = "store_oob_fault";
+    Sim s;
+
+    constexpr uint64_t NEAR_END = 0xFFFFF0;
+
+    s.load({
+        insn::SET_ADDR_LO(0, NEAR_END),
+        insn::SET_ADDR_HI(0, 0),
+        insn::STORE(0, 0, 2, 0, 0),  // OOB: 2 x 16B from 0xFFFFF0 crosses 16MB
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(200000);
+    if (!s.dut->fault) TEST_FAIL(name, "expected fault=1");
+    if (s.dut->fault_code != 2) TEST_FAIL(name, "expected fault_code=2 (DRAM_OOB)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
 // test: LOAD dispatch is non-blocking; SYNC(001) waits correctly
 // ============================================================================
 static void test_load_dispatch_async() {
@@ -334,11 +457,14 @@ int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
     test_load_single_beat();
+    test_load_16bytes_to_sram_direct();
+    test_store_16bytes_from_sram_direct();
     test_load_multi_beat();
     test_load_to_wbuf();
     test_load_to_accum();
     test_addr_reg_independence();
     test_dram_oob_fault();
+    test_store_oob_fault();
     test_load_dispatch_async();
     test_dram_offset();
 

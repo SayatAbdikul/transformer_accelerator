@@ -146,14 +146,21 @@ static void test_set_scale() {
 static void test_set_addr() {
     const char* name = "set_addr_lo_hi";
     Sim s;
+    constexpr uint32_t LO = 0x0100000;
+    constexpr uint32_t HI = 0x0000123;
     s.load({
-        insn::SET_ADDR_LO(0, 0x0100000),  // R0[27:0] = 0x100000
-        insn::SET_ADDR_HI(0, 0x0000000),  // R0[55:28] = 0
+        insn::SET_ADDR_LO(0, LO),  // R0[27:0]
+        insn::SET_ADDR_HI(0, HI),  // R0[55:28]
         insn::HALT()
     });
     s.run();
     EXPECT(s.dut->done  == 1, "done");
     EXPECT(s.dut->fault == 0, "no fault on SET_ADDR");
+
+    const uint64_t expected = ((uint64_t(HI & 0x0FFFFFFF) << 28) | uint64_t(LO & 0x0FFFFFFF));
+    const uint64_t got = uint64_t(s.dut->rootp->taccel_top__DOT__u_regfile__DOT__addr_regs[0])
+                         & 0x00FFFFFFFFFFFFFFULL;
+    EXPECT(got == expected, "R0 56-bit composition mismatch");
     TEST_PASS(name);
 }
 
