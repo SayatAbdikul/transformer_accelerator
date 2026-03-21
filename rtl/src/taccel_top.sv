@@ -6,6 +6,11 @@
 //   - SRAM Port A connected to DMA engine
 //   - AXI write channels (AW/W/B) connected to DMA engine
 //   - New ports: m_axi_aw_len, m_axi_aw_size, m_axi_aw_burst
+//
+// Phase 3 additions:
+//   - Systolic controller instantiated
+//   - sys_busy now driven by systolic controller (not stubbed)
+//   - SRAM port arbitration between DMA and systolic controller
 
 `ifndef TACCEL_TOP_SV
 `define TACCEL_TOP_SV
@@ -143,17 +148,54 @@ module taccel_top
   logic       dma_fault_w;
   logic [3:0] dma_fault_code_w;
 
-  // Phase 2: sys/sfu/alu still stubbed
+  // Phase 3: systolic controller active; sfu/alu still stubbed
   logic sys_busy, sfu_busy, alu_busy;
-  assign sys_busy = 1'b0;
   assign sfu_busy = 1'b0;
   assign alu_busy = 1'b0;
 
-  // SRAM Port A from DMA
+  // SRAM Port A requests from DMA / Systolic
   logic         dma_sram_en,  dma_sram_we;
   logic [1:0]   dma_sram_buf;
   logic [15:0]  dma_sram_row;
   logic [127:0] dma_sram_wdata, dma_sram_rdata;
+
+  logic         sys_sram_a_en,  sys_sram_a_we;
+  logic [1:0]   sys_sram_a_buf;
+  logic [15:0]  sys_sram_a_row;
+  logic [127:0] sys_sram_a_wdata, sys_sram_a_rdata;
+
+  // SRAM Port B request from Systolic
+  logic         sys_sram_b_en;
+  logic [1:0]   sys_sram_b_buf;
+  logic [15:0]  sys_sram_b_row;
+  logic [127:0] sys_sram_b_rdata;
+
+  // Arbitrated SRAM wires
+  logic         sram_a_en, sram_a_we;
+  logic [1:0]   sram_a_buf;
+  logic [15:0]  sram_a_row;
+  logic [127:0] sram_a_wdata, sram_a_rdata;
+  logic         sram_a_fault;
+  logic         sram_b_en;
+  logic [1:0]   sram_b_buf;
+  logic [15:0]  sram_b_row;
+  logic [127:0] sram_b_rdata;
+  logic         sram_b_fault;
+
+  // DMA gets priority when active; systolic uses SRAM while DMA is idle.
+  assign sram_a_en    = dma_sram_en ? dma_sram_en    : sys_sram_a_en;
+  assign sram_a_we    = dma_sram_en ? dma_sram_we    : sys_sram_a_we;
+  assign sram_a_buf   = dma_sram_en ? dma_sram_buf   : sys_sram_a_buf;
+  assign sram_a_row   = dma_sram_en ? dma_sram_row   : sys_sram_a_row;
+  assign sram_a_wdata = dma_sram_en ? dma_sram_wdata : sys_sram_a_wdata;
+
+  assign sram_b_en    = sys_sram_b_en;
+  assign sram_b_buf   = sys_sram_b_buf;
+  assign sram_b_row   = sys_sram_b_row;
+
+  assign dma_sram_rdata   = sram_a_rdata;
+  assign sys_sram_a_rdata = sram_a_rdata;
+  assign sys_sram_b_rdata = sram_b_rdata;
 
   // =========================================================================
   // Instruction register
@@ -304,27 +346,52 @@ module taccel_top
     .dma_b_ready     (m_axi_b_ready)
   );
 
+  systolic_controller u_systolic (
+    .clk             (clk),
+    .rst_n           (rst_n),
+    .dispatch        (sys_dispatch),
+    .tile_m          (tile_m),
+    .tile_n          (tile_n),
+    .tile_k          (tile_k),
+    .src1_buf        (insn.src1_buf),
+    .src1_off        (insn.src1_off),
+    .src2_buf        (insn.src2_buf),
+    .src2_off        (insn.src2_off),
+    .dst_buf         (insn.dst_buf),
+    .dst_off         (insn.dst_off),
+    .flags_accumulate(insn.flags),
+    .sys_busy        (sys_busy),
+    .sram_a_en       (sys_sram_a_en),
+    .sram_a_we       (sys_sram_a_we),
+    .sram_a_buf      (sys_sram_a_buf),
+    .sram_a_row      (sys_sram_a_row),
+    .sram_a_wdata    (sys_sram_a_wdata),
+    .sram_a_rdata    (sys_sram_a_rdata),
+    .sram_b_en       (sys_sram_b_en),
+    .sram_b_buf      (sys_sram_b_buf),
+    .sram_b_row      (sys_sram_b_row),
+    .sram_b_rdata    (sys_sram_b_rdata)
+  );
+
   sram_subsystem u_sram (
     .clk     (clk),
     .rst_n   (rst_n),
-    // Port A: DMA engine
-    .a_en    (dma_sram_en),
-    .a_we    (dma_sram_we),
-    .a_buf   (dma_sram_buf),
-    .a_row   (dma_sram_row),
-    .a_wdata (dma_sram_wdata),
-    .a_rdata (dma_sram_rdata),
+    // Port A: DMA/Systolic (arbitrated)
+    .a_en    (sram_a_en),
+    .a_we    (sram_a_we),
+    .a_buf   (sram_a_buf),
+    .a_row   (sram_a_row),
+    .a_wdata (sram_a_wdata),
+    .a_rdata (sram_a_rdata),
     /* verilator lint_off PINCONNECTEMPTY */
     .a_fault (),   // Phase 2: SRAM OOB reported via a_fault; checked in Phase 6
     /* verilator lint_on PINCONNECTEMPTY */
-    // Port B: unused in Phase 2
-    .b_en    (1'b0),
-    .b_buf   (2'b00),
-    .b_row   (16'h0),
-    /* verilator lint_off PINCONNECTEMPTY */
-    .b_rdata (),
-    .b_fault ()
-    /* verilator lint_on PINCONNECTEMPTY */
+    // Port B: systolic source reads
+    .b_en    (sram_b_en),
+    .b_buf   (sram_b_buf),
+    .b_row   (sram_b_row),
+    .b_rdata (sram_b_rdata),
+    .b_fault (sram_b_fault)
   );
 
 endmodule

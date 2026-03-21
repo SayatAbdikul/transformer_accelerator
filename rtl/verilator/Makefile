@@ -19,6 +19,7 @@ VFLAGS        := --cc --exe --build --timing \
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
+SYSTOLIC_DIR  := $(SRC_DIR)/systolic
 TB_DIR        := $(SRC_DIR)/tb
 BUILD_DIR     := build
 
@@ -32,12 +33,15 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/memory/register_file.sv \
                  $(SRC_DIR)/memory/sram_dp.sv \
                  $(SRC_DIR)/memory/sram_subsystem.sv \
+				 $(SRC_DIR)/systolic/systolic_pe.sv \
+				 $(SRC_DIR)/systolic/systolic_array.sv \
+				 $(SRC_DIR)/systolic/systolic_controller.sv \
                  $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all test_decode test_control test_dma clean
+.PHONY: all test_decode test_control test_dma test_systolic clean
 
-all: test_decode test_control test_dma
+all: test_decode test_control test_dma test_systolic
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run
@@ -45,7 +49,7 @@ all: test_decode test_control test_dma
 $(BUILD_DIR)/test_decode/Vtb_decode_unit: $(DECODE_SV) test_decode.cpp
 	mkdir -p $(BUILD_DIR)/test_decode
 	$(VERILATOR) $(VFLAGS) \
-	  -I$(INCLUDE_DIR) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module tb_decode_unit \
 	  --Mdir $(BUILD_DIR)/test_decode \
 	  $(DECODE_SV) \
@@ -63,7 +67,7 @@ test_decode: $(BUILD_DIR)/test_decode/Vtb_decode_unit
 $(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp
 	mkdir -p $(BUILD_DIR)/test_control
 	$(VERILATOR) $(VFLAGS) \
-	  -I$(INCLUDE_DIR) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_control \
 	  $(CONTROL_SV) \
@@ -81,7 +85,7 @@ test_control: $(BUILD_DIR)/test_control/Vtaccel_top
 $(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
 	mkdir -p $(BUILD_DIR)/test_dma
 	$(VERILATOR) $(VFLAGS) \
-	  -I$(INCLUDE_DIR) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_dma \
 	  $(CONTROL_SV) \
@@ -92,6 +96,24 @@ $(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
 test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 	@echo "--- Running DMA tests ---"
 	$(BUILD_DIR)/test_dma/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_systolic: verilate taccel_top (with systolic) + compile + run
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp
+	mkdir -p $(BUILD_DIR)/test_systolic
+	$(VERILATOR) $(VFLAGS) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_systolic \
+	  $(CONTROL_SV) \
+	  test_systolic.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_systolic -f Vtaccel_top.mk
+
+test_systolic: $(BUILD_DIR)/test_systolic/Vtaccel_top
+	@echo "--- Running systolic tests ---"
+	$(BUILD_DIR)/test_systolic/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:

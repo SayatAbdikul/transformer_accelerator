@@ -13,7 +13,7 @@ TOPLEVEL_LANG ?= verilog
 SIM           ?= icarus     # icarus | verilator | vcs | xsim
 
 TOPLEVEL      := taccel_top
-MODULE        := test_fetch_decode,test_dma
+MODULE        := test_fetch_decode,test_dma,test_systolic
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -27,11 +27,15 @@ VERILOG_SOURCES := \
   $(SRC_DIR)/memory/sram_dp.sv \
   $(SRC_DIR)/memory/register_file.sv \
   $(SRC_DIR)/memory/sram_subsystem.sv \
+  $(SRC_DIR)/systolic/systolic_pe.sv \
+  $(SRC_DIR)/systolic/systolic_array.sv \
+  $(SRC_DIR)/systolic/systolic_controller.sv \
   $(SRC_DIR)/dma_engine.sv \
   $(SRC_DIR)/taccel_top.sv
 
 # Include paths
 COMPILE_ARGS += -I$(INCLUDE_DIR)
+COMPILE_ARGS += -I$(SRC_DIR)/systolic
 
 # Verilator-specific flags
 ifeq ($(SIM), verilator)
