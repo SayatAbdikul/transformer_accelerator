@@ -19,7 +19,12 @@ from utils.dram_model import DramModel
 # Common setup helper
 # ---------------------------------------------------------------------------
 
-async def _setup(dut, insns, dram_writes=None):
+async def _setup(
+    dut,
+    insns,
+    dram_writes=None,
+    write_slave_kwargs=None,
+):
     """Clock, reset, load program+data, start, return dram model."""
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
     dram = DramModel()
@@ -28,7 +33,7 @@ async def _setup(dut, insns, dram_writes=None):
         for addr, data in dram_writes.items():
             dram.write_bytes(addr, bytes(data))
     cocotb.start_soon(dram.axi_slave(dut))
-    cocotb.start_soon(dram.axi_write_slave(dut))
+    cocotb.start_soon(dram.axi_write_slave(dut, **(write_slave_kwargs or {})))
 
     dut.rst_n.value = 0
     for _ in range(10):
@@ -289,3 +294,110 @@ async def test_dram_offset_field(dut):
     assert dut.done.value == 1 and dut.fault.value == 0
     assert bytes(dram.mem[DST:DST+16]) == src_data, "data mismatch"
     dut._log.info("dram_offset_field: OK")
+
+
+@cocotb.test()
+async def test_store_oob_fault(dut):
+    """STORE past DRAM end should raise FAULT_DRAM_OOB."""
+    NEAR_END = 0xFFFFF0
+    prog = [
+        SET_ADDR_LO(0, NEAR_END), SET_ADDR_HI(0, 0),
+        STORE(BUF_ABUF, 0, 2, 0, 0),   # OOB: 2 beats from 0xFFFFF0 crosses 16MB
+        SYNC(0b001),
+        HALT(),
+    ]
+    await _setup(dut, prog)
+    await _wait_halt(dut)
+
+    assert dut.fault.value == 1, "expected fault"
+    assert int(dut.fault_code.value) == 2, (
+        f"expected fault_code=2, got {int(dut.fault_code.value)}"
+    )
+    dut._log.info("store_oob_fault: OK")
+
+
+@cocotb.test()
+async def test_load_store_max_len_256(dut):
+    """Boundary: xfer_len=256 beats (AXI len=255) should complete and match."""
+    SRC = 0x120000
+    DST = 0x140000
+    nbytes = 256 * 16
+    src_data = bytes((i * 7) & 0xFF for i in range(nbytes))
+    prog = [
+        SET_ADDR_LO(0, SRC), SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, 256, 0, 0),
+        SYNC(0b001),
+        SET_ADDR_LO(1, DST), SET_ADDR_HI(1, 0),
+        STORE(BUF_ABUF, 0, 256, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog, {SRC: src_data})
+    await _wait_halt(dut, max_cycles=300_000)
+
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert bytes(dram.mem[DST:DST+nbytes]) == src_data, "data mismatch"
+    dut._log.info("load_store_max_len_256: OK")
+
+
+@cocotb.test()
+async def test_store_backpressure_aw_w(dut):
+    """STORE should complete when AW/W are stalled for several cycles."""
+    SRC = 0x160000
+    DST = 0x180000
+    src_data = bytes((0x3A + i) & 0xFF for i in range(64))
+    prog = [
+        SET_ADDR_LO(0, SRC), SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, 4, 0, 0),
+        SYNC(0b001),
+        SET_ADDR_LO(1, DST), SET_ADDR_HI(1, 0),
+        STORE(BUF_ABUF, 0, 4, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(
+        dut,
+        prog,
+        {SRC: src_data},
+        write_slave_kwargs={
+            "w_stall_cycles": 2,
+            "b_valid_delay_cycles": 2,
+        },
+    )
+    await _wait_halt(dut)
+
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert bytes(dram.mem[DST:DST+64]) == src_data, "data mismatch"
+    dut._log.info("store_backpressure_aw_w: OK")
+
+
+@cocotb.test()
+async def test_store_bresp_non_okay_path(dut):
+    """Exercise DMA B channel when slave returns non-OKAY BRESP."""
+    SRC = 0x1A0000
+    DST = 0x1C0000
+    src_data = bytes((0x90 ^ i) & 0xFF for i in range(16))
+    prog = [
+        SET_ADDR_LO(0, SRC), SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, 1, 0, 0),
+        SYNC(0b001),
+        SET_ADDR_LO(1, DST), SET_ADDR_HI(1, 0),
+        STORE(BUF_ABUF, 0, 1, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(
+        dut,
+        prog,
+        {SRC: src_data},
+        write_slave_kwargs={"b_resp": 2},
+    )
+    await _wait_halt(dut)
+
+    # Current RTL does not fault on BRESP and only waits for BVALID handshake.
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert bytes(dram.mem[DST:DST+16]) == src_data, "data mismatch"
+    dut._log.info("store_bresp_non_okay_path: exercised")

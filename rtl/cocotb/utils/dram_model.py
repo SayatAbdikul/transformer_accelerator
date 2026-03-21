@@ -142,16 +142,34 @@ class DramModel:
                         req['cd'] = 1   # next beat next cycle
                     break  # one beat per outer loop iteration
 
-    async def axi_write_slave(self, dut) -> None:
+    async def axi_write_slave(
+        self,
+        dut,
+        aw_stall_cycles: int = 0,
+        w_stall_cycles: int = 0,
+        b_valid_delay_cycles: int = 0,
+        b_resp: int = 0,
+    ) -> None:
         """Coroutine: drive AXI4 write slave (AW/W/B channels).
 
         Run as a background task alongside axi_slave():
             cocotb.start_soon(dram.axi_write_slave(dut))
+
+        Args:
+            aw_stall_cycles: Number of cycles to hold AWREADY low before each burst.
+            w_stall_cycles: Number of cycles to hold WREADY low before each beat.
+            b_valid_delay_cycles: Cycles to wait between last W and BVALID assertion.
+            b_resp: BRESP value to return (0=OKAY, 2=SLVERR, 3=DECERR).
         """
+        aw_stall_cfg = max(0, int(aw_stall_cycles))
+        w_stall_cfg = max(0, int(w_stall_cycles))
+        b_delay_cfg = max(0, int(b_valid_delay_cycles))
+        b_resp_val = int(b_resp) & 0x3
+
         dut.m_axi_aw_ready.value = 1
         dut.m_axi_w_ready.value  = 0
         dut.m_axi_b_valid.value  = 0
-        dut.m_axi_b_resp.value   = 0
+        dut.m_axi_b_resp.value   = b_resp_val
 
         while True:
             await RisingEdge(dut.clk)
@@ -161,8 +179,18 @@ class DramModel:
                 dut.m_axi_aw_ready.value = 1
                 dut.m_axi_w_ready.value  = 0
                 dut.m_axi_b_valid.value  = 0
-                dut.m_axi_b_resp.value   = 0
+                dut.m_axi_b_resp.value   = b_resp_val
                 continue
+
+            # Optional AW backpressure before each burst.
+            for _ in range(aw_stall_cfg):
+                dut.m_axi_aw_ready.value = 0
+                await RisingEdge(dut.clk)
+                if self._sig_int(dut.rst_n, default=0) == 0:
+                    break
+            if self._sig_int(dut.rst_n, default=0) == 0:
+                continue
+            dut.m_axi_aw_ready.value = 1
 
             # Accept AW only on an edge-stable handshake. Do not use delta-only
             # acceptance; that can make the model think AW happened while the DUT
@@ -182,6 +210,7 @@ class DramModel:
             dut.m_axi_w_ready.value = 1
 
             beat = 0
+            stall_left = w_stall_cfg
             while beat < beats_expected:
                 await RisingEdge(dut.clk)
 
@@ -190,6 +219,13 @@ class DramModel:
                     dut.m_axi_b_valid.value = 0
                     dut.m_axi_aw_ready.value = 1
                     break
+
+                # Optional per-beat W backpressure.
+                if stall_left > 0:
+                    dut.m_axi_w_ready.value = 0
+                    stall_left -= 1
+                    continue
+                dut.m_axi_w_ready.value = 1
 
                 # Accept W only on an edge-stable handshake.
                 w_valid = self._sig_int(dut.m_axi_w_valid, 0)
@@ -213,6 +249,7 @@ class DramModel:
                     )
 
                 beat += 1
+                stall_left = w_stall_cfg
 
             # If reset hit during beat collection, restart in idle state.
             if beat < beats_expected:
@@ -221,8 +258,15 @@ class DramModel:
             dut.m_axi_w_ready.value = 0
 
             # Send B response.
+            for _ in range(b_delay_cfg):
+                await RisingEdge(dut.clk)
+                if self._sig_int(dut.rst_n, default=0) == 0:
+                    break
+            if self._sig_int(dut.rst_n, default=0) == 0:
+                continue
+
             dut.m_axi_b_valid.value = 1
-            dut.m_axi_b_resp.value = 0
+            dut.m_axi_b_resp.value = b_resp_val
             while True:
                 await RisingEdge(dut.clk)
                 if self._sig_int(dut.rst_n, default=0) == 0:
