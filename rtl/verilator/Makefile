@@ -32,11 +32,12 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/memory/register_file.sv \
                  $(SRC_DIR)/memory/sram_dp.sv \
                  $(SRC_DIR)/memory/sram_subsystem.sv \
+                 $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all test_decode test_control clean
+.PHONY: all test_decode test_control test_dma clean
 
-all: test_decode test_control
+all: test_decode test_control test_dma
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run
@@ -73,6 +74,24 @@ $(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp
 test_control: $(BUILD_DIR)/test_control/Vtaccel_top
 	@echo "--- Running control unit tests ---"
 	$(BUILD_DIR)/test_control/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_dma: verilate taccel_top (with DMA engine) + compile + run
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
+	mkdir -p $(BUILD_DIR)/test_dma
+	$(VERILATOR) $(VFLAGS) \
+	  -I$(INCLUDE_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_dma \
+	  $(CONTROL_SV) \
+	  test_dma.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_dma -f Vtaccel_top.mk
+
+test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
+	@echo "--- Running DMA tests ---"
+	$(BUILD_DIR)/test_dma/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:

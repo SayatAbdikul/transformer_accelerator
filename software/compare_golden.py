@@ -39,6 +39,14 @@ WEIGHTS_PATH = "pytorch_model.bin"
 COCO_VAL_IDS = [
     39769, 139, 285, 632, 724, 776, 785, 872, 1000, 1296,
     1353, 1503, 1761, 2006, 2153, 2473, 2685, 3501, 3845, 5037,
+    6209, 6673, 7406, 8031, 9156, 10185, 11325, 12661, 13765, 14829,
+    15991, 17097, 18304, 19492, 20750, 21873, 22988, 24139, 25376, 26612,
+    27855, 28991, 30127, 31364, 32540, 33784, 34906, 36071, 37299, 38542,
+    39783, 40915, 42067, 43298, 44531, 45772, 46995, 48126, 49370, 50591,
+    51744, 52980, 54112, 55371, 56590, 57822, 58994, 60235, 61473, 62691,
+    63824, 65067, 66299, 67514, 68760, 69982, 71119, 72354, 73590, 74821,
+    76044, 77295, 78431, 79663, 80890, 82115, 83379, 84597, 85731, 86980,
+    88122, 89354, 90591, 91730, 92975, 94108, 95344, 96592, 97731, 98970,
 ]
 COCO_BASE = "http://images.cocodataset.org/val2017/{:012d}.jpg"
 
@@ -282,7 +290,7 @@ def compile_model(model, state_dict, sample_images, processor):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare FP32 vs golden model inference")
-    parser.add_argument("--max-images", type=int, default=5)
+    parser.add_argument("--max-images", type=int, default=100)
     parser.add_argument("--top-k", type=int, default=5)
     args = parser.parse_args()
 

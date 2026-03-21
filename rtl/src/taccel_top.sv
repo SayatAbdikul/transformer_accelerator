@@ -133,6 +133,11 @@ module taccel_top
   // Dispatch signals
   logic dma_dispatch, sys_dispatch, sfu_dispatch, alu_dispatch;
 
+  // Explicit intermediate: Icarus fails to evaluate complex expressions in port
+  // connections (e.g. enum comparisons), so we pull is_store out to a named wire.
+  logic dma_is_store;
+  assign dma_is_store = (insn_data_q[63:59] == 5'(OP_STORE));
+
   // DMA engine status
   logic       dma_busy;
   logic       dma_fault_w;
@@ -173,9 +178,11 @@ module taccel_top
     .insn_data      (insn_data_w),
     .m_axi_ar_addr  (fetch_ar_addr),
     .m_axi_ar_valid (fetch_ar_valid),
+    /* verilator lint_off PINCONNECTEMPTY */
     .m_axi_ar_len   (),                // always 0; mux uses dma_ar_len / 0
     .m_axi_ar_size  (),                // always 3'b100; fixed in mux
     .m_axi_ar_burst (),                // always 2'b01; fixed in mux
+    /* verilator lint_on PINCONNECTEMPTY */
     .m_axi_ar_ready (fetch_ar_ready),
     .m_axi_r_data   (m_axi_r_data),
     .m_axi_r_resp   (m_axi_r_resp),
@@ -255,7 +262,7 @@ module taccel_top
     .rst_n           (rst_n),
     // Dispatch
     .dispatch        (dma_dispatch),
-    .is_store        (insn.opcode == OP_STORE),
+    .is_store        (dma_is_store),
     .buf_id          (insn.m_buf_id),
     .sram_off        (insn.m_sram_off),
     .xfer_len        (insn.m_xfer_len),

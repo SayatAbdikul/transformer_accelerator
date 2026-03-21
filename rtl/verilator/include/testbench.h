@@ -180,64 +180,131 @@ public:
         return mem_[addr];
     }
 
-    // Drive AXI slave outputs given DUT's master outputs (call every cycle)
+    // Drive AXI slave outputs given DUT's master outputs (call every cycle).
+    // Handles AR/R (reads, single-beat model) and AW/W/B (writes, multi-beat).
     void tick(Vtaccel_top* dut, int latency = 2) {
-        // AR channel: always ready; accept new request
+        // ----------------------------------------------------------------
+        // AR channel: accept one outstanding read request at a time
+        // ----------------------------------------------------------------
         dut->m_axi_ar_ready = 1;
         if (dut->m_axi_ar_valid && !pending_valid_) {
             uint64_t aligned = (uint64_t)dut->m_axi_ar_addr & ~uint64_t(0xF);
-            pending_addr_  = aligned;
-            pending_timer_ = latency;
-            pending_valid_ = true;
+            pending_addr_    = aligned;
+            pending_ar_len_  = dut->m_axi_ar_len;   // burst beat count - 1
+            pending_beat_    = 0;
+            pending_timer_   = latency;
+            pending_valid_   = true;
         }
 
-        // R channel
+        // ----------------------------------------------------------------
+        // R channel: serve one beat per call when timer fires
+        // ----------------------------------------------------------------
         if (r_valid_) {
             if (dut->m_axi_r_ready) {
-                r_valid_       = false;
+                r_valid_           = false;
                 dut->m_axi_r_valid = 0;
+                dut->m_axi_r_last  = 0;
+                // If more beats remain in this burst, queue next beat
+                if (pending_beat_ <= (int)pending_ar_len_) {
+                    pending_timer_ = 1;  // next beat next cycle
+                }
             }
-            // hold r_valid + r_data until accepted
         } else if (pending_valid_) {
             if (pending_timer_ > 0) {
                 pending_timer_--;
             } else {
-                // Build 128-bit (16-byte) response, little-endian
-                // rdata[7:0] = mem[addr+0], rdata[15:8] = mem[addr+1], ...
-                // We drive the 128-bit field as two 64-bit halves:
-                //   rdata_lo = mem[addr+0..7]  (insn at even PC)
-                //   rdata_hi = mem[addr+8..15] (insn at odd PC)
-                // Note: we store instructions big-endian so mem[addr] = MSByte
-                // The fetch_unit does a byte-swap after extraction.
+                // Build 16-byte response for current beat
+                uint64_t beat_addr = pending_addr_ + (uint64_t)pending_beat_ * 16;
                 uint64_t lo = 0, hi = 0;
-                for (int b = 0; b < 8 && pending_addr_+b < mem_.size(); b++)
-                    lo |= (uint64_t)mem_[pending_addr_+b] << (b*8);
-                for (int b = 0; b < 8 && pending_addr_+8+b < mem_.size(); b++)
-                    hi |= (uint64_t)mem_[pending_addr_+8+b] << (b*8);
+                for (int b = 0; b < 8 && beat_addr+b < mem_.size(); b++)
+                    lo |= (uint64_t)mem_[beat_addr+b] << (b*8);
+                for (int b = 0; b < 8 && beat_addr+8+b < mem_.size(); b++)
+                    hi |= (uint64_t)mem_[beat_addr+8+b] << (b*8);
 
-                // Drive r_data as a byte array (128 bits)
-                // Verilator represents [127:0] as WData[3] (4×32-bit words)
                 uint32_t* rdata = dut->m_axi_r_data.data();
                 rdata[0] = lo & 0xFFFFFFFF;
                 rdata[1] = (lo >> 32) & 0xFFFFFFFF;
                 rdata[2] = hi & 0xFFFFFFFF;
                 rdata[3] = (hi >> 32) & 0xFFFFFFFF;
 
+                bool is_last = (pending_beat_ >= (int)pending_ar_len_);
                 dut->m_axi_r_valid = 1;
-                dut->m_axi_r_last  = 1;
+                dut->m_axi_r_last  = is_last ? 1 : 0;
                 dut->m_axi_r_resp  = 0;
-                r_valid_      = true;
-                pending_valid_ = false;
+                r_valid_           = true;
+                pending_beat_++;
+                if (is_last)
+                    pending_valid_ = false;
             }
+        }
+
+        // ----------------------------------------------------------------
+        // AW channel: accept write address
+        // ----------------------------------------------------------------
+        dut->m_axi_aw_ready = 1;
+        if (dut->m_axi_aw_valid && !aw_pending_) {
+            aw_addr_    = (uint64_t)dut->m_axi_aw_addr;
+            aw_len_     = dut->m_axi_aw_len;
+            w_beat_cnt_ = 0;
+            aw_pending_ = true;
+        }
+
+        // ----------------------------------------------------------------
+        // W channel: accept write data beats
+        // ----------------------------------------------------------------
+        if (aw_pending_) {
+            dut->m_axi_w_ready = 1;
+            if (dut->m_axi_w_valid) {
+                // Write 16 bytes to memory
+                uint64_t beat_addr = aw_addr_ + (uint64_t)w_beat_cnt_ * 16;
+                uint32_t* wdata = dut->m_axi_w_data.data();
+                for (int b = 0; b < 16 && beat_addr+b < mem_.size(); b++)
+                    mem_[beat_addr+b] = (uint8_t)((wdata[b/4] >> ((b%4)*8)) & 0xFF);
+                bool last = dut->m_axi_w_last || (w_beat_cnt_ >= (int)aw_len_);
+                w_beat_cnt_++;
+                if (last) {
+                    aw_pending_ = false;
+                    b_pending_  = true;
+                    // Keep w_ready=1 this cycle so DUT sees it on posedge;
+                    // the else branch below will clear it next cycle.
+                }
+            }
+        } else {
+            dut->m_axi_w_ready = 0;
+        }
+
+        // ----------------------------------------------------------------
+        // B channel: send write response
+        // ----------------------------------------------------------------
+        if (b_pending_) {
+            dut->m_axi_b_valid = 1;
+            dut->m_axi_b_resp  = 0;
+            if (dut->m_axi_b_ready) {
+                b_pending_ = false;
+                // Keep b_valid=1 this cycle so DUT sees it on posedge;
+                // the else branch below will clear it next cycle.
+            }
+        } else {
+            dut->m_axi_b_valid = 0;
+            dut->m_axi_b_resp  = 0;
         }
     }
 
 private:
     std::vector<uint8_t> mem_;
+    // Read state
     bool     pending_valid_;
     uint64_t pending_addr_;
+    int      pending_ar_len_;
+    int      pending_beat_;
     int      pending_timer_;
     bool     r_valid_;
+    // Write state
+    bool     aw_pending_;
+    uint64_t aw_addr_;
+    int      aw_len_;
+    int      w_beat_cnt_;
+    bool     b_pending_;
 };
 
 // ============================================================================

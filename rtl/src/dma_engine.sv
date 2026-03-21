@@ -59,7 +59,7 @@ module dma_engine
   output logic                   dma_r_ready,
 
   // --- AXI4 write channels (STORE) ---
-  output logic [AXI_ADDR_W-1:0] dma_aw_addr,
+  output logic [AXI_ADDR_W-1:0]  dma_aw_addr,
   output logic [7:0]             dma_aw_len,
   output logic                   dma_aw_valid,
   input  logic                   dma_aw_ready,
@@ -98,9 +98,11 @@ module dma_engine
   logic [15:0] beat_cnt;
   logic [3:0]  fault_code_r;
 
+
   // OOB: end address (57-bit to detect overflow past 56-bit max)
+  // {37'h0, xfer_len_q, 4'b0} = 37+16+4 = 57 bits = xfer_len × 16
   logic [56:0] dram_end;
-  assign dram_end = {1'b0, dram_byte_addr_q} + {1'b0, xfer_len_q, 4'b0};
+  assign dram_end = {1'b0, dram_byte_addr_q} + {37'h0, xfer_len_q, 4'b0};
   logic oob;
   assign oob = (dram_end > 57'(DRAM_SIZE));
 

@@ -21,7 +21,7 @@ big-endian instruction word.
 
 import struct
 import cocotb
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import RisingEdge, Timer
 
 
 class DramModel:
@@ -54,15 +54,28 @@ class DramModel:
     def read_bytes(self, addr: int, length: int) -> bytes:
         return bytes(self.mem[addr:addr + length])
 
+    @staticmethod
+    def _sig_int(sig, default: int = 0) -> int:
+        """Best-effort signal conversion that tolerates unresolved X/Z values."""
+        try:
+            v = sig.value
+            return int(v) if v.is_resolvable else default
+        except Exception:
+            return default
+
     # -----------------------------------------------------------------------
     # AXI4 slave coroutine
     # -----------------------------------------------------------------------
 
     async def axi_slave(self, dut, latency: int = 2) -> None:
-        """Coroutine: drive AXI4 read slave signals continuously.
+        """Coroutine: drive AXI4 read slave (AR/R channels only).
 
-        Connects to DUT's m_axi_* ports.  Run as a background task:
+        Handles multi-beat AR/R bursts. Start axi_write_slave() separately
+        for AW/W/B support.
+
+        Run as background tasks:
             cocotb.start_soon(dram.axi_slave(dut))
+            cocotb.start_soon(dram.axi_write_slave(dut))  # for STORE
         """
         dut.m_axi_ar_ready.value = 1
         dut.m_axi_r_valid.value  = 0
@@ -70,42 +83,154 @@ class DramModel:
         dut.m_axi_r_resp.value   = 0
         dut.m_axi_r_last.value   = 0
 
-        pending = []  # list of (addr, countdown)
+        # pending: list of {'addr': int, 'ar_len': int, 'beat': int, 'cd': int}
+        pending = []
 
         while True:
             await RisingEdge(dut.clk)
 
+            # Keep read channel quiescent during reset.
+            if self._sig_int(dut.rst_n, default=0) == 0:
+                pending.clear()
+                dut.m_axi_ar_ready.value = 1
+                dut.m_axi_r_valid.value  = 0
+                dut.m_axi_r_last.value   = 0
+                continue
+
             # Accept new AR transaction
-            if dut.m_axi_ar_valid.value and dut.m_axi_ar_ready.value:
-                aligned = int(dut.m_axi_ar_addr.value) & ~0xF
-                pending.append([aligned, latency])
+            if self._sig_int(dut.m_axi_ar_valid, 0) and self._sig_int(dut.m_axi_ar_ready, 0):
+                aligned  = int(dut.m_axi_ar_addr.value) & ~0xF
+                ar_len   = int(dut.m_axi_ar_len.value)
+                pending.append({'addr': aligned, 'ar_len': ar_len,
+                                'beat': 0, 'cd': latency})
 
-            # Decrement pending counters
+            # Decrement countdowns
             for req in pending:
-                req[1] -= 1
+                if req['cd'] > 0:
+                    req['cd'] -= 1
 
-            # Serve the oldest ready request
-            served = []
+            # Serve one beat for the oldest ready request
             for req in pending:
-                if req[1] <= 0:
-                    aligned_addr = req[0]
-                    # Build 128-bit response: 16 bytes, little-endian in r_data
-                    chunk = self.mem[aligned_addr:aligned_addr + 16]
-                    chunk = chunk.ljust(16, b'\x00')  # pad if at DRAM boundary
+                if req['cd'] <= 0:
+                    beat_addr = req['addr'] + req['beat'] * 16
+                    chunk = self.mem[beat_addr:beat_addr + 16]
+                    chunk = bytes(chunk).ljust(16, b'\x00')
                     val = int.from_bytes(chunk, 'little')
-                    dut.m_axi_r_data.value = val
+                    dut.m_axi_r_data.value  = val
                     dut.m_axi_r_valid.value = 1
-                    dut.m_axi_r_resp.value  = 0   # OKAY
-                    dut.m_axi_r_last.value  = 1
-                    served.append(req)
-                    # Wait for master to accept
+                    dut.m_axi_r_resp.value  = 0
+                    is_last = (req['beat'] >= req['ar_len'])
+                    dut.m_axi_r_last.value  = 1 if is_last else 0
+
+                    # Gate ar_ready while waiting for this beat to be accepted,
+                    # so a concurrent fetch AR isn't silently dropped.
+                    dut.m_axi_ar_ready.value = 0
+
+                    # Wait for master to accept this beat
                     while True:
                         await RisingEdge(dut.clk)
-                        if dut.m_axi_r_ready.value:
+                        if self._sig_int(dut.m_axi_r_ready, 0):
                             break
-                    dut.m_axi_r_valid.value = 0
-                    dut.m_axi_r_last.value  = 0
-                    break  # serve one per iteration
+                    dut.m_axi_r_valid.value  = 0
+                    dut.m_axi_r_last.value   = 0
+                    dut.m_axi_ar_ready.value = 1  # re-open AR channel
 
-            for req in served:
-                pending.remove(req)
+                    if is_last:
+                        pending.remove(req)
+                    else:
+                        req['beat'] += 1
+                        req['cd'] = 1   # next beat next cycle
+                    break  # one beat per outer loop iteration
+
+    async def axi_write_slave(self, dut) -> None:
+        """Coroutine: drive AXI4 write slave (AW/W/B channels).
+
+        Run as a background task alongside axi_slave():
+            cocotb.start_soon(dram.axi_write_slave(dut))
+        """
+        dut.m_axi_aw_ready.value = 1
+        dut.m_axi_w_ready.value  = 0
+        dut.m_axi_b_valid.value  = 0
+        dut.m_axi_b_resp.value   = 0
+
+        while True:
+            await RisingEdge(dut.clk)
+
+            # Keep channel outputs in a safe state while reset is asserted.
+            if self._sig_int(dut.rst_n, default=0) == 0:
+                dut.m_axi_aw_ready.value = 1
+                dut.m_axi_w_ready.value  = 0
+                dut.m_axi_b_valid.value  = 0
+                dut.m_axi_b_resp.value   = 0
+                continue
+
+            # Accept AW only on an edge-stable handshake. Do not use delta-only
+            # acceptance; that can make the model think AW happened while the DUT
+            # (which samples on clock edges) does not.
+            aw_v = self._sig_int(dut.m_axi_aw_valid, 0)
+            aw_r = self._sig_int(dut.m_axi_aw_ready, 0)
+            if aw_v == 0 or aw_r == 0:
+                continue
+
+            aw_addr = int(dut.m_axi_aw_addr.value)
+            aw_len = int(dut.m_axi_aw_len.value)
+            beats_expected = aw_len + 1
+            dut._log.info(f"[write_slave] AW: addr=0x{aw_addr:08x} len={aw_len}")
+
+            # Block additional AW while this burst is in flight.
+            dut.m_axi_aw_ready.value = 0
+            dut.m_axi_w_ready.value = 1
+
+            beat = 0
+            while beat < beats_expected:
+                await RisingEdge(dut.clk)
+
+                if self._sig_int(dut.rst_n, default=0) == 0:
+                    dut.m_axi_w_ready.value = 0
+                    dut.m_axi_b_valid.value = 0
+                    dut.m_axi_aw_ready.value = 1
+                    break
+
+                # Accept W only on an edge-stable handshake.
+                w_valid = self._sig_int(dut.m_axi_w_valid, 0)
+                w_ready = self._sig_int(dut.m_axi_w_ready, 0)
+                if not (w_valid and w_ready):
+                    continue
+
+                w_val = int(dut.m_axi_w_data.value)
+                w_strb = int(dut.m_axi_w_strb.value)
+                w_last = self._sig_int(dut.m_axi_w_last, 0)
+
+                beat_addr = aw_addr + beat * 16
+                for b in range(16):
+                    if ((w_strb >> b) & 0x1) and (beat_addr + b < self.size):
+                        self.mem[beat_addr + b] = (w_val >> (b * 8)) & 0xFF
+
+                expected_last = 1 if beat == beats_expected - 1 else 0
+                if w_last != expected_last:
+                    dut._log.warning(
+                        f"[write_slave] WLAST mismatch beat={beat} w_last={w_last} expected={expected_last}"
+                    )
+
+                beat += 1
+
+            # If reset hit during beat collection, restart in idle state.
+            if beat < beats_expected:
+                continue
+
+            dut.m_axi_w_ready.value = 0
+
+            # Send B response.
+            dut.m_axi_b_valid.value = 1
+            dut.m_axi_b_resp.value = 0
+            while True:
+                await RisingEdge(dut.clk)
+                if self._sig_int(dut.rst_n, default=0) == 0:
+                    dut.m_axi_b_valid.value = 0
+                    break
+                if self._sig_int(dut.m_axi_b_ready, 0):
+                    dut.m_axi_b_valid.value = 0
+                    break
+
+            # Re-open AW channel for next transaction.
+            dut.m_axi_aw_ready.value = 1

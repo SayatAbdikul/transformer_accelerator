@@ -13,12 +13,12 @@ TOPLEVEL_LANG ?= verilog
 SIM           ?= icarus     # icarus | verilator | vcs | xsim
 
 TOPLEVEL      := taccel_top
-MODULE        := test_fetch_decode
+MODULE        := test_fetch_decode,test_dma
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
 
-# All SV source files for Phase 1 (order matters for Icarus)
+# All SV source files for Phase 2 (order matters for Icarus)
 VERILOG_SOURCES := \
   $(INCLUDE_DIR)/taccel_pkg.sv \
   $(SRC_DIR)/decode_unit.sv \
@@ -27,6 +27,7 @@ VERILOG_SOURCES := \
   $(SRC_DIR)/memory/sram_dp.sv \
   $(SRC_DIR)/memory/register_file.sv \
   $(SRC_DIR)/memory/sram_subsystem.sv \
+  $(SRC_DIR)/dma_engine.sv \
   $(SRC_DIR)/taccel_top.sv
 
 # Include paths

@@ -7,7 +7,7 @@ from ..isa.encoding import encode
 from ..isa.instructions import Instruction
 
 
-MAGIC = 0x54414343  # "TACC"
+MAGIC = 0x54414343  # "TACC", needed fro checking the binary file format and version compatibility.
 VERSION = 0x0001
 HEADER_SIZE = 32
 
@@ -93,8 +93,8 @@ class Assembler:
         insn_bytes = bytearray()
         for line in lines:
             _, insn = parse_line(line)
-            if insn is not None:
-                insn_bytes.extend(encode(insn))
+            if insn is not None: 
+                insn_bytes.extend(encode(insn)) # encding the instruction class
 
         insn_count = len(insn_bytes) // 8
         return ProgramBinary(
