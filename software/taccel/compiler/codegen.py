@@ -58,6 +58,12 @@ class CodeGenerator:
         # Maps output_name → DRAM byte offset of the spilled data
         self.dram_temp_outputs: Dict[str, int] = {}
 
+    def _dram_offset_required(self, name: str, context: str) -> int:
+        """Return DRAM offset for a symbol or raise a clear error."""
+        if name not in self.dram_layout:
+            raise KeyError(f"Missing DRAM symbol '{name}' while {context}")
+        return self.dram_layout[name]
+
     def generate(self, graph: IRGraph) -> Tuple[List[Instruction], bytes]:
         """Generate instructions for the entire IR graph.
 
@@ -230,7 +236,7 @@ class CodeGenerator:
         # Load weights to WBUF via allocator so live attn@V outputs are not clobbered.
         # (Previously hardcoded to offset 0, which overwrote head N-1's attn@V output
         # when loading head N's Q/K/V weights, destroying per-image information.)
-        dram_off = self.dram_layout.get(weight_name, 0)
+        dram_off = self._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
         weight_bytes = w_q.size
         w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
         self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
@@ -261,7 +267,9 @@ class CodeGenerator:
 
         # Bias add if present
         bias_name = node.attrs.get("bias")
-        if bias_name and bias_name in self.prescaled_biases:
+        if bias_name:
+            if bias_name not in self.prescaled_biases:
+                raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
             self._emit_bias_add(bias_name, N_pad, m_tiles)
 
         # Requantize: scale = input_act_scale × mean(weight_scale) / target_act_scale
@@ -297,7 +305,7 @@ class CodeGenerator:
         strip_rows = TILE
 
         # Load weights to WBUF via allocator so live WBUF data is not clobbered.
-        dram_off = self.dram_layout.get(weight_name, 0)
+        dram_off = self._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
         weight_bytes = w_q.size
         w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
         self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
@@ -351,7 +359,9 @@ class CodeGenerator:
 
             # Bias add
             bias_name = node.attrs.get("bias")
-            if bias_name and bias_name in self.prescaled_biases:
+            if bias_name:
+                if bias_name not in self.prescaled_biases:
+                    raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
                 self._emit_bias_add(bias_name, N_pad, 1)
 
             # Requantize strip: scale = input_act_scale × mean(weight_scale) / target_act_scale
@@ -405,7 +415,7 @@ class CodeGenerator:
 
     def _emit_bias_add(self, bias_name: str, N_pad: int, m_tiles: int):
         """Emit bias load + VADD to accumulator."""
-        bias_dram_off = self.dram_layout.get(bias_name, 0)
+        bias_dram_off = self._dram_offset_required(bias_name, f"loading bias '{bias_name}'")
         bias_bytes = N_pad * 4  # INT32
 
         # Load bias to WBUF (temporary location after weights)
@@ -449,8 +459,9 @@ class CodeGenerator:
         if M_pad > real_seq:
             pad_rows = M_pad - real_seq
             k_pad_units = k_alloc.offset_units + (real_seq * K_pad) // UNIT
+            zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading K padding mask")
             self._emit_dma_load(BUF_ABUF, k_pad_units, pad_rows * K_pad, 3,
-                                self.dram_layout.get("__zero_pad__", 0))
+                                zero_pad_dram)
             self._emit(SyncInsn(resource_mask=0b001))
 
         src_rows = M_pad // TILE
@@ -539,8 +550,9 @@ class CodeGenerator:
         if M_pad > real_seq:
             pad_rows = M_pad - real_seq
             v_pad_units = v_alloc.offset_units + (real_seq * N_pad) // UNIT
+            zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading V padding mask")
             self._emit_dma_load(BUF_ABUF, v_pad_units, pad_rows * N_pad, 3,
-                                self.dram_layout.get("__zero_pad__", 0))
+                                zero_pad_dram)
             self._emit(SyncInsn(resource_mask=0b001))
 
         m_tiles = M_pad // TILE
@@ -744,8 +756,8 @@ class CodeGenerator:
         beta_data = self.weight_data.get(beta_name)
 
         if gamma_data is not None and beta_data is not None:
-            gamma_dram = self.dram_layout.get(gamma_name, 0)
-            beta_dram = self.dram_layout.get(beta_name, 0)
+            gamma_dram = self._dram_offset_required(gamma_name, f"loading layernorm gamma for '{node.name}'")
+            beta_dram = self._dram_offset_required(beta_name, f"loading layernorm beta for '{node.name}'")
             # Pack gamma then beta in WBUF
             gb_bytes = N_pad * 4  # gamma[N] FP16 + beta[N] FP16 = N*4 bytes
             gb_alloc = self.mem.wbuf.alloc(f"gb_{node.name}", gb_bytes)
@@ -839,7 +851,7 @@ class CodeGenerator:
     def _emit_cls_prepend(self, node: IRNode):
         """Emit CLS token prepend: load CLS to ABUF[0], then DMA patches to rows 1-196."""
         cls_name = node.inputs[1]
-        cls_dram = self.dram_layout.get(cls_name, 0)
+        cls_dram = self._dram_offset_required(cls_name, "loading cls token")
         # Load CLS token [1, 192] = 192 bytes = 12 × 16-byte units to ABUF row 0
         self._emit_dma_load(BUF_ABUF, 0, 192, 0, cls_dram)
         self._emit(SyncInsn(resource_mask=0b001))
@@ -856,7 +868,7 @@ class CodeGenerator:
     def _emit_pos_embed_add(self, node: IRNode):
         """Emit position embedding add."""
         pos_name = node.inputs[1]
-        pos_dram = self.dram_layout.get(pos_name, 0)
+        pos_dram = self._dram_offset_required(pos_name, "loading position embeddings")
         M_pad = pad_dim(197)
         N = 192
         N_pad = pad_dim(N)

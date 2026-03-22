@@ -257,6 +257,18 @@ class Compiler:
         input_patches_dram_off = codegen.dram_layout.get("__input_patches__", 0)
         input_offset = data_base + input_patches_dram_off
 
+        # pos_embed_patch_dram_offset: DRAM-absolute start of patch rows (rows 1-196)
+        # in the position_embeddings tensor.  Row 0 is the CLS position embedding and
+        # must stay intact; rows 1-196 are the patch embeddings that the host folds
+        # into the patch input (B3 preprocessing) to save one INT8 quantisation step.
+        pos_emb_key = "vit.embeddings.position_embeddings"
+        pos_emb_dram_start = codegen.dram_layout.get(pos_emb_key, None)
+        if pos_emb_dram_start is not None:
+            # Row 0 (192 bytes) = CLS position embedding → skip it
+            pos_embed_patch_dram_offset = data_base + pos_emb_dram_start + EMBED_DIM
+        else:
+            pos_embed_patch_dram_offset = 0
+
         return ProgramBinary(
             instructions=bytes(patched),
             data=dram_data,
@@ -264,6 +276,7 @@ class Compiler:
             insn_count=len(instructions),
             data_base=data_base,
             input_offset=input_offset,
+            pos_embed_patch_dram_offset=pos_embed_patch_dram_offset,
         )
 
     def _default_calibration_scales(self, state_dict: dict) -> Dict[str, float]:
@@ -310,6 +323,7 @@ class Compiler:
         # Add per-head bias slices for Q/K/V
         for layer_idx in range(12):
             prefix = f"vit.encoder.layer.{layer_idx}"
+            ln1_scale = cal_scales.get(f"block{layer_idx}_ln1", default_act_scale)
             for proj in ["query", "key", "value"]:
                 bname = f"{prefix}.attention.attention.{proj}.bias"
                 wname = f"{prefix}.attention.attention.{proj}.weight"
@@ -322,7 +336,7 @@ class Compiler:
                 for h in range(NUM_HEADS):
                     b_h = bias_fp32[h * HEAD_DIM:(h + 1) * HEAD_DIM]
                     s_h = w_scales_full[h * HEAD_DIM:(h + 1) * HEAD_DIM]
-                    act_scale = np.array([6.0 / 127.0])
+                    act_scale = np.array([ln1_scale], dtype=np.float32)
                     bias_i32 = self.scale_prop.prescale_bias(b_h, act_scale, s_h)
                     prescaled[f"{bname}_h{h}"] = bias_i32
 

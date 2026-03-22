@@ -21,6 +21,7 @@ class ProgramBinary:
     insn_count: int = 0
     data_base: int = 0    # byte offset of data section in unified DRAM image (0 = legacy)
     input_offset: int = 0  # byte offset of input patches region in unified DRAM image
+    pos_embed_patch_dram_offset: int = 0  # byte offset of patch rows of pos_embed (rows 1-196)
 
     def to_bytes(self) -> bytes:
         data_offset = HEADER_SIZE + len(self.instructions)

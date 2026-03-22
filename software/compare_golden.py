@@ -80,10 +80,8 @@ def collect_images(max_images: int):
             img_id, img = future.result()
             if img is not None:
                 collected.append((img_id, img))
-                if len(collected) >= max_images:
-                    for f in futures:
-                        f.cancel()
-                    break
+    # Deterministic subset selection: prefer lowest COCO IDs among successful fetches.
+    # Avoid race-dependent "first completed" sampling, which causes metric drift.
     collected.sort(key=lambda x: x[0])
     return collected[:max_images]
 
@@ -99,6 +97,11 @@ def patch_embed_int8(model, processor, image, act_scale=None):
     """Run patch embedding on CPU and quantize to INT8 for the accelerator.
 
     Returns (int8_patches, scale) where int8_patches is [NUM_PATCHES, EMBED_DIM].
+
+    B3 optimisation: patch position embeddings are added in FP32 before
+    quantisation (one INT8 quantisation step instead of two).  The compiled
+    program must have the corresponding DRAM patch-pos-embed rows zeroed out
+    so the in-program VADD becomes a no-op for those rows (see golden_inference).
 
     act_scale must match the embedding scale used in the compiled program for
     CLS token and position embeddings (cal_scales["pos_embed_add"]).
@@ -116,8 +119,15 @@ def patch_embed_int8(model, processor, image, act_scale=None):
         # Reshape to [196, 192]
         embedded = embedded.flatten(2).transpose(1, 2).squeeze(0)  # [196, 192]
 
+        # B3: fold patch position embeddings into host preprocessing.
+        # pos_embed shape: [1, 197, 192]; rows 1:197 are the patch positions.
+        pos_embed = model.vit.embeddings.position_embeddings  # [1, 197, 192]
+        patch_pos = pos_embed[0, 1:NUM_PATCHES + 1].numpy().astype(np.float32)  # [196, 192]
+
     patches_fp32 = embedded.numpy().astype(np.float32)
-    patches_int8 = np.clip(np.round(patches_fp32 / act_scale), -128, 127).astype(np.int8)
+    # FP32 sum: one rounding step instead of INT8(patches) + INT8(pos_embed)
+    combined_fp32 = patches_fp32 + patch_pos
+    patches_int8 = np.clip(np.round(combined_fp32 / act_scale), -128, 127).astype(np.int8)
     return patches_int8, act_scale
 
 
@@ -141,6 +151,14 @@ def golden_inference(program, patches_int8, num_classes=1000):
     dram_off = program.input_offset
     state.dram[dram_off:dram_off + len(patch_bytes)] = patch_bytes
 
+    # B3: patch pos_embed was folded into patches on the host side; zero out
+    # those DRAM rows so the in-program VADD becomes a no-op for patch rows
+    # (prevents double-counting pos_embed).
+    if program.pos_embed_patch_dram_offset > 0:
+        patch_pos_size = NUM_PATCHES * pad_dim(EMBED_DIM)
+        off = program.pos_embed_patch_dram_offset
+        state.dram[off:off + patch_pos_size] = bytes(patch_pos_size)
+
     # Run simulation
     count = sim.run()
 
@@ -149,13 +167,26 @@ def golden_inference(program, patches_int8, num_classes=1000):
     return logits_int32.astype(np.float32), count, state.cycle_count
 
 
-def calibrate_softmax_scales(model, sample_inputs: list) -> dict:
-    """Capture max attention probability per (layer, head) for softmax scale calibration.
+def calibrate_softmax_scales(
+    model,
+    sample_inputs: list,
+    mode: str = "max",
+    percentile: float = 99.0,
+    min_prob: float = 1e-4,
+    max_prob: float = 1.0,
+) -> tuple:
+    """Capture per-head attention probabilities and QKT max_abs for calibration.
 
-    Uses model's built-in output_attentions=True to get attention weights directly.
-    Returns {(layer_idx, head_idx): max_prob} across all sample inputs.
+    mode="max": uses the largest observed per-image max for each (layer, head).
+    mode="percentile": uses a percentile of per-image maxima to reduce outlier impact.
+
+    Returns (softmax_probs, qkt_max_abs):
+      softmax_probs: {(layer_idx, head_idx): calibrated_prob}
+      qkt_max_abs:   {(layer_idx, head_idx): max_abs of Q@K^T/sqrt(d) over samples}
     """
-    max_attn = {}  # {(layer_idx, head_idx): max_prob}
+    import math as _math
+    attn_samples = {}  # {(layer_idx, head_idx): [max_prob_per_image]}
+    qkt_samples = {}   # {(layer_idx, head_idx): [max_abs_qkt_per_image]}
 
     # Build a temporary copy with eager attn + output_attentions enabled.
     # output_attentions requires attn_implementation='eager' (SDPA doesn't support it).
@@ -165,6 +196,28 @@ def calibrate_softmax_scales(model, sample_inputs: list) -> dict:
     attn_model = type(model)(cfg)
     attn_model.load_state_dict(model.state_dict())
     attn_model.eval()
+
+    # Hook each ViTSelfAttention to capture pre-softmax QKT max_abs per head.
+    # Runs Q/K projections a second time inside the hook (diagnostics overhead only).
+    handles = []
+    for layer_idx in range(DEPTH):
+        def _make_qkt_hook(l_idx):
+            def hook(module, inputs, output):
+                hidden = inputs[0]
+                with torch.no_grad():
+                    q = module.transpose_for_scores(module.query(hidden))
+                    k = module.transpose_for_scores(module.key(hidden))
+                    qkt = torch.matmul(q, k.transpose(-1, -2)) / _math.sqrt(
+                        module.attention_head_size)
+                    for h in range(qkt.shape[1]):
+                        key = (l_idx, h)
+                        if key not in qkt_samples:
+                            qkt_samples[key] = []
+                        qkt_samples[key].append(float(qkt[0, h].abs().max().item()))
+            return hook
+        h = attn_model.vit.encoder.layer[layer_idx].attention.attention \
+                .register_forward_hook(_make_qkt_hook(layer_idx))
+        handles.append(h)
 
     with torch.no_grad():
         for inp in sample_inputs:
@@ -176,13 +229,36 @@ def calibrate_softmax_scales(model, sample_inputs: list) -> dict:
                     for h in range(attn_weights.shape[1]):
                         max_prob = float(attn_weights[0, h].max().item())
                         key = (layer_idx, h)
-                        max_attn[key] = max(max_attn.get(key, 0.0), max_prob)
+                        if key not in attn_samples:
+                            attn_samples[key] = []
+                        attn_samples[key].append(max_prob)
 
+    for h in handles:
+        h.remove()
     del attn_model
-    return max_attn
+
+    softmax_probs = {}
+    for key, vals in attn_samples.items():
+        arr = np.array(vals, dtype=np.float32)
+        if mode == "percentile":
+            raw = float(np.percentile(arr, percentile))
+        else:
+            raw = float(np.max(arr))
+        softmax_probs[key] = float(np.clip(raw, min_prob, max_prob))
+
+    qkt_max_abs = {}
+    for key, vals in qkt_samples.items():
+        arr = np.array(vals, dtype=np.float32)
+        if mode == "percentile":
+            qkt_max_abs[key] = float(np.percentile(arr, percentile))
+        else:
+            qkt_max_abs[key] = float(np.max(arr))
+
+    return softmax_probs, qkt_max_abs
 
 
-def build_calibration_scales(calibration, softmax_max_probs: dict = None) -> dict:
+def build_calibration_scales(calibration, softmax_max_probs: dict = None,
+                             qkt_max_abs: dict = None) -> dict:
     """Map calibration module output scales to IR node names used by the codegen."""
     cal = calibration.scales  # module_name → float scale
 
@@ -218,10 +294,17 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None) -> dic
             scales[f"{b}_head{h}_query"] = q_scale
             scales[f"{b}_head{h}_key"] = k_scale
             scales[f"{b}_head{h}_value"] = v_scale
-            scales[f"{b}_head{h}_qkt"] = 6.0 / 127.0
+            # Per-head calibrated QKT scale: covers the observed max of Q@K^T/sqrt(d).
+            # Previously hardcoded to 6.0/127.0, which clipped 10/36 heads (up to 4.3×).
+            if qkt_max_abs and (i, h) in qkt_max_abs:
+                qkt_max = qkt_max_abs[(i, h)]
+            else:
+                qkt_max = 6.0  # fallback to original default
+            qkt_scale = max(qkt_max, 1e-2) / 127.0
+            scales[f"{b}_head{h}_qkt"] = qkt_scale
             # scale_mul is a no-op in codegen (0.125 is baked into QKT REQUANT),
             # so the WBUF data has the same scale as the QKT output.
-            scales[f"{b}_head{h}_scale"] = 6.0 / 127.0
+            scales[f"{b}_head{h}_scale"] = qkt_scale
             # Per-head softmax scale: calibrated to each head's max attention probability.
             # Heads with sharp CLS self-attention (≈99%) get a coarse scale;
             # heads with diffuse attention (≈10%) get a fine scale preserving variation.
@@ -230,6 +313,8 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None) -> dic
             else:
                 max_prob = 0.20
             scales[f"{b}_head{h}_softmax"] = max(max_prob, 1e-4) / 127.0
+
+        for h in range(NUM_HEADS):
             scales[f"{b}_head{h}_attn_v"] = v_scale
 
         # Concatenated head outputs feed into out_proj
@@ -264,7 +349,16 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None) -> dic
     return scales
 
 
-def compile_model(model, state_dict, sample_images, processor):
+def compile_model(
+    model,
+    state_dict,
+    sample_images,
+    processor,
+    softmax_mode="max",
+    softmax_percentile=99.0,
+    softmax_min_prob=1e-4,
+    softmax_max_prob=1.0,
+):
     """Compile the model to a ProgramBinary using calibration from sample images.
 
     Returns (program, cal_scales) so callers can pass the embedding scale to
@@ -273,15 +367,29 @@ def compile_model(model, state_dict, sample_images, processor):
     print("  Calibrating activation scales...")
     sample_inputs = [processor(images=img, return_tensors="pt") for img in sample_images]
     calibration = calibrate_model(model, sample_inputs)
-    softmax_max_probs = calibrate_softmax_scales(model, sample_inputs)
-    cal_scales = build_calibration_scales(calibration, softmax_max_probs)
+    softmax_max_probs, qkt_max_abs = calibrate_softmax_scales(
+        model,
+        sample_inputs,
+        mode=softmax_mode,
+        percentile=softmax_percentile,
+        min_prob=softmax_min_prob,
+        max_prob=softmax_max_prob,
+    )
+    cal_scales = build_calibration_scales(calibration, softmax_max_probs, qkt_max_abs)
     embed_scale = cal_scales.get("pos_embed_add", 14.0 / 127.0)
     print(f"  Got {len(cal_scales)} calibration entries; "
           f"block0_ln1={cal_scales.get('block0_ln1', 'N/A'):.5f}  "
           f"pos_embed_add={embed_scale:.5f}")
-    # Show per-head max probs for block 0
+    print(
+        "  Softmax calibration: "
+        f"mode={softmax_mode} percentile={softmax_percentile:.1f} "
+        f"clip=[{softmax_min_prob:.3f},{softmax_max_prob:.3f}]"
+    )
+    # Show per-head max probs and QKT scales for block 0
     b0_probs = [softmax_max_probs.get((0, h), 0.20) for h in range(NUM_HEADS)]
     print(f"  Softmax max_prob block0: " + " ".join(f"h{h}={p:.3f}" for h, p in enumerate(b0_probs)))
+    b0_qkt = [qkt_max_abs.get((0, h), 6.0) for h in range(NUM_HEADS)]
+    print(f"  QKT max_abs   block0: " + " ".join(f"h{h}={v:.2f}" for h, v in enumerate(b0_qkt)))
 
     compiler = Compiler()
     program = compiler.compile(state_dict, calibration=type('C', (), {'scales': cal_scales})())
@@ -292,6 +400,41 @@ def main():
     parser = argparse.ArgumentParser(description="Compare FP32 vs golden model inference")
     parser.add_argument("--max-images", type=int, default=100)
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument(
+        "--calibration-images",
+        type=int,
+        default=0,
+        help="Number of collected images to use for calibration (0 = use all collected images)",
+    )
+    parser.add_argument(
+        "--softmax-calibration",
+        choices=["max", "percentile"],
+        default="max",
+        help="Softmax head calibration mode",
+    )
+    parser.add_argument(
+        "--softmax-percentile",
+        type=float,
+        default=99.0,
+        help="Percentile used when --softmax-calibration=percentile",
+    )
+    parser.add_argument(
+        "--softmax-min-prob",
+        type=float,
+        default=1e-4,
+        help="Minimum prob used for softmax scale clipping",
+    )
+    parser.add_argument(
+        "--softmax-max-prob",
+        type=float,
+        default=1.0,
+        help="Maximum prob used for softmax scale clipping",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print extra per-image diagnostics and mismatch severity",
+    )
     args = parser.parse_args()
 
     width = 72
@@ -318,7 +461,22 @@ def main():
     # Compile model (now using calibration from actual images)
     header("Compiling model to INT8 program")
     t0 = time.time()
-    program, cal_scales = compile_model(model, state_dict, [img for _, img in images[:3]], processor)
+    if args.calibration_images <= 0:
+        calib_n = len(images)
+    else:
+        calib_n = min(args.calibration_images, len(images))
+    calibration_samples = [img for _, img in images[:calib_n]]
+    print(f"  Using {calib_n} images for calibration")
+    program, cal_scales = compile_model(
+        model,
+        state_dict,
+        calibration_samples,
+        processor,
+        softmax_mode=args.softmax_calibration,
+        softmax_percentile=args.softmax_percentile,
+        softmax_min_prob=args.softmax_min_prob,
+        softmax_max_prob=args.softmax_max_prob,
+    )
     embed_scale = cal_scales.get("pos_embed_add", 14.0 / 127.0)
     dt = time.time() - t0
     print(f"  {program.insn_count} instructions, {len(program.data):,} bytes data")
@@ -361,6 +519,15 @@ def main():
         else:
             cosine_sim = 0.0
 
+        # Top-1 margin is a useful stability signal for near-tie label flips.
+        fp32_top1_logit = float(logits_fp32[fp32_top[0]])
+        fp32_top2_logit = float(logits_fp32[fp32_top[1]]) if len(fp32_top) > 1 else fp32_top1_logit
+        golden_top1_logit = float(logits_golden[golden_top[0]])
+        golden_top2_logit = float(logits_golden[golden_top[1]]) if len(golden_top) > 1 else golden_top1_logit
+        fp32_margin = fp32_top1_logit - fp32_top2_logit
+        golden_margin = golden_top1_logit - golden_top2_logit
+        margin_delta = golden_margin - fp32_margin
+
         # Rank correlation (Spearman-like on top predictions)
         fp32_ranks = np.argsort(np.argsort(logits_fp32)[::-1])
         golden_ranks = np.argsort(np.argsort(logits_golden)[::-1])
@@ -371,6 +538,13 @@ def main():
         print(f"  Golden top-1: class {golden_top[0]:>4} = {id2label.get(int(golden_top[0]), '?')}")
         print(f"  Result: {sym}  |  cosine_sim={cosine_sim:.4f}  |  top5_overlap={top5_overlap*100:.0f}%")
         print(f"  Golden: {insn_count} insns, {cycles:,} cycles")
+        if args.diagnostics:
+            print(
+                "  Diag: "
+                f"fp32_margin={fp32_margin:.3f} "
+                f"golden_margin={golden_margin:.3f} "
+                f"margin_delta={margin_delta:.3f}"
+            )
 
         print(f"\n  {'Rank':<6} {'FP32':>6} {'FP32 label':<30} {'Golden':>6} {'Golden label':<30}")
         print(f"  {'-'*6} {'-'*6} {'-'*30} {'-'*6} {'-'*30}")
@@ -390,6 +564,11 @@ def main():
             "fp32_top5": [int(x) for x in fp32_top[:5]],
             "golden_top5": [int(x) for x in golden_top[:5]],
             "cycles": int(cycles),
+            "fp32_top1_logit": fp32_top1_logit,
+            "golden_top1_logit": golden_top1_logit,
+            "fp32_margin": fp32_margin,
+            "golden_margin": golden_margin,
+            "margin_delta": margin_delta,
         })
 
     # Summary
