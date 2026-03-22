@@ -116,7 +116,7 @@ def execute_layernorm(state, insn):
 
 
 def execute_softmax(state, insn):
-    """Softmax: dequant INT8 → FP32, softmax along last dim, requant → INT8.
+    """Softmax: dequant (INT8 or INT32) → FP32, softmax along last dim, requant → INT8.
 
     Numerically stable: subtract row-max before exp.
     All arithmetic in FP32.
@@ -132,10 +132,13 @@ def execute_softmax(state, insn):
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
 
-    inp = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
-
-    # Dequantize: INT8 × FP32(in_scale) → FP32
-    x = inp.astype(np.float32) * in_scale
+    if insn.src1_buf == BUF_ACCUM:
+        # C1 path: consume raw INT32 QKT accumulators directly.
+        inp_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, N)
+        x = inp_i32.astype(np.float32) * in_scale
+    else:
+        inp_i8 = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
+        x = inp_i8.astype(np.float32) * in_scale
 
     # Numerically stable softmax in FP32
     x_shifted = x - x.max(axis=-1, keepdims=True)
@@ -144,7 +147,7 @@ def execute_softmax(state, insn):
 
     # Requantize: round-half-to-even, clip to INT8
     if out_scale == np.float32(0):
-        result = np.zeros_like(inp)
+        result = np.zeros((M, N), dtype=np.int8)
     else:
         result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
 

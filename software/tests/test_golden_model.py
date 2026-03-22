@@ -263,6 +263,43 @@ class TestSFUOps:
         # All 256 elements uniform: each = 1/256, tiny but non-negative
         assert np.all(result >= 0), "Softmax output should be non-negative"
 
+    def test_softmax_from_accum_int32_path(self):
+        """SOFTMAX accepts ACCUM INT32 input and matches expected requantized output."""
+        from taccel.golden_model.sfu import execute_softmax
+        from taccel.isa.instructions import SoftmaxInsn
+
+        state = MachineState()
+        # One 16x16 tile
+        state.tile_config = (0, 0, 0)
+        in_scale = np.float32(0.125)
+        out_scale = np.float32(1.0 / 256.0)
+        state.scale_regs[0] = in_scale
+        state.scale_regs[1] = out_scale
+
+        # Deterministic INT32 attention-like scores in ACCUM.
+        tile_i32 = np.arange(256, dtype=np.int32).reshape(16, 16) - 128
+        state.accum[:256] = tile_i32.flatten()
+
+        insn = SoftmaxInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_ABUF, dst_off=0,
+            sreg=0,
+            flags=0,
+        )
+
+        execute_softmax(state, insn)
+
+        # Reference: softmax(tile_i32 * in_scale), then requantize to INT8.
+        x = tile_i32.astype(np.float32) * in_scale
+        x_shifted = x - x.max(axis=-1, keepdims=True)
+        exp_x = np.exp(x_shifted).astype(np.float32)
+        probs = exp_x / exp_x.sum(axis=-1, keepdims=True)
+        expected = np.clip(np.round(probs / out_scale), -128, 127).astype(np.int8)
+
+        got = np.frombuffer(bytes(state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        np.testing.assert_array_equal(got, expected)
+
 
 class TestErrorHandling:
     def test_matmul_without_config_tile_raises(self):

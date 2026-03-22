@@ -200,13 +200,21 @@ def calibrate_softmax_scales(
     # Hook each ViTSelfAttention to capture pre-softmax QKT max_abs per head.
     # Runs Q/K projections a second time inside the hook (diagnostics overhead only).
     handles = []
+
+    def _reshape_heads(tensor, module):
+        """Reshape [B, S, D] -> [B, H, S, Dh] in a HF-version-agnostic way."""
+        bsz, seq_len, _ = tensor.shape
+        nh = module.num_attention_heads
+        hd = module.attention_head_size
+        return tensor.view(bsz, seq_len, nh, hd).permute(0, 2, 1, 3)
+
     for layer_idx in range(DEPTH):
         def _make_qkt_hook(l_idx):
             def hook(module, inputs, output):
                 hidden = inputs[0]
                 with torch.no_grad():
-                    q = module.transpose_for_scores(module.query(hidden))
-                    k = module.transpose_for_scores(module.key(hidden))
+                    q = _reshape_heads(module.query(hidden), module)
+                    k = _reshape_heads(module.key(hidden), module)
                     qkt = torch.matmul(q, k.transpose(-1, -2)) / _math.sqrt(
                         module.attention_head_size)
                     for h in range(qkt.shape[1]):
@@ -294,16 +302,11 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None,
             scales[f"{b}_head{h}_query"] = q_scale
             scales[f"{b}_head{h}_key"] = k_scale
             scales[f"{b}_head{h}_value"] = v_scale
-            # Per-head calibrated QKT scale: covers the observed max of Q@K^T/sqrt(d).
-            # Previously hardcoded to 6.0/127.0, which clipped 10/36 heads (up to 4.3×).
-            if qkt_max_abs and (i, h) in qkt_max_abs:
-                qkt_max = qkt_max_abs[(i, h)]
-            else:
-                qkt_max = 6.0  # fallback to original default
-            qkt_scale = max(qkt_max, 1e-2) / 127.0
+            # C1: QKT scale is the raw INT32 accumulator dequant scale used by
+            # strip-mined SOFTMAX from ACCUM: q_scale * k_scale * (1/sqrt(d_head)).
+            qkt_scale = q_scale * k_scale * 0.125
             scales[f"{b}_head{h}_qkt"] = qkt_scale
-            # scale_mul is a no-op in codegen (0.125 is baked into QKT REQUANT),
-            # so the WBUF data has the same scale as the QKT output.
+            # scale_mul is metadata-only in C1, so it carries the same scale.
             scales[f"{b}_head{h}_scale"] = qkt_scale
             # Per-head softmax scale: calibrated to each head's max attention probability.
             # Heads with sharp CLS self-attention (≈99%) get a coarse scale;
@@ -429,6 +432,11 @@ def main():
         type=float,
         default=1.0,
         help="Maximum prob used for softmax scale clipping",
+    )
+    parser.add_argument(
+        "--output",
+        default="golden_comparison.json",
+        help="Path for JSON results output (default: golden_comparison.json)",
     )
     parser.add_argument(
         "--diagnostics",
@@ -592,7 +600,7 @@ def main():
                       f"  ->  golden={golden_cls} {id2label.get(golden_cls, '?')}")
 
     # Save results
-    out = "golden_comparison.json"
+    out = args.output
     with open(out, "w") as f:
         json.dump({"summary": {
             "n_images": n,

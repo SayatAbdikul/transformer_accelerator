@@ -10,7 +10,7 @@ from ..isa.instructions import (
 )
 from .ir import IRNode, IRGraph
 from .tiler import tile_matmul, tile_qkt, tile_strip_mine, pad_dim, TILE
-from .memory_alloc import MemoryAllocator
+from .memory_alloc import MemoryAllocator, Allocation
 from .graph_extract import NUM_PATCHES, EMBED_DIM
 
 UNIT = 16
@@ -437,7 +437,7 @@ class CodeGenerator:
 
         Full [208,208] INT32 would need 173KB in ACCUM (only 64KB available).
         Instead process 16-row strips: each [16,208] INT32 = 13KB ≤ 64KB.
-        REQUANT each strip to INT8 → WBUF immediately.
+        SOFTMAX each strip from ACCUM directly to INT8 → WBUF immediately.
         After all strips, WBUF holds [208,208] INT8 = 43KB for downstream softmax.
         """
         head_idx = node.attrs["head_idx"]
@@ -480,14 +480,20 @@ class CodeGenerator:
         if q_alloc is None:
             q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * head_dim)
 
-        # Output: full [208,208] INT8 in WBUF
+        # Output: full [208,208] INT8 softmax probabilities in WBUF
         qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * M_pad)
 
         n_tiles = M_pad // TILE
         k_tiles = K_pad // TILE
         act_scale_q = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
         act_scale_k = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
-        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+        # C1: softmax consumes raw ACCUM values with this dequant scale.
+        # qkt_in_scale = q_scale * k_scale * (1/sqrt(d_head)).
+        qkt_in_scale = self.calibration_scales.get(
+            node.name, act_scale_q * act_scale_k * node.attrs.get("scale", 0.125)
+        )
+        softmax_name = node.name.replace("_qkt", "_softmax")
+        softmax_out_scale = self.calibration_scales.get(softmax_name, 1.0 / 127.0)
 
         for s in range(num_strips):
             # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
@@ -503,22 +509,24 @@ class CodeGenerator:
             ))
             self._emit(SyncInsn(resource_mask=0b010))
 
-            # REQUANT [16,208] strip: scale = q_act_scale * k_act_scale * attn_scale / target_act_scale
-            # NOTE: ×0.125 (1/sqrt(d_head=64)) is folded in here because
-            #       _emit_scale_mul is a no-op that expects it already baked in.
-            attn_scaling = node.attrs.get("scale", 0.125)
-            requant_scale_f = act_scale_q * act_scale_k * attn_scaling / max(target_act_scale, 1e-12)
-            sreg = self._alloc_sreg()
+            # C1: SOFTMAX directly from ACCUM to avoid QKT INT8 bottleneck.
+            # in_scale dequants INT32 accumulators; out_scale quantizes probabilities.
+            sreg = self._alloc_sreg_pair()
             self._emit(SetScaleInsn(sreg=sreg, src_mode=0,
-                                    imm16=_fp16_to_uint16(requant_scale_f)))
+                                    imm16=_fp16_to_uint16(qkt_in_scale)))
+            self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
+                                    imm16=_fp16_to_uint16(softmax_out_scale)))
             strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
-            self._emit(RequantInsn(
+            self._emit(SoftmaxInsn(
                 src1_buf=BUF_ACCUM, src1_off=0,
                 dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
                 sreg=sreg,
             ))
+            self._emit(SyncInsn(resource_mask=0b100))
 
         self.mem.wbuf.free(f"kt_head{head_idx}")
+        # Metadata now reflects softmax-quantized output in node.name allocation.
+        self.calibration_scales[node.name] = softmax_out_scale
 
     def _emit_attn_v(self, node: IRNode):
         """Emit attention @ V matmul.
@@ -636,18 +644,7 @@ class CodeGenerator:
             self.mem.wbuf.free(inp_name)
 
     def _emit_scale_mul(self, node: IRNode):
-        """Attention scale_mul (×0.125) is already baked into QKT's REQUANT.
-
-        The QKT strip-mined codegen folds the ×0.125 scale into the requant
-        scale and writes INT8 directly to WBUF. So this node is a no-op:
-        just rename the WBUF allocation from the QKT node to this node's name.
-
-        Critically, we propagate the calibration scale from the QKT input to
-        this output name so that downstream SFU nodes (softmax) dequantize at
-        the correct scale.  Without this, softmax would fall back to 1/127
-        (6× too small), producing near-uniform attention weights that destroy
-        image-specific information in the CLS token.
-        """
+        """C1: scale_mul is metadata-only; scaling is folded into QKT softmax input scale."""
         in_alloc = self.mem.wbuf.get(node.inputs[0])
         if in_alloc is not None:
             # Rename in-place: pop the old key and re-insert under the new name
@@ -655,46 +652,20 @@ class CodeGenerator:
             alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
             self.mem.wbuf.allocations[node.name] = alloc
 
-        # Propagate the QKT output scale to this node's name.  The underlying
-        # WBUF data was quantized at the QKT target scale; override whatever
-        # the caller supplied so softmax uses the right dequant scale.
+        # Propagate scale metadata for downstream rename nodes.
         self.calibration_scales[node.name] = self.calibration_scales.get(
             node.inputs[0], 6.0 / 127.0
         )
 
     def _emit_softmax(self, node: IRNode):
-        """Emit SOFTMAX SFU instruction.
-
-        Attention scores live in WBUF (placed there by _emit_scale_mul).
-        Softmax is done in-place: same WBUF slot, renamed for downstream.
-        """
-        M_pad = pad_dim(node.output_shape[0])
-        N_pad = pad_dim(node.output_shape[1])
-        m_tiles = M_pad // TILE
-        n_tiles = N_pad // TILE
-        self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
-
-        sreg = self._alloc_sreg_pair()
-        in_scale = self.calibration_scales.get(node.inputs[0], 1.0 / 127.0)
-        out_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
-        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(in_scale)))
-        self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(out_scale)))
-
-        # Input is in WBUF (from scale_mul); output written to same slot (in-place)
+        """C1: softmax already emitted per-strip in _emit_qkt; this node is a rename."""
         in_alloc = self.mem.wbuf.get(node.inputs[0])
-        if in_alloc is None:
-            in_alloc = self.mem.wbuf.alloc(node.inputs[0], M_pad * N_pad)
-        # Rename in-place: pop old key, re-insert under output name.
-        # Do NOT call free() here — that would double-book the region in the free list.
-        if node.inputs[0] in self.mem.wbuf.allocations:
+        if in_alloc is not None and node.inputs[0] in self.mem.wbuf.allocations:
             alloc = self.mem.wbuf.allocations.pop(node.inputs[0])
             self.mem.wbuf.allocations[node.name] = alloc
-        self._emit(SoftmaxInsn(
-            src1_buf=BUF_WBUF, src1_off=in_alloc.offset_units,
-            dst_buf=BUF_WBUF, dst_off=in_alloc.offset_units,
-            sreg=sreg,
-        ))
-        self._emit(SyncInsn(resource_mask=0b100))
+        self.calibration_scales[node.name] = self.calibration_scales.get(
+            node.inputs[0], 1.0 / 127.0
+        )
 
     def _emit_gelu(self, node: IRNode):
         """Emit GELU SFU instruction (no-op if inlined with a strip-mined matmul)."""
@@ -785,7 +756,7 @@ class CodeGenerator:
         if gb_alloc:
             self.mem.wbuf.free(f"gb_{node.name}")
 
-    def _load_dram_to_abuf(self, input_name: str, M_pad: int, N_pad: int) -> 'Allocation':
+    def _load_dram_to_abuf(self, input_name: str, M_pad: int, N_pad: int) -> Allocation:
         """Load a DRAM-temp-resident tensor into ABUF and return the allocation."""
         dram_off = self.dram_temp_outputs[input_name]
         # Free the small strip-mine placeholder before allocating the full tensor.
