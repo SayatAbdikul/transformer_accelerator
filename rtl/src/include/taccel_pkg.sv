@@ -58,6 +58,11 @@ package taccel_pkg;
   // Architecture parameters
   // -------------------------------------------------------------------------
   parameter int SYS_DIM        = 16;   // systolic array dimension
+  // Systolic architecture modes used during migration.
+  parameter int SYS_MODE_BROADCAST = 0;
+  parameter int SYS_MODE_CHAINED   = 1;
+  // Default remains broadcast until chained-mode numerical parity is complete.
+  parameter int SYS_MODE_DEFAULT   = SYS_MODE_BROADCAST;
   parameter int NUM_SCALE_REGS = 16;   // FP16 scale registers S0–S15
   parameter int NUM_ADDR_REGS  = 4;    // 56-bit DRAM address registers R0–R3
   parameter int ADDR_WIDTH     = 56;   // DRAM address bits

@@ -56,21 +56,33 @@ module systolic_controller
 
   logic [10:0] m_tiles_q, n_tiles_q, k_tiles_q;
   logic [10:0] mtile_q, ntile_q, ktile_q;
-  logic [4:0]  lane_q;
+  logic [5:0]  lane_q;
   logic [4:0]  drain_row_q;
   logic [1:0]  drain_grp_q;
 
   logic step_en;
   logic clear_acc;
+  logic [0:0] arch_mode_q;
+  logic       inject_zero_data;
+  logic [15:0] lane_row_idx;
+  logic [127:0] a_row_data_q, b_row_data_q;
   logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat;
+
+  localparam int CHAIN_PRELOAD_CYCLES = 1;
+  localparam int CHAIN_FLUSH_CYCLES = (2 * (SYS_DIM - 1));
+  localparam int CHAIN_TOTAL_STEPS  = CHAIN_PRELOAD_CYCLES + SYS_DIM + CHAIN_FLUSH_CYCLES;
+
+  // Architecture default comes from package constant (currently broadcast).
+  assign arch_mode_q = SYS_MODE_DEFAULT[0:0];
 
   systolic_array u_array (
     .clk      (clk),
     .rst_n    (rst_n),
     .step_en  (step_en),
     .clear_acc(clear_acc),
-    .a_row_data(sram_b_rdata),
-    .b_row_data(sram_a_rdata),
+    .a_row_data(a_row_data_q),
+    .b_row_data(b_row_data_q),
+    .arch_mode(arch_mode_q),
     .acc_flat (acc_flat)
   );
 
@@ -108,7 +120,7 @@ module systolic_controller
       mtile_q <= 11'd0;
       ntile_q <= 11'd0;
       ktile_q <= 11'd0;
-      lane_q <= 5'd0;
+      lane_q <= 6'd0;
       drain_row_q <= 5'd0;
       drain_grp_q <= 2'd0;
     end else begin
@@ -128,13 +140,13 @@ module systolic_controller
             mtile_q <= 11'd0;
             ntile_q <= 11'd0;
             ktile_q <= 11'd0;
-            lane_q <= 5'd0;
+            lane_q <= 6'd0;
             state <= ST_INIT_TILE;
           end
         end
 
         ST_INIT_TILE: begin
-          lane_q <= 5'd0;
+          lane_q <= 6'd0;
           state <= ST_READ_REQ;
         end
 
@@ -143,8 +155,8 @@ module systolic_controller
         end
 
         ST_READ_USE: begin
-          if (lane_q == 5'd15) begin
-            lane_q <= 5'd0;
+          if (int'(lane_q) == ((arch_mode_q == SYS_MODE_CHAINED[0:0]) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
+            lane_q <= 6'd0;
             if (ktile_q + 11'd1 < k_tiles_q) begin
               ktile_q <= ktile_q + 11'd1;
               state <= ST_READ_REQ;
@@ -154,7 +166,7 @@ module systolic_controller
               state <= ST_DRAIN_PREP;
             end
           end else begin
-            lane_q <= lane_q + 5'd1;
+            lane_q <= lane_q + 6'd1;
             state <= ST_READ_REQ;
           end
         end
@@ -195,6 +207,17 @@ module systolic_controller
   always_comb begin
     sys_busy = (state != ST_IDLE);
 
+    // During chained flush cycles, inject zeros so only in-flight operands
+    // continue propagating through the PE mesh.
+    inject_zero_data = (arch_mode_q == SYS_MODE_CHAINED[0:0])
+                    && ((lane_q == 6'd0) || (int'(lane_q) > SYS_DIM))
+                    && ((state == ST_READ_REQ) || (state == ST_READ_USE));
+    lane_row_idx = (arch_mode_q == SYS_MODE_CHAINED[0:0])
+               ? ({10'h0, lane_q[5:0]} - 16'd1)
+               : {10'h0, lane_q[5:0]};
+    a_row_data_q = inject_zero_data ? 128'h0 : sram_b_rdata;
+    b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;
+
     sram_a_en = 1'b0;
     sram_a_we = 1'b0;
     sram_a_buf = src2_buf_q;
@@ -211,14 +234,19 @@ module systolic_controller
 
     case (state)
       ST_READ_REQ: begin
-        sram_b_en = 1'b1;
-        sram_b_buf = src1_buf_q;
-        sram_b_row = src1_tile_base[15:0] + {11'h0, lane_q};
+        if (inject_zero_data) begin
+          sram_b_en = 1'b0;
+          sram_a_en = 1'b0;
+        end else begin
+          sram_b_en = 1'b1;
+          sram_b_buf = src1_buf_q;
+          sram_b_row = src1_tile_base[15:0] + lane_row_idx;
 
-        sram_a_en = 1'b1;
-        sram_a_we = 1'b0;
-        sram_a_buf = src2_buf_q;
-        sram_a_row = src2_tile_base[15:0] + {11'h0, lane_q};
+          sram_a_en = 1'b1;
+          sram_a_we = 1'b0;
+          sram_a_buf = src2_buf_q;
+          sram_a_row = src2_tile_base[15:0] + lane_row_idx;
+        end
       end
 
       ST_READ_USE: begin
