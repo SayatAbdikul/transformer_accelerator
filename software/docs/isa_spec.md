@@ -1,19 +1,23 @@
 # TACCEL ISA v1 Specification
 
+This document tracks the ISA as implemented in the current software stack
+(`taccel/isa`, assembler/disassembler, golden-model simulator, compiler, and
+tests), not just the original baseline design.
+
 ## 1. Architecture Overview
 
 TACCEL is a DNN inference accelerator with three parallel execution units
 behind an in-order issue stage:
 
-| Unit     | Instructions              | Data Types        |
-|----------|---------------------------|-------------------|
-| DMA      | LOAD, STORE               | byte stream       |
-| Systolic | MATMUL                    | INT8 in, INT32 out|
-| SFU      | SOFTMAX, LAYERNORM, GELU  | FP32 internal     |
+| Unit     | Instructions                               | Data Types                   |
+|----------|--------------------------------------------|------------------------------|
+| DMA      | LOAD, STORE                                | byte stream                  |
+| Systolic | MATMUL                                     | INT8 in, INT32 out           |
+| SFU      | SOFTMAX, SOFTMAX_ATTNV, LAYERNORM, GELU    | INT8/INT32 in, FP32 internal |
 
-Additional control/data instructions (REQUANT, VADD, SCALE_MUL, BUF_COPY,
-CONFIG_TILE, SET_SCALE, SET_ADDR_LO/HI, SYNC, NOP, HALT) execute in the
-issue stage.
+Additional control/data instructions (`REQUANT`, `REQUANT_PC`, `VADD`,
+`DEQUANT_ADD`, `SCALE_MUL`, `BUF_COPY`, `CONFIG_TILE`, `SET_SCALE`,
+`SET_ADDR_LO/HI`, `SYNC`, `NOP`, `HALT`) execute in the issue stage.
 
 ### SRAM Buffers
 
@@ -65,7 +69,10 @@ All instructions are 64 bits, big-endian.  Bits [63:59] hold the 5-bit opcode.
 | SOFTMAX      | 0x0E   | R-TYPE | Row-wise softmax (FP32 internal)     |
 | LAYERNORM    | 0x0F   | R-TYPE | Layer normalization (FP32 internal)  |
 | GELU         | 0x10   | R-TYPE | GELU activation (FP32 internal)      |
-| 0x11–0x1F    | —      | —      | **Reserved** — illegal instruction fault |
+| REQUANT_PC   | 0x11   | R-TYPE | INT32 → INT8 using per-column FP16 scales |
+| SOFTMAX_ATTNV | 0x12   | R-TYPE | Fused softmax(QK^T) @ V             |
+| DEQUANT_ADD  | 0x13   | R-TYPE | FP32 rescale-add of ACCUM and INT8 skip |
+| 0x14–0x1F    | —      | —      | **Reserved** — illegal instruction fault |
 
 ### 2.2 R-TYPE (Compute)
 
@@ -84,6 +91,13 @@ All instructions are 64 bits, big-endian.  Bits [63:59] hold the 5-bit opcode.
 FLAGS semantics per opcode:
 - MATMUL: 0=overwrite ACCUM, 1=accumulate into ACCUM.
 - All others: reserved, must be 0.
+
+SREG usage by opcode:
+- `REQUANT`, `SCALE_MUL`: `S[sreg]` only.
+- `SOFTMAX`, `LAYERNORM`, `GELU`, `DEQUANT_ADD`: `S[sreg]` and `S[sreg+1]`.
+- `SOFTMAX_ATTNV`: `S[sreg]` through `S[sreg+3]`.
+- `REQUANT_PC`: current implementation ignores `sreg`; encode `sreg=0` for
+  portability and read scales from `src2`.
 
 ### 2.3 M-TYPE (Memory)
 
@@ -142,7 +156,9 @@ Full 56-bit address = `(HI_imm28 << 28) | LO_imm28`.
 ```
 
 Tile dimensions in 16-element units.  Persists until next CONFIG_TILE.
-Must be set before any compute instruction (MATMUL, REQUANT, VADD, SFU).
+Must be set before any tiled compute instruction (`MATMUL`, `REQUANT`,
+`REQUANT_PC`, `SCALE_MUL`, `VADD`, `DEQUANT_ADD`, `SOFTMAX`,
+`SOFTMAX_ATTNV`, `LAYERNORM`, `GELU`).
 
 ### 2.7 S-TYPE (System)
 
@@ -176,12 +192,12 @@ parallel:
 ```
 Issue → ┬→ DMA engine     (LOAD, STORE)
         ├→ Systolic array  (MATMUL)
-        └→ SFU             (SOFTMAX, LAYERNORM, GELU)
+        └→ SFU             (SOFTMAX, SOFTMAX_ATTNV, LAYERNORM, GELU)
 ```
 
-Other instructions (REQUANT, VADD, SCALE_MUL, BUF_COPY, CONFIG_TILE,
-SET_SCALE, SET_ADDR) execute in the issue stage and complete before the
-next instruction issues.
+Other instructions (`REQUANT`, `REQUANT_PC`, `VADD`, `DEQUANT_ADD`,
+`SCALE_MUL`, `BUF_COPY`, `CONFIG_TILE`, `SET_SCALE`, `SET_ADDR`) execute in
+the issue stage and complete before the next instruction issues.
 
 ### 3.2 Synchronization
 
@@ -201,7 +217,7 @@ different units.  SYNC with mask 0b000 is a NOP.
 
 | Condition                    | Behaviour                        |
 |------------------------------|----------------------------------|
-| Illegal opcode (0x11–0x1F)  | Halt, set fault status register  |
+| Illegal opcode (0x14–0x1F)  | Halt, set fault status register  |
 | DRAM out of bounds           | Halt, set fault status register  |
 | SRAM out of bounds           | Halt, set fault status register  |
 | Missing CONFIG_TILE          | Halt, set fault status register  |
@@ -230,12 +246,83 @@ Maximum accumulator magnitude per instruction:
 For DeiT-tiny: max(M×K) = 208 × 192 = 39,936 → max |acc| ≈ 644M.
 Fits in INT32 (±2.1G).  The compiler must tile to prevent overflow.
 
+### 4.1 Quantization and Residual Helper Instructions
+
+All helper paths use round-half-to-even before clipping.
+
+**REQUANT**
+
+```
+dst_int8 = clip(round(src1_int32 × S[sreg]), -128, 127)
+```
+
+**REQUANT_PC**
+
+```
+scale[j] = FP16(src2[j]) for j in 0..N_dim-1
+dst[:, j] = clip(round(src1_int32[:, j] × scale[j]), -128, 127)
+```
+
+- `src1` must be `ACCUM`.
+- `src2` points at `N_dim` packed FP16 scales in `ABUF` or `WBUF`.
+- The same scale row is reused across all `M_dim` rows.
+- `dst` must be an INT8 buffer (`ABUF` or `WBUF`).
+
+**SCALE_MUL**
+
+```
+if src1 is ACCUM:
+    dst_int32 = clip(round(src1_int32 × S[sreg]), INT32_MIN, INT32_MAX)
+else:
+    dst_int8 = clip(round(src1_int8 × S[sreg]), -128, 127)
+```
+
+**VADD**
+
+Current implementation supports two modes:
+
+```
+INT8 mode:  dst = sat_int8(src1_int8 + src2_int8)
+INT32 mode: dst = src1_int32 + broadcast_row(src2_int32)
+```
+
+- INT8 mode is selected when `src1_buf = ABUF`.
+- INT32 mode is selected when `src1_buf = ACCUM`; `src2` is read as a single
+  `1 × N_dim` row and broadcast across the tile.
+
+**DEQUANT_ADD**
+
+```
+accum_rescale = S[sreg]
+skip_rescale  = S[sreg+1]
+dst_int8 = clip(round(src1_accum_int32 × accum_rescale +
+                      src2_skip_int8  × skip_rescale), -128, 127)
+```
+
+- `src1` must be `ACCUM`.
+- `src2` must be an INT8 SRAM buffer.
+- `dst` must be an INT8 SRAM buffer.
+- This is the implemented residual-add primitive used to avoid a separate
+  `REQUANT` followed by `VADD`.
+
 ---
 
 ## 5. Special Function Unit (SFU)
 
-All SFU operations: INT8 in → FP32 internal → INT8 out.
-Uses consecutive scale registers S[sreg] (in_scale) and S[sreg+1] (out_scale).
+SFU operations run with FP32 internal arithmetic and FP16 scale registers
+widened to FP32.
+
+Scale-register conventions:
+- `SOFTMAX`, `LAYERNORM`, `GELU`: dual-scale form using `S[sreg]` and
+  `S[sreg+1]`.
+- `SOFTMAX_ATTNV`: quad-scale form using `S[sreg]..S[sreg+3]`.
+
+Source/destination conventions:
+- `SOFTMAX` and `GELU` may read either INT8 SRAM or raw INT32 `ACCUM`.
+- `LAYERNORM` reads INT8 activations plus FP16 `gamma/beta` parameters from
+  `src2`.
+- `SOFTMAX_ATTNV` reads `QK^T` from `ACCUM` and `V` from INT8 SRAM, and writes
+  the quantized `attn @ V` output to INT8 SRAM.
 
 ### 5.1 Rounding Convention
 
@@ -245,31 +332,48 @@ RTL must implement this mode.
 
 ### 5.2 SOFTMAX
 
-Per-row softmax along the N dimension:
+Per-row softmax along the logical reduction dimension of the configured tile:
 
 ```
-x_fp32 = INT8_input × in_scale
-x_shifted = x - max(x, axis=N)
+x_fp32 = input × in_scale           # input may be INT8 SRAM or INT32 ACCUM
+x_shifted = x_fp32 - max(x_fp32, axis=N)
 softmax = exp(x_shifted) / sum(exp(x_shifted))
 output = clip(round(softmax / out_scale), -128, 127)
 ```
 
 Row-max subtraction is required for numerical stability.
 
-### 5.3 LAYERNORM
+### 5.3 SOFTMAX_ATTNV
+
+Fused attention tail:
+
+```
+qkt = ACCUM_int32 × S[sreg]         # qkt_in_scale
+v   = V_int8 × S[sreg+1]            # v_scale
+softmax = softmax_rows(qkt)
+attn_v = softmax @ v
+output = clip(round(attn_v / S[sreg+2]), -128, 127)
+```
+
+`S[sreg+3]` is used by the golden model as a trace-only softmax scale so the
+software stack can materialize a virtual INT8 softmax tensor for diagnostics.
+That virtual trace payload is not architectural state and does not affect the
+visible destination buffer.
+
+### 5.4 LAYERNORM
 
 Per-row normalize + affine transform:
 
 ```
 x_fp32 = INT8_input × in_scale
-x_norm = (x - mean(x)) / sqrt(var(x) + 1e-6)
+x_norm = (x_fp32 - mean(x_fp32)) / sqrt(var(x_fp32) + 1e-6)
 y = x_norm × gamma + beta          (gamma/beta are FP16, widened to FP32)
 output = clip(round(y / out_scale), -128, 127)
 ```
 
 Gamma and beta are packed in WBUF at src2: N×2 bytes gamma, then N×2 bytes beta.
 
-### 5.4 GELU
+### 5.5 GELU
 
 ```
 GELU(x) = x × 0.5 × (1 + erf(x / sqrt(2)))
@@ -324,8 +428,15 @@ include `data_base`).
 
 16 × FP16 registers (S0–S15).  Loaded via SET_SCALE.
 
-SFU operations use consecutive pairs: S[sreg]=in_scale, S[sreg+1]=out_scale.
-Constraint: sreg ≤ 14 for dual-scale operations.
+Register usage in the current ISA:
+- Single-register ops: `REQUANT`, `SCALE_MUL`
+- Dual-register ops: `SOFTMAX`, `LAYERNORM`, `GELU`, `DEQUANT_ADD`
+- Quad-register ops: `SOFTMAX_ATTNV`
+- Memory-sourced scales: `REQUANT_PC`
+
+Constraints:
+- Dual-register ops require `sreg <= 14`
+- Quad-register ops require `sreg <= 12`
 
 FP16 → FP32 widening: the exact FP16 value is preserved (no extra precision).
 
@@ -341,9 +452,16 @@ FP16 → FP32 widening: the exact FP16 value is preserved (no extra precision).
 | BUF_COPY      | length (1 cycle per 16-byte unit)         |
 | MATMUL        | m_tiles × n_tiles × k_tiles × 16         |
 | REQUANT       | M × N                                     |
+| REQUANT_PC    | M × N                                     |
 | SCALE_MUL     | M × N                                     |
 | VADD          | M × N                                     |
+| DEQUANT_ADD   | M × N                                     |
 | SOFTMAX       | M × N × 2                                |
+| SOFTMAX_ATTNV | M × K × 2 + m_tiles × n_tiles × k_tiles × 16 + M × N |
 | LAYERNORM     | M × N × 2                                |
 | GELU          | M × N × 2                                |
 | Others        | 0 (issue-stage only)                      |
+
+Here `M`, `N`, and `K` denote realized element counts
+(`M = (tile_M + 1) × 16`, etc.), while `m_tiles`, `n_tiles`, and `k_tiles`
+denote tile counts.
