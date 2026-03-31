@@ -15,7 +15,7 @@ execution of independent units (e.g. a LOAD can overlap a MATMUL).
 
 Reserved fields / opcodes
 -------------------------
-- Opcodes 0x11–0x1F are reserved.  Decoding a reserved opcode raises an
+- Opcodes 0x14–0x1F are reserved.  Decoding a reserved opcode raises an
   illegal-instruction fault and the processor halts.
 - M-TYPE stride_log2 [6:3] is reserved and must be zero.
 - M-TYPE flags [2:0] are reserved and must be zero.
@@ -41,6 +41,9 @@ class Opcode(IntEnum):
     SOFTMAX = 0x0E
     LAYERNORM = 0x0F
     GELU = 0x10
+    REQUANT_PC = 0x11
+    SOFTMAX_ATTNV = 0x12
+    DEQUANT_ADD = 0x13
 
 
 class InsnFormat(IntEnum):
@@ -70,6 +73,9 @@ OPCODE_FORMAT = {
     Opcode.SOFTMAX: InsnFormat.R_TYPE,
     Opcode.LAYERNORM: InsnFormat.R_TYPE,
     Opcode.GELU: InsnFormat.R_TYPE,
+    Opcode.REQUANT_PC: InsnFormat.R_TYPE,
+    Opcode.SOFTMAX_ATTNV: InsnFormat.R_TYPE,
+    Opcode.DEQUANT_ADD: InsnFormat.R_TYPE,
 }
 
 # Buffer IDs (2-bit, shared across R-type, M-type, B-type)

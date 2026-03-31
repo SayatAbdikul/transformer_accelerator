@@ -1,10 +1,32 @@
 """Tests for compiler (single-layer compile + verify)."""
+from types import SimpleNamespace
+
 import pytest
 import numpy as np
+import torch
+from taccel.compiler.compiler import Compiler
 from taccel.compiler.tiler import tile_matmul, pad_dim, TILE
+from taccel.compiler.codegen import CodeGenerator
+from taccel.compiler.ir import IRGraph, IRNode
+from taccel.golden_model import Simulator
+from taccel.quantizer.bias_correction import compute_bias_corrections
+from taccel.quantizer.quantize import quantize_tensor, quantize_weights
 
 from taccel.compiler.memory_alloc import MemoryAllocator, BufferAllocator
-from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE
+from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_ACCUM
+from taccel.isa.instructions import (
+    BufCopyInsn,
+    DequantAddInsn,
+    GeluInsn,
+    MatmulInsn,
+    RequantInsn,
+    RequantPcInsn,
+    SoftmaxAttnVInsn,
+    SoftmaxInsn,
+    VaddInsn,
+)
+from taccel.isa.encoding import encode
+from taccel.assembler.assembler import ProgramBinary
 
 
 class TestMemoryAllocator:
@@ -110,6 +132,21 @@ class TestMemoryconsistency:
         strip_bytes = TILE * N_pad * 4  # [16, 192] INT32
         assert strip_bytes <= ACCUM_SIZE, f"One strip {strip_bytes}B > ACCUM {ACCUM_SIZE}B"
 
+
+class TestCompilerGuards:
+    def test_requant_pc_fc1_rejects_overlap_with_gelu_from_accum(self):
+        compiler = Compiler()
+
+        with pytest.raises(ValueError, match="REQUANT_PC FC1 cannot overlap with GELU-from-ACCUM"):
+            compiler.compile(
+                {},
+                calibration=SimpleNamespace(scales={}),
+                gelu_from_accum=True,
+                gelu_from_accum_blocks={3},
+                requant_pc_fc1=True,
+                requant_pc_fc1_blocks={3},
+            )
+
     def test_attention_kt_wbuf_pressure(self):
         """3 heads' K^T fits in WBUF alongside other data."""
         head_dim = 64
@@ -118,3 +155,539 @@ class TestMemoryconsistency:
         kt_total_3_heads = kt_per_head * 3  # 39,936 bytes
         assert kt_total_3_heads < WBUF_SIZE, \
             f"3 heads K^T ({kt_total_3_heads}B) doesn't fit in WBUF ({WBUF_SIZE}B)"
+
+
+class TestBiasCorrection:
+    class _TinyLinear(torch.nn.Module):
+        def __init__(self, weight: np.ndarray, bias: np.ndarray):
+            super().__init__()
+            out_features, in_features = weight.shape
+            self.classifier = torch.nn.Linear(in_features, out_features, bias=True)
+            with torch.no_grad():
+                self.classifier.weight.copy_(torch.from_numpy(weight.astype(np.float32)))
+                self.classifier.bias.copy_(torch.from_numpy(bias.astype(np.float32)))
+
+        def forward(self, x):
+            return self.classifier(x)
+
+    @staticmethod
+    def _classifier_output_mse(model, sample_inputs, q_weight, q_scales, act_scale, bias_correction=None):
+        weight_fp32 = model.state_dict()["classifier.weight"].detach().cpu().numpy().astype(np.float32)
+        bias_fp32 = model.state_dict()["classifier.bias"].detach().cpu().numpy().astype(np.float32)
+        dq_weight = q_weight.astype(np.float32) * q_scales.astype(np.float32).reshape(-1, 1)
+        correction = (
+            np.asarray(bias_correction, dtype=np.float32)
+            if bias_correction is not None else np.zeros_like(bias_fp32, dtype=np.float32)
+        )
+        sq_err = []
+        for sample in sample_inputs:
+            x = sample["x"].detach().cpu().numpy().astype(np.float32)
+            x_q = np.clip(np.round(x / act_scale), -128, 127).astype(np.int8)
+            x_dq = x_q.astype(np.float32) * np.float32(act_scale)
+            y_fp32 = x @ weight_fp32.T + bias_fp32
+            y_qdq = x_dq @ dq_weight.T + bias_fp32 + correction
+            sq_err.append(np.mean((y_fp32 - y_qdq) ** 2))
+        return float(np.mean(sq_err))
+
+    def test_compute_bias_corrections_is_zero_when_quantized_path_is_exact(self):
+        weight = np.array([[12.7, -0.3], [0.2, 0.0]], dtype=np.float32)
+        bias = np.array([0.5, -1.0], dtype=np.float32)
+        model = self._TinyLinear(weight, bias)
+        state_dict = model.state_dict()
+        quant_weights = quantize_weights(state_dict)
+        sample_inputs = [
+            {"x": torch.tensor([[1.0, -0.5]], dtype=torch.float32)},
+            {"x": torch.tensor([[0.0, 0.25]], dtype=torch.float32)},
+        ]
+
+        corrections = compute_bias_corrections(
+            model,
+            state_dict,
+            quant_weights,
+            {"final_ln": 0.25},
+            sample_inputs,
+            ["classifier.weight"],
+        )
+
+        np.testing.assert_allclose(corrections["classifier.bias"], np.zeros_like(bias), atol=2e-3)
+
+    def test_compute_bias_corrections_reduces_classifier_output_mse(self):
+        weight = np.array([[0.37, -0.28], [0.11, 0.34]], dtype=np.float32)
+        bias = np.array([0.05, -0.03], dtype=np.float32)
+        model = self._TinyLinear(weight, bias)
+        state_dict = model.state_dict()
+        quant_weights = quantize_weights(state_dict)
+        sample_inputs = [
+            {"x": torch.tensor([[0.23, -0.11]], dtype=torch.float32)},
+            {"x": torch.tensor([[0.41, 0.17]], dtype=torch.float32)},
+            {"x": torch.tensor([[-0.19, 0.28]], dtype=torch.float32)},
+        ]
+        act_scale = 0.01
+
+        corrections = compute_bias_corrections(
+            model,
+            state_dict,
+            quant_weights,
+            {"final_ln": act_scale},
+            sample_inputs,
+            ["classifier.weight"],
+        )
+
+        q_weight, q_scales = quantize_tensor(weight, per_channel=False)
+        mse_before = self._classifier_output_mse(
+            model,
+            sample_inputs,
+            q_weight,
+            q_scales,
+            act_scale,
+        )
+        mse_after = self._classifier_output_mse(
+            model,
+            sample_inputs,
+            q_weight,
+            q_scales,
+            act_scale,
+            bias_correction=corrections["classifier.bias"],
+        )
+
+        assert np.max(np.abs(corrections["classifier.bias"])) > 0.0
+        assert mse_after < mse_before
+
+
+class TestRequantPcCodegen:
+    def test_codegen_emits_requant_pc_for_selected_weight(self):
+        weight_name = "vit.encoder.layer.0.attention.attention.query.weight_h0"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block0_head0_query",
+            inputs=["ln1_input", weight_name],
+            output_shape=(16, 16),
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.linspace(0.01, 0.16, 16, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "ln1_input": 0.125,
+                "block0_head0_query": 0.25,
+            },
+            prescaled_biases={},
+            requant_pc_weight_names={weight_name},
+            requant_pc_scale_tables={
+                weight_name: np.linspace(0.02, 0.32, 16, dtype=np.float16),
+            },
+        )
+
+        instructions, _ = codegen.generate(graph)
+
+        assert any(isinstance(insn, RequantPcInsn) for insn in instructions)
+        assert not any(isinstance(insn, RequantInsn) for insn in instructions)
+        assert f"{weight_name}__requant_pc" in codegen.dram_layout
+
+
+class TestGeluFromAccumCodegen:
+    @staticmethod
+    def _make_strip_mined_fc1_codegen(selected_blocks=None):
+        weight_name = "vit.encoder.layer.3.intermediate.dense.weight"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block3_fc1",
+            inputs=["ln2_input", weight_name],
+            output_shape=(32, 16),
+            attrs={"strip_mine": True, "inline_gelu": "block3_gelu"},
+        ))
+        return CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.full(16, 0.125, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "ln2_input": 0.125,
+                "block3_fc1": 0.25,
+                "block3_gelu": 0.25,
+            },
+            prescaled_biases={},
+            gelu_from_accum=True,
+            gelu_from_accum_blocks=selected_blocks,
+        ), graph
+
+    def test_strip_mined_fc1_uses_accum_gelu_for_selected_block(self):
+        codegen, graph = self._make_strip_mined_fc1_codegen(selected_blocks={3})
+
+        instructions, _ = codegen.generate(graph)
+
+        gelu_insns = [insn for insn in instructions if isinstance(insn, GeluInsn)]
+        assert gelu_insns
+        assert all(insn.src1_buf == BUF_ACCUM for insn in gelu_insns)
+        assert not any(isinstance(insn, RequantInsn) for insn in instructions)
+
+    def test_strip_mined_fc1_falls_back_to_int8_gelu_for_unselected_block(self):
+        codegen, graph = self._make_strip_mined_fc1_codegen(selected_blocks={2})
+
+        instructions, _ = codegen.generate(graph)
+
+        gelu_insns = [insn for insn in instructions if isinstance(insn, GeluInsn)]
+        assert gelu_insns
+        assert all(insn.src1_buf == BUF_ABUF for insn in gelu_insns)
+        assert any(isinstance(insn, RequantInsn) for insn in instructions)
+
+    def test_strip_mined_fc1_emits_requant_pc_for_selected_weight(self):
+        weight_name = "vit.encoder.layer.3.intermediate.dense.weight"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block3_fc1",
+            inputs=["ln2_input", weight_name],
+            output_shape=(32, 16),
+            attrs={"strip_mine": True, "inline_gelu": "block3_gelu"},
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.linspace(0.02, 0.17, 16, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "ln2_input": 0.125,
+                "block3_fc1": 0.25,
+                "block3_gelu": 0.25,
+            },
+            prescaled_biases={},
+            requant_pc_weight_names={weight_name},
+            requant_pc_scale_tables={
+                weight_name: np.linspace(0.01, 0.16, 16, dtype=np.float16),
+            },
+        )
+
+        instructions, _ = codegen.generate(graph)
+
+        assert any(isinstance(insn, RequantPcInsn) for insn in instructions)
+        assert not any(isinstance(insn, RequantInsn) for insn in instructions)
+        assert f"{weight_name}__requant_pc" in codegen.dram_layout
+
+    def test_strip_mined_codegen_emits_requant_pc_for_selected_weight(self):
+        weight_name = "vit.encoder.layer.0.attention.output.dense.weight"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block0_out_proj",
+            inputs=["concat_input", weight_name],
+            output_shape=(32, 16),
+            attrs={"strip_mine": True},
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.linspace(0.01, 0.16, 16, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "concat_input": 0.125,
+                "block0_out_proj": 0.25,
+            },
+            prescaled_biases={},
+            requant_pc_weight_names={weight_name},
+            requant_pc_scale_tables={
+                weight_name: np.linspace(0.02, 0.32, 16, dtype=np.float16),
+            },
+        )
+
+        instructions, _ = codegen.generate(graph)
+
+        assert any(isinstance(insn, RequantPcInsn) for insn in instructions)
+        assert not any(isinstance(insn, RequantInsn) for insn in instructions)
+        assert f"{weight_name}__requant_pc" in codegen.dram_layout
+
+
+class TestFusedSoftmaxAttnVCodegen:
+    def test_block_selected_qkt_emits_fused_softmax_attnv(self):
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul_qkt",
+            name="block11_head0_qkt",
+            inputs=["block11_head0_query", "block11_head0_key"],
+            output_shape=(16, 16),
+            attrs={"head_idx": 0, "scale": 0.125},
+        ))
+        graph.add_node(IRNode(
+            op="scale_mul",
+            name="block11_head0_scale",
+            inputs=["block11_head0_qkt"],
+            output_shape=(16, 16),
+            attrs={"scale": 0.125},
+        ))
+        graph.add_node(IRNode(
+            op="softmax",
+            name="block11_head0_softmax",
+            inputs=["block11_head0_scale"],
+            output_shape=(16, 16),
+        ))
+        graph.add_node(IRNode(
+            op="matmul_attn_v",
+            name="block11_head0_attn_v",
+            inputs=["block11_head0_softmax", "block11_head0_value"],
+            output_shape=(16, 64),
+            attrs={"head_idx": 0},
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={},
+            calibration_scales={
+                "block11_head0_query": 0.125,
+                "block11_head0_key": 0.125,
+                "block11_head0_value": 0.25,
+                "block11_head0_qkt": 0.015625,
+                "block11_head0_softmax": 0.0625,
+                "block11_head0_attn_v": 0.25,
+            },
+            prescaled_biases={},
+            fused_softmax_attnv_blocks={11},
+        )
+
+        instructions, _ = codegen.generate(graph)
+
+        assert any(isinstance(insn, SoftmaxAttnVInsn) for insn in instructions)
+        assert not any(isinstance(insn, SoftmaxInsn) for insn in instructions)
+
+    def test_fused_out_proj_accumulates_heads_without_concat_rows(self):
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="concat_heads",
+            name="block11_concat",
+            inputs=[f"block11_head{head_idx}_attn_v" for head_idx in range(3)],
+            output_shape=(197, 192),
+        ))
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block11_out_proj",
+            inputs=["block11_concat", "vit.encoder.layer.11.attention.output.dense.weight"],
+            output_shape=(197, 192),
+            attrs={
+                "bias": "vit.encoder.layer.11.attention.output.dense.bias",
+                "strip_mine": True,
+            },
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                "vit.encoder.layer.11.attention.output.dense.weight": (
+                    np.ones((192, 192), dtype=np.int8),
+                    np.full(192, 0.0625, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "block11_concat": 0.125,
+                "block11_head0_attn_v": 0.10,
+                "block11_head1_attn_v": 0.125,
+                "block11_head2_attn_v": 0.15,
+                "block11_out_proj": 0.25,
+            },
+            prescaled_biases={
+                "vit.encoder.layer.11.attention.output.dense.bias": np.zeros(192, dtype=np.int32),
+            },
+            fused_softmax_attnv_blocks={11},
+            fused_softmax_attnv_accum_out_proj_blocks={11},
+        )
+        for head_idx in range(3):
+            codegen.mem.wbuf.alloc(f"block11_head{head_idx}_attn_v", pad_dim(197) * 64)
+
+        instructions, _ = codegen.generate(graph)
+
+        matmuls = [insn for insn in instructions if isinstance(insn, MatmulInsn)]
+        assert len(matmuls) == 13 * 3
+        assert [insn.flags for insn in matmuls[:6]] == [0, 1, 1, 0, 1, 1]
+        short_concat_copies = [
+            insn for insn in instructions
+            if isinstance(insn, BufCopyInsn) and insn.length == 4
+        ]
+        assert not short_concat_copies
+
+
+class TestDequantAddResidual1Codegen:
+    def test_block_selected_residual1_emits_dequant_add(self):
+        weight_name = "vit.encoder.layer.11.attention.output.dense.weight"
+        bias_name = "vit.encoder.layer.11.attention.output.dense.bias"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block11_out_proj",
+            inputs=["block11_concat", weight_name],
+            output_shape=(16, 16),
+            attrs={"bias": bias_name},
+        ))
+        graph.add_node(IRNode(
+            op="vadd",
+            name="block11_residual1",
+            inputs=["block11_out_proj", "block10_residual2"],
+            output_shape=(16, 16),
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.full(16, 0.125, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "block11_concat": 0.125,
+                "block10_residual2": 0.25,
+                "block11_out_proj": 0.25,
+                "block11_residual1": 0.25,
+            },
+            prescaled_biases={bias_name: np.zeros(16, dtype=np.int32)},
+            dequant_add_residual1_blocks={11},
+        )
+        codegen.mem.abuf.alloc("block11_concat", 16 * 16)
+        codegen.mem.abuf.alloc("block10_residual2", 16 * 16)
+
+        instructions, _ = codegen.generate(graph)
+
+        assert any(isinstance(insn, DequantAddInsn) for insn in instructions)
+        assert not any(
+            isinstance(insn, VaddInsn) and insn.src1_buf == BUF_ABUF
+            for insn in instructions
+        )
+
+
+class TestMatmulRequantNumerics:
+    @staticmethod
+    def _pack_weight(q_rows: np.ndarray, scales: np.ndarray):
+        q_rows = np.asarray(q_rows, dtype=np.int8)
+        scales = np.asarray(scales, dtype=np.float32)
+        out_ch, in_ch = q_rows.shape
+        out_pad = pad_dim(out_ch)
+        in_pad = pad_dim(in_ch)
+        q_pad = np.zeros((out_pad, in_pad), dtype=np.int8)
+        q_pad[:out_ch, :in_ch] = q_rows
+        scale_pad = np.full(out_pad, float(scales[-1]), dtype=np.float16)
+        scale_pad[:out_ch] = scales.astype(np.float16)
+        return np.ascontiguousarray(q_pad.T), scale_pad, q_pad
+
+    @staticmethod
+    def _run_single_matmul(weight_name: str, input_int8: np.ndarray, weight_data,
+                           calibration_scales, prescaled_biases,
+                           requant_pc_scale_table=None):
+        bias_name = f"{weight_name.rsplit('.', 1)[0]}.bias"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="test_node",
+            inputs=["act", weight_name],
+            output_shape=(input_int8.shape[0], 10),
+            attrs={"bias": bias_name},
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={weight_name: weight_data},
+            calibration_scales=calibration_scales,
+            prescaled_biases=prescaled_biases,
+            requant_pc_weight_names={weight_name} if requant_pc_scale_table is not None else set(),
+            requant_pc_scale_tables=(
+                {weight_name: requant_pc_scale_table}
+                if requant_pc_scale_table is not None else {}
+            ),
+        )
+        instructions, dram_data = codegen.generate(graph)
+        program = ProgramBinary(
+            instructions=b"".join(encode(insn) for insn in instructions),
+            data=dram_data,
+            entry_point=0,
+            insn_count=len(instructions),
+        )
+        program = ProgramBinary.from_bytes(program.to_bytes())
+
+        sim = Simulator()
+        sim.load_program(program)
+
+        act_alloc = codegen.mem.abuf.get("act")
+        assert act_alloc is not None
+        sim.state.abuf[act_alloc.offset_units * 16:act_alloc.offset_units * 16 + input_int8.size] = (
+            np.asarray(input_int8, dtype=np.int8).tobytes()
+        )
+        sim.run()
+
+        out_alloc = codegen.mem.abuf.get("test_node")
+        assert out_alloc is not None
+        out_rows = pad_dim(input_int8.shape[0])
+        out_cols = pad_dim(10)
+        raw = bytes(
+            sim.state.abuf[
+                out_alloc.offset_units * 16:
+                out_alloc.offset_units * 16 + out_rows * out_cols
+            ]
+        )
+        return np.frombuffer(raw, dtype=np.int8).reshape(out_rows, out_cols)
+
+    def test_scalar_requant_codegen_matches_direct_formula_with_uniform_scales(self):
+        input_scale = np.float32(0.25)
+        target_scale = np.float32(0.125)
+        input_int8 = ((np.arange(256).reshape(16, 16) % 7) - 3).astype(np.int8)
+
+        q_rows = (((np.arange(160).reshape(10, 16) * 3) % 9) - 4).astype(np.int8)
+        w_scale = np.float32(0.0625)
+        packed_weight, packed_scales, q_pad = self._pack_weight(
+            q_rows,
+            np.full(10, w_scale, dtype=np.float32),
+        )
+        bias_i32 = (np.arange(10, dtype=np.int32) - 4).astype(np.int32)
+        bias_pad = np.pad(bias_i32, (0, pad_dim(10) - 10), constant_values=0)
+
+        result = self._run_single_matmul(
+            "test.weight",
+            input_int8,
+            (packed_weight, packed_scales),
+            {"act": float(input_scale), "test_node": float(target_scale)},
+            {"test.bias": bias_pad},
+        )
+
+        accum = input_int8.astype(np.int32) @ q_pad.T.astype(np.int32)
+        accum += bias_pad.reshape(1, -1)
+        requant_scale = np.float32(input_scale * w_scale / target_scale)
+        expected = np.clip(np.round(accum.astype(np.float32) * requant_scale), -128, 127).astype(np.int8)
+
+        np.testing.assert_array_equal(result, expected)
+
+    def test_requant_pc_codegen_matches_direct_formula_with_per_channel_scales(self):
+        input_scale = np.float32(0.125)
+        target_scale = np.float32(0.20)
+        input_int8 = (((np.arange(256).reshape(16, 16) * 5) % 11) - 5).astype(np.int8)
+
+        q_rows = (((np.arange(160).reshape(10, 16) * 7) % 13) - 6).astype(np.int8)
+        per_channel_scales = np.linspace(0.02, 0.11, 10, dtype=np.float32)
+        packed_weight, packed_scales, q_pad = self._pack_weight(q_rows, per_channel_scales)
+        bias_i32 = (np.arange(10, dtype=np.int32) - 3).astype(np.int32)
+        bias_pad = np.pad(bias_i32, (0, pad_dim(10) - 10), constant_values=0)
+        pc_scales = np.full(pad_dim(10), per_channel_scales[-1], dtype=np.float16)
+        pc_scales[:10] = (input_scale * per_channel_scales / target_scale).astype(np.float16)
+
+        result = self._run_single_matmul(
+            "test.weight",
+            input_int8,
+            (packed_weight, packed_scales),
+            {"act": float(input_scale), "test_node": float(target_scale)},
+            {"test.bias": bias_pad},
+            requant_pc_scale_table=pc_scales,
+        )
+
+        accum = input_int8.astype(np.int32) @ q_pad.T.astype(np.int32)
+        accum += bias_pad.reshape(1, -1)
+        expected = np.clip(
+            np.round(accum.astype(np.float32) * pc_scales.astype(np.float32).reshape(1, -1)),
+            -128,
+            127,
+        ).astype(np.int8)
+
+        np.testing.assert_array_equal(result, expected)

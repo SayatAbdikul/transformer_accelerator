@@ -33,3 +33,6 @@ quantization_comparison.json
 
 # macOS
 .DS_Store
+
+# storage for dataset
+images/

@@ -71,6 +71,14 @@ def _get_dual_scales(state, sreg: int):
     return in_scale, out_scale
 
 
+def _get_quad_scales(state, sreg: int):
+    """Return four consecutive FP32 scales from scale registers."""
+    from .simulator import ConfigError
+    if sreg >= 13:
+        raise ConfigError("SFU sreg+3 out of range")
+    return tuple(np.float32(state.scale_regs[sreg + idx]) for idx in range(4))
+
+
 def execute_layernorm(state, insn):
     """LayerNorm: dequant INT8 → FP32, normalize, requant → INT8.
 
@@ -175,10 +183,13 @@ def execute_gelu(state, insn):
 
     in_scale, out_scale = _get_dual_scales(state, insn.sreg)
 
-    inp = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
-
-    # Dequantize: INT8 × FP32(in_scale) → FP32
-    x = inp.astype(np.float32) * in_scale
+    if insn.src1_buf == BUF_ACCUM:
+        inp_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, N)
+        x = inp_i32.astype(np.float32) * in_scale
+    else:
+        inp = memory.read_int8_tile(state, insn.src1_buf, insn.src1_off, M, N)
+        # Dequantize: INT8 × FP32(in_scale) → FP32
+        x = inp.astype(np.float32) * in_scale
 
     # GELU in FP32
     from scipy.special import erf
@@ -187,9 +198,71 @@ def execute_gelu(state, insn):
 
     # Requantize: round-half-to-even, clip to INT8
     if out_scale == np.float32(0):
-        result = np.zeros_like(inp)
+        result = np.zeros((M, N), dtype=np.int8)
     else:
         result = np.clip(np.round(x_out / out_scale), -128, 127).astype(np.int8)
 
     memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
     state.cycle_count += M * N * CYCLE_PER_ELEMENT
+
+
+def execute_softmax_attnv(state, insn):
+    """Fused SOFTMAX_ATTNV.
+
+    Reads QKT from ACCUM and V from INT8 SRAM, computes softmax(QKT) in FP32,
+    immediately multiplies by dequantized V in FP32, and requantizes the final
+    attn@V output to INT8. For diagnostics, it also returns a virtual INT8
+    softmax tile using a trace-only scale in sreg+3.
+    """
+    from .simulator import ConfigError, IllegalBufferError
+    if state.tile_config is None:
+        raise ConfigError("CONFIG_TILE not set")
+    if insn.src1_buf != BUF_ACCUM:
+        raise IllegalBufferError(insn.src1_buf)
+    if insn.src2_buf == BUF_ACCUM:
+        raise IllegalBufferError(insn.src2_buf)
+    if insn.dst_buf == BUF_ACCUM:
+        raise IllegalBufferError(insn.dst_buf)
+
+    m_tiles = state.tile_config[0] + 1
+    n_tiles = state.tile_config[1] + 1
+    k_tiles = state.tile_config[2] + 1
+    M = m_tiles * 16
+    N = n_tiles * 16
+    K = k_tiles * 16
+
+    qkt_in_scale, v_scale, out_scale, softmax_trace_scale = _get_quad_scales(state, insn.sreg)
+
+    qkt_i32 = memory.read_int32_tile(state, BUF_ACCUM, insn.src1_off, M, K)
+    v_i8 = memory.read_int8_tile(state, insn.src2_buf, insn.src2_off, K, N)
+
+    qkt = qkt_i32.astype(np.float32) * qkt_in_scale
+    v = v_i8.astype(np.float32) * v_scale
+
+    qkt_shifted = qkt - qkt.max(axis=-1, keepdims=True)
+    exp_qkt = np.exp(qkt_shifted).astype(np.float32)
+    softmax = exp_qkt / exp_qkt.sum(axis=-1, keepdims=True)
+    attn_v = np.matmul(softmax, v).astype(np.float32)
+
+    if out_scale == np.float32(0):
+        result = np.zeros((M, N), dtype=np.int8)
+    else:
+        result = np.clip(np.round(attn_v / out_scale), -128, 127).astype(np.int8)
+    memory.write_int8_tile(state, insn.dst_buf, insn.dst_off, result)
+
+    if softmax_trace_scale == np.float32(0):
+        softmax_i8 = np.zeros((M, K), dtype=np.int8)
+    else:
+        softmax_i8 = np.clip(np.round(softmax / softmax_trace_scale), -128, 127).astype(np.int8)
+
+    state.cycle_count += (M * K * CYCLE_PER_ELEMENT) + (m_tiles * n_tiles * k_tiles * 16) + (M * N)
+    return {
+        "softmax": {
+            "raw": softmax_i8,
+            "dtype": "int8",
+            "scale": float(softmax_trace_scale),
+            "sat": int(np.count_nonzero((softmax_i8 == 127) | (softmax_i8 == -128))),
+            "zero": int(np.count_nonzero(softmax_i8 == 0)),
+            "total": int(softmax_i8.size),
+        }
+    }

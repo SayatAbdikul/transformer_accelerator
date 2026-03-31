@@ -18,7 +18,8 @@ from .opcodes import (
 from .instructions import (
     Instruction, RTypeInsn, MTypeInsn, BufCopyInsn, ATypeInsn, ConfigTileInsn,
     SetScaleInsn, SyncInsn, NopInsn, HaltInsn,
-    MatmulInsn, RequantInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    SoftmaxAttnVInsn, DequantAddInsn,
     LoadInsn, StoreInsn, SetAddrLoInsn, SetAddrHiInsn,
 )
 
@@ -26,11 +27,14 @@ from .instructions import (
 _R_TYPE_CLASSES = {
     Opcode.MATMUL: MatmulInsn,
     Opcode.REQUANT: RequantInsn,
+    Opcode.REQUANT_PC: RequantPcInsn,
     Opcode.SCALE_MUL: ScaleMulInsn,
     Opcode.VADD: VaddInsn,
     Opcode.SOFTMAX: SoftmaxInsn,
     Opcode.LAYERNORM: LayernormInsn,
     Opcode.GELU: GeluInsn,
+    Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
+    Opcode.DEQUANT_ADD: DequantAddInsn,
 }
 
 _M_TYPE_CLASSES = {

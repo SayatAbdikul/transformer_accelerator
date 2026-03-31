@@ -60,6 +60,11 @@ class RequantInsn(RTypeInsn):
 
 
 @dataclass
+class RequantPcInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.REQUANT_PC, init=False)
+
+
+@dataclass
 class ScaleMulInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.SCALE_MUL, init=False)
 
@@ -82,6 +87,16 @@ class LayernormInsn(RTypeInsn):
 @dataclass
 class GeluInsn(RTypeInsn):
     opcode: Opcode = field(default=Opcode.GELU, init=False)
+
+
+@dataclass
+class SoftmaxAttnVInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.SOFTMAX_ATTNV, init=False)
+
+
+@dataclass
+class DequantAddInsn(RTypeInsn):
+    opcode: Opcode = field(default=Opcode.DEQUANT_ADD, init=False)
 
 
 # --- M-type instructions ---

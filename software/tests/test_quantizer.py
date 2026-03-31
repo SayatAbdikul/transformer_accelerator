@@ -1,7 +1,15 @@
 """Tests for quantizer."""
 import pytest
 import numpy as np
-from taccel.quantizer.quantize import quantize_tensor, dequantize_tensor
+import torch
+from taccel.quantizer.quantize import (
+    adaround_greedy,
+    dequantize_tensor,
+    quantize_tensor,
+    quantize_tensor_clipped,
+    quantize_weights,
+)
+from taccel.quantizer.calibrate import CalibrationResult
 from taccel.quantizer.scales import ScalePropagator
 
 
@@ -56,6 +64,112 @@ class TestQuantize:
         assert q.shape == (192, 768)
         assert len(scales) == 192
 
+    def test_output_aware_clipping_reduces_output_mse(self):
+        """Clipping should help when large outliers matter less than typical inputs."""
+        W = np.array(
+            [
+                [12.0, 0.80, -0.65, 0.55],
+                [-11.0, -0.75, 0.70, -0.45],
+            ],
+            dtype=np.float32,
+        )
+        calibration_inputs = [
+            np.array(
+                [
+                    [0.01, 1.2, -0.8, 0.7],
+                    [0.00, -1.0, 0.9, -0.6],
+                    [0.02, 0.8, -0.4, 1.1],
+                ],
+                dtype=np.float32,
+            )
+        ]
+
+        q_base, s_base = quantize_tensor(W, per_channel=True)
+        q_clip, s_clip = quantize_tensor_clipped(
+            W,
+            calibration_inputs=calibration_inputs,
+            per_channel=True,
+            n_candidates=31,
+            alpha_min=0.2,
+        )
+
+        x = calibration_inputs[0]
+        y_fp32 = x @ W.T
+        y_base = x @ dequantize_tensor(q_base, s_base).T
+        y_clip = x @ dequantize_tensor(q_clip, s_clip).T
+
+        mse_base = float(np.mean((y_fp32 - y_base) ** 2))
+        mse_clip = float(np.mean((y_fp32 - y_clip) ** 2))
+        assert mse_clip < mse_base
+
+    def test_quantize_weights_applies_targeted_clipping_override(self):
+        state_dict = {
+            "fc.weight": torch.from_numpy(np.array(
+                [[10.0, 0.7, -0.5], [-9.0, -0.6, 0.4]],
+                dtype=np.float32,
+            ))
+        }
+        overrides = {
+            "fc.weight": {
+                "mode": "output_aware_clipping",
+                "per_channel": True,
+                "n_candidates": 21,
+                "alpha_min": 0.2,
+                "calibration_inputs": [np.array([[0.0, 1.0, -1.0]], dtype=np.float32)],
+            }
+        }
+
+        q_default, s_default = quantize_weights(state_dict)["fc.weight"]
+        q_clipped, s_clipped = quantize_weights(state_dict, quantization_overrides=overrides)["fc.weight"]
+
+        assert q_clipped.shape == q_default.shape
+        assert s_clipped.shape == s_default.shape
+        assert not np.array_equal(q_clipped, q_default) or not np.array_equal(s_clipped, s_default)
+
+    def test_adaround_greedy_reduces_output_mse(self):
+        W = np.array(
+            [
+                [0.55, -1.45, 0.25, 0.75],
+                [-0.62, 1.38, -0.48, 0.18],
+            ],
+            dtype=np.float32,
+        )
+        calibration_inputs = [
+            np.array(
+                [
+                    [1.0, -0.6, 0.3, 0.9],
+                    [-0.7, 0.8, -0.4, 0.5],
+                    [0.6, 0.7, 0.2, -0.3],
+                ],
+                dtype=np.float32,
+            )
+        ]
+
+        q_clip, s_clip = quantize_tensor_clipped(
+            W,
+            calibration_inputs=calibration_inputs,
+            per_channel=True,
+            n_candidates=7,
+            alpha_min=1.0,
+        )
+        q_ada = adaround_greedy(
+            W,
+            q_clip,
+            s_clip,
+            calibration_inputs,
+            frac_lo=0.2,
+            frac_hi=0.8,
+        )
+
+        x = calibration_inputs[0]
+        y_fp32 = x @ W.T
+        y_clip = x @ dequantize_tensor(q_clip, s_clip).T
+        y_ada = x @ dequantize_tensor(q_ada, s_clip).T
+
+        mse_clip = float(np.mean((y_fp32 - y_clip) ** 2))
+        mse_ada = float(np.mean((y_fp32 - y_ada) ** 2))
+        assert mse_ada <= mse_clip
+
 
 class TestScalePropagator:
     def test_prescale_bias(self):
@@ -81,3 +195,16 @@ class TestScalePropagator:
         out_scale = sp.compute_matmul_output_scale(act_scale, w_scales)
         expected = np.array([0.005, 0.01])
         np.testing.assert_allclose(out_scale, expected, rtol=1e-5)
+
+
+class TestCalibrationResult:
+    def test_compute_scales_supports_percentile_overrides(self):
+        result = CalibrationResult()
+        result.add_observation(
+            "vit.layernorm",
+            10.0,
+            abs_values=np.array([1.0, 2.0, 3.0, 9.0], dtype=np.float32),
+        )
+        result.compute_scales(percentile_overrides={"vit.layernorm": 50.0})
+
+        assert result.get_scale("vit.layernorm") == pytest.approx(np.percentile([1.0, 2.0, 3.0, 9.0], 50.0) / 127.0)

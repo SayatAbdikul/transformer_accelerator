@@ -6,6 +6,7 @@ from taccel.golden_model.simulator import Simulator, ConfigError, IllegalBufferE
 from taccel.golden_model.memory import SRAMAccessError, DRAMAccessError
 from taccel.assembler.assembler import Assembler, ProgramBinary
 from taccel.isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
+from tools.run_golden import write_runtime_inputs
 
 
 def make_sim(asm_source: str) -> Simulator:
@@ -120,6 +121,44 @@ class TestRequant:
         assert result[0] == 127   # clamped to max
         assert result[1] == -128  # clamped to min
 
+    def test_requant_pc_matches_scalar_requant_when_scales_are_uniform(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "REQUANT_PC src1=ACCUM[0], src2=WBUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        sim.state.accum[:256] = np.arange(256, dtype=np.int32) - 128
+        scales = np.full(16, np.float16(0.5), dtype=np.float16)
+        sim.state.wbuf[: scales.nbytes] = scales.tobytes()
+        sim.run()
+
+        result = np.frombuffer(bytes(sim.state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        expected = np.clip(
+            np.round((np.arange(256, dtype=np.int32).reshape(16, 16) - 128).astype(np.float32) * 0.5),
+            -128,
+            127,
+        ).astype(np.int8)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_requant_pc_uses_per_column_scales(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "REQUANT_PC src1=ACCUM[0], src2=WBUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        sim.state.accum[:256] = 8
+        scales = np.array([0.5] * 8 + [1.0] * 8, dtype=np.float16)
+        sim.state.wbuf[: scales.nbytes] = scales.tobytes()
+        sim.run()
+
+        result = np.frombuffer(bytes(sim.state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        expected = np.tile(np.array([4] * 8 + [8] * 8, dtype=np.int8), (16, 1))
+        np.testing.assert_array_equal(result, expected)
+
 
 class TestVADD:
     def test_int8_saturating_add(self):
@@ -156,6 +195,26 @@ class TestVADD:
         assert np.all(result == 30)
 
 
+class TestDequantAdd:
+    def test_accum_plus_skip_requants_to_int8(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S6, imm=0x3800\n"
+            "SET_SCALE S7, imm=0x3400\n"
+            "DEQUANT_ADD src1=ACCUM[0], src2=ABUF[16], dst=ABUF[32], sreg=6, flags=0\n"
+            "HALT"
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        sim.state.accum[:256] = 20
+        sim.state.abuf[256:512] = bytes([8] * 256)
+        sim.run()
+
+        result = np.frombuffer(bytes(sim.state.abuf[512:768]), dtype=np.int8).reshape(16, 16)
+        expected = np.clip(np.round(20.0 * 0.5 + 8.0 * 0.25), -128, 127).astype(np.int8)
+        assert np.all(result == expected)
+
+
 class TestDMA:
     def test_load_store_roundtrip(self):
         """DMA load then store recovers original data."""
@@ -181,6 +240,45 @@ class TestDMA:
         assert bytes(sim.state.abuf[:256]) == data
         # Verify DRAM store target contains the same data
         assert bytes(sim.state.dram[0x100000:0x100000 + 256]) == data
+
+
+class TestRuntimeInputPlacement:
+    def test_write_runtime_inputs_uses_program_offsets_and_fold_metadata(self):
+        prog = ProgramBinary(
+            input_offset=1024,
+            pos_embed_patch_dram_offset=512,
+            pos_embed_cls_dram_offset=64,
+            cls_token_dram_offset=768,
+        )
+        state = MachineState()
+        patches = np.arange(8, dtype=np.int8).reshape(2, 4)
+        cls_row = np.arange(192, dtype=np.int8).reshape(1, 192)
+
+        write_runtime_inputs(
+            state,
+            prog,
+            patches,
+            cls_input=cls_row,
+            folded_pos_embed=True,
+        )
+
+        expected_patch_bytes = np.zeros((2, 16), dtype=np.int8)
+        expected_patch_bytes[:, :4] = patches
+        assert bytes(state.dram[1024:1024 + expected_patch_bytes.nbytes]) == expected_patch_bytes.tobytes()
+        assert bytes(state.dram[768:768 + 192]) == cls_row.tobytes()
+        assert bytes(state.dram[64:64 + 192]) == bytes(192)
+        assert bytes(state.dram[512:512 + expected_patch_bytes.nbytes]) == bytes(expected_patch_bytes.nbytes)
+
+    def test_write_runtime_inputs_falls_back_to_abuf_for_legacy_program(self):
+        prog = ProgramBinary()
+        state = MachineState()
+        patches = np.arange(8, dtype=np.int8).reshape(2, 4)
+
+        write_runtime_inputs(state, prog, patches)
+
+        expected_patch_bytes = np.zeros((2, 16), dtype=np.int8)
+        expected_patch_bytes[:, :4] = patches
+        assert bytes(state.abuf[:expected_patch_bytes.nbytes]) == expected_patch_bytes.tobytes()
 
 
 class TestBufCopy:
@@ -243,6 +341,23 @@ class TestSFUOps:
         # GELU(4.0) ≈ 4.0 → at scale 0.25, quantized ≈ 16
         assert result[0] > 10, f"GELU should be ~16, got {result[0]}"
 
+    def test_gelu_from_accum_int32_path(self):
+        """GELU can consume INT32 ACCUM input directly."""
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3400\n"   # in_scale = 0.25
+            "SET_SCALE S1, imm=0x3400\n"   # out_scale = 0.25
+            "GELU src1=ACCUM[0], src2=ABUF[0], dst=ABUF[16], sreg=0, flags=0\n"
+            "HALT"
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        sim.state.accum[:256] = 16  # 16 * 0.25 = 4.0
+        sim.run()
+
+        result = np.frombuffer(bytes(sim.state.abuf[256:512]), dtype=np.int8)
+        assert result[0] > 10, f"GELU-from-ACCUM should be ~16, got {result[0]}"
+
     def test_softmax_sums_to_one(self):
         """Softmax output sums close to 1.0 after dequantization."""
         prog = Assembler().assemble(
@@ -298,6 +413,26 @@ class TestSFUOps:
         expected = np.clip(np.round(probs / out_scale), -128, 127).astype(np.int8)
 
         got = np.frombuffer(bytes(state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        np.testing.assert_array_equal(got, expected)
+
+    def test_softmax_attnv_fused_path_matches_expected_quantized_output(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S4, imm=0x3000\n"  # qkt_in_scale = 0.125
+            "SET_SCALE S5, imm=0x3400\n"  # v_scale = 0.25
+            "SET_SCALE S6, imm=0x3400\n"  # out_scale = 0.25
+            "SET_SCALE S7, imm=0x2c00\n"  # softmax trace scale = 1/16
+            "SOFTMAX_ATTNV src1=ACCUM[0], src2=ABUF[0], dst=WBUF[0], sreg=4, flags=0\n"
+            "HALT"
+        )
+        sim = Simulator()
+        sim.load_program(prog)
+        sim.state.accum[:256] = 0  # uniform logits => uniform softmax
+        sim.state.abuf[:256] = bytes([8] * 256)  # 8 * 0.25 = 2.0
+        sim.run()
+
+        got = np.frombuffer(bytes(sim.state.wbuf[:256]), dtype=np.int8).reshape(16, 16)
+        expected = np.full((16, 16), 8, dtype=np.int8)
         np.testing.assert_array_equal(got, expected)
 
 

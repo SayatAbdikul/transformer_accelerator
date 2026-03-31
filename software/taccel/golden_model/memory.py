@@ -133,10 +133,16 @@ def read_bytes(state, buf_id: int, offset_units: int, length_bytes: int) -> byte
 
     if buf_id == BUF_ACCUM:
         data = state.accum.view(np.uint8)
-        return bytes(data[byte_offset:byte_offset + length_bytes])
+        end = byte_offset + length_bytes
+        if end > len(data):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        return bytes(data[byte_offset:end])
     else:
         buf = state.get_buffer(buf_id)
-        return bytes(buf[byte_offset:byte_offset + length_bytes])
+        end = byte_offset + length_bytes
+        if end > len(buf):
+            raise SRAMAccessError(buf_id, offset_units, BUFFER_MAX_OFF[buf_id])
+        return bytes(buf[byte_offset:end])
 
 
 def write_bytes(state, buf_id: int, offset_units: int, data: bytes):

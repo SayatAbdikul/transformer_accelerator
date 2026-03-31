@@ -1,10 +1,13 @@
 """IR → ISA instruction sequence code generator."""
+import re
 import struct
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from ..isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
-    MatmulInsn, RequantInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    DequantAddInsn,
+    SoftmaxAttnVInsn,
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
     ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
@@ -38,7 +41,14 @@ class CodeGenerator:
 
     def __init__(self, weight_data: Dict[str, Tuple[np.ndarray, Optional[np.ndarray]]],
                  calibration_scales: Dict[str, float],
-                 prescaled_biases: Dict[str, np.ndarray]):
+                 prescaled_biases: Dict[str, np.ndarray],
+                 gelu_from_accum: bool = False,
+                 gelu_from_accum_blocks: Optional[set] = None,
+                 dequant_add_residual1_blocks: Optional[set] = None,
+                 fused_softmax_attnv_blocks: Optional[set] = None,
+                 fused_softmax_attnv_accum_out_proj_blocks: Optional[set] = None,
+                 requant_pc_weight_names: Optional[set] = None,
+                 requant_pc_scale_tables: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
             weight_data: name → (quantized_data, per_channel_scales)
@@ -48,15 +58,33 @@ class CodeGenerator:
         self.weight_data = weight_data
         self.calibration_scales = calibration_scales
         self.prescaled_biases = prescaled_biases
+        self.gelu_from_accum = gelu_from_accum
+        self.gelu_from_accum_blocks = None if gelu_from_accum_blocks is None else set(gelu_from_accum_blocks)
+        self.dequant_add_residual1_blocks = (
+            None if dequant_add_residual1_blocks is None else set(dequant_add_residual1_blocks)
+        )
+        self.fused_softmax_attnv_blocks = None if fused_softmax_attnv_blocks is None else set(fused_softmax_attnv_blocks)
+        self.fused_softmax_attnv_accum_out_proj_blocks = (
+            None if fused_softmax_attnv_accum_out_proj_blocks is None
+            else set(fused_softmax_attnv_accum_out_proj_blocks)
+        )
+        self.requant_pc_weight_names = set(requant_pc_weight_names or set())
+        self.requant_pc_scale_tables = dict(requant_pc_scale_tables or {})
         self.mem = MemoryAllocator()
         self.instructions: List[Instruction] = []
         self.dram_layout: Dict[str, int] = {}  # name → dram byte offset
         self.dram_blob = bytearray()
         self.next_sreg_single = 0  # index into odd sreg pool (1,3,5,...)
         self.next_sreg_pair = 0    # index into even sreg pool (0,2,4,...)
+        self.next_sreg_quad = 0    # index into quadruplet pool (0,4,8,12)
         # Track node outputs that live in DRAM temp (from strip-mined spills)
         # Maps output_name → DRAM byte offset of the spilled data
         self.dram_temp_outputs: Dict[str, int] = {}
+        # Optional trace metadata keyed by program counter. Each event tells the
+        # simulator how to decode a node output back into FP32 for diagnostics.
+        self.trace_manifest: Dict[int, List[Dict[str, Any]]] = {}
+        self.pending_accum_outputs: Dict[str, Dict[str, Any]] = {}
+        self.precomputed_nodes: set = set()
 
     def _dram_offset_required(self, name: str, context: str) -> int:
         """Return DRAM offset for a symbol or raise a clear error."""
@@ -111,6 +139,12 @@ class CodeGenerator:
                 scale_blob = scales.tobytes()
                 self.dram_blob.extend(scale_blob)
                 offset += len(scale_blob)
+            if name in self.requant_pc_scale_tables:
+                pc_scale_name = f"{name}__requant_pc"
+                self.dram_layout[pc_scale_name] = offset
+                pc_scale_blob = self.requant_pc_scale_tables[name].astype(np.float16).tobytes()
+                self.dram_blob.extend(pc_scale_blob)
+                offset += len(pc_scale_blob)
 
         # Pre-scaled biases
         for name, bias_i32 in self.prescaled_biases.items():
@@ -164,8 +198,80 @@ class CodeGenerator:
         self.next_sreg_pair = (self.next_sreg_pair + 1) % len(PAIR_POOL)
         return reg
 
+    def _alloc_sreg_quad(self) -> int:
+        """Allocate four consecutive scale registers."""
+        QUAD_POOL = [0, 4, 8, 12]
+        reg = QUAD_POOL[self.next_sreg_quad % len(QUAD_POOL)]
+        self.next_sreg_quad = (self.next_sreg_quad + 1) % len(QUAD_POOL)
+        return reg
+
     def _emit(self, insn: Instruction):
         self.instructions.append(insn)
+
+    def _record_trace_event(self, node_name: str, buf_id: int, offset_units: int,
+                            mem_rows: int, mem_cols: int,
+                            logical_rows: int, logical_cols: int,
+                            dtype: str, scale: float,
+                            row_start: int = 0,
+                            full_rows: Optional[int] = None,
+                            full_cols: Optional[int] = None,
+                            pc: Optional[int] = None):
+        """Record how to snapshot a node tensor after an emitted instruction."""
+        if logical_rows <= 0 or logical_cols <= 0:
+            return
+        if pc is None:
+            pc = len(self.instructions) - 1
+        event = {
+            "node_name": node_name,
+            "buf_id": int(buf_id),
+            "offset_units": int(offset_units),
+            "mem_rows": int(mem_rows),
+            "mem_cols": int(mem_cols),
+            "logical_rows": int(logical_rows),
+            "logical_cols": int(logical_cols),
+            "full_rows": int(full_rows if full_rows is not None else logical_rows),
+            "full_cols": int(full_cols if full_cols is not None else logical_cols),
+            "row_start": int(row_start),
+            "dtype": dtype,
+            "scale": float(scale),
+            "when": "after",
+        }
+        self.trace_manifest.setdefault(pc, []).append(event)
+
+    def _gelu_from_accum_enabled_for(self, node: IRNode, gelu_name: Optional[str]) -> bool:
+        """Return True when this FC1 -> GELU strip should consume ACCUM directly."""
+        if not (gelu_name and self.gelu_from_accum):
+            return False
+        if self.gelu_from_accum_blocks is None:
+            return True
+        match = re.match(r"block(\d+)_", gelu_name or node.name)
+        if match is None:
+            return False
+        return int(match.group(1)) in self.gelu_from_accum_blocks
+
+    def _block_selected(self, name: str, selected_blocks: Optional[set]) -> bool:
+        if selected_blocks is None:
+            return False
+        match = re.match(r"block(\d+)_", name)
+        if match is None:
+            return False
+        return int(match.group(1)) in selected_blocks
+
+    def _dequant_add_residual1_enabled_for_output(self, node_name: str) -> bool:
+        return node_name.endswith("_out_proj") and self._block_selected(node_name, self.dequant_add_residual1_blocks)
+
+    def _dequant_add_residual1_enabled_for_residual(self, node_name: str) -> bool:
+        return node_name.endswith("_residual1") and self._block_selected(node_name, self.dequant_add_residual1_blocks)
+
+    def _fused_softmax_attnv_accum_out_proj_enabled_for(self, node_name: str) -> bool:
+        return self._block_selected(node_name, self.fused_softmax_attnv_accum_out_proj_blocks)
+
+    def _residual1_skip_name(self, out_proj_name: str) -> str:
+        match = re.match(r"block(\d+)_out_proj$", out_proj_name)
+        if match is None:
+            raise ValueError(f"Cannot infer residual1 skip input from '{out_proj_name}'")
+        block_idx = int(match.group(1))
+        return "pos_embed_add" if block_idx == 0 else f"block{block_idx - 1}_residual2"
 
     def _emit_node(self, node: IRNode):
         """Emit instructions for a single IR node."""
@@ -219,6 +325,12 @@ class CodeGenerator:
             strip_mine = True
 
         if strip_mine:
+            if (
+                node.name.endswith("_out_proj")
+                and self._fused_softmax_attnv_accum_out_proj_enabled_for(node.name)
+            ):
+                self._emit_fused_out_proj_accum(node, M, N, K, w_q, w_scales)
+                return
             self._emit_matmul_strip_mined(node, M, N, K, w_q, w_scales)
         else:
             self._emit_matmul_simple(node, M, N, K, w_q, w_scales)
@@ -272,21 +384,303 @@ class CodeGenerator:
                 raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
             self._emit_bias_add(bias_name, N_pad, m_tiles)
 
-        # Requantize: scale = input_act_scale × mean(weight_scale) / target_act_scale
         input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
         target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
         mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
-        requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
-        sreg = self._alloc_sreg()
-        self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+        accum_real_scale = input_act_scale * mean_w_scale
+
+        if self._dequant_add_residual1_enabled_for_output(node.name):
+            if weight_name in self.requant_pc_weight_names:
+                raise ValueError(
+                    f"DEQUANT_ADD residual1 path currently requires scalar out_proj scale, got REQUANT_PC weight '{weight_name}'"
+                )
+            self.pending_accum_outputs[node.name] = {
+                "accum_real_scale": accum_real_scale,
+                "shape": (M_pad, N_pad, M, N),
+            }
+            self._record_trace_event(
+                node.name,
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M,
+                N,
+                "int32",
+                accum_real_scale,
+            )
+            return
 
         # Allocate output in ABUF
         out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
-        self._emit(RequantInsn(
-            src1_buf=BUF_ACCUM, src1_off=0,
-            dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
-            sreg=sreg,
-        ))
+        if weight_name in self.requant_pc_weight_names:
+            pc_scale_name = f"{weight_name}__requant_pc"
+            pc_scale_dram = self._dram_offset_required(
+                pc_scale_name,
+                f"loading REQUANT_PC scales for '{weight_name}'",
+            )
+            pc_scale_bytes = N_pad * 2
+            pc_scale_alloc = self.mem.wbuf.alloc(f"_rqpc_{weight_name}", pc_scale_bytes)
+            self._emit_dma_load(BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+            self._emit(RequantPcInsn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
+                dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+            ))
+            self.mem.wbuf.free(f"_rqpc_{weight_name}")
+        else:
+            requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+            sreg = self._alloc_sreg()
+            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+            self._emit(RequantInsn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
+                sreg=sreg,
+            ))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            M_pad,
+            N_pad,
+            M,
+            N,
+            "int8",
+            target_act_scale,
+        )
+        if node.name == "classifier":
+            self._record_trace_event(
+                node.name,
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M,
+                N,
+                "int32",
+                accum_real_scale if accum_real_scale is not None else input_act_scale,
+            )
+
+    def _emit_fused_out_proj_accum(self, node: IRNode, M: int, N: int, K: int,
+                                   w_q: np.ndarray, w_scales: np.ndarray):
+        """Emit strip-mined out_proj that accumulates per-head fused outputs directly.
+
+        This avoids materializing the concatenated INT8 tensor. Each head output keeps
+        its own attn_v scale in WBUF, is rescaled to the concat scale strip-by-strip,
+        and contributes via MATMUL accumulate into one shared ACCUM tile.
+        """
+        weight_name = node.inputs[1]
+        match = re.match(r"block(\d+)_out_proj$", node.name)
+        if match is None:
+            raise ValueError(f"Cannot infer block index for fused out_proj node '{node.name}'")
+        block_idx = int(match.group(1))
+
+        M_pad = pad_dim(M)
+        N_pad = pad_dim(N)
+        K_pad = pad_dim(K)
+        strip_rows = TILE
+        num_strips = M_pad // strip_rows
+        head_names = [f"block{block_idx}_head{head_idx}_attn_v" for head_idx in range(3)]
+        num_heads = len(head_names)
+        head_dim = K // max(num_heads, 1)
+        head_dim_pad = pad_dim(head_dim)
+        concat_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+        fuse_residual1 = self._dequant_add_residual1_enabled_for_output(node.name)
+        residual1_name = node.name.replace("_out_proj", "_residual1") if fuse_residual1 else None
+
+        dram_off = self._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
+        weight_bytes = w_q.size
+        w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
+        self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
+        self._emit(SyncInsn(resource_mask=0b001))
+
+        pc_scale_alloc = None
+        if weight_name in self.requant_pc_weight_names:
+            pc_scale_name = f"{weight_name}__requant_pc"
+            pc_scale_dram = self._dram_offset_required(
+                pc_scale_name,
+                f"loading REQUANT_PC scales for '{weight_name}'",
+            )
+            pc_scale_bytes = N_pad * 2
+            pc_scale_alloc = self.mem.wbuf.alloc(f"_rqpc_{weight_name}", pc_scale_bytes)
+            self._emit_dma_load(BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+        if fuse_residual1 and pc_scale_alloc is not None:
+            raise ValueError(
+                f"DEQUANT_ADD residual1 path currently requires scalar out_proj scale, got REQUANT_PC weight '{weight_name}'"
+            )
+
+        head_allocs = []
+        for head_name in head_names:
+            head_alloc = self.mem.wbuf.get(head_name)
+            if head_alloc is None:
+                raise KeyError(
+                    f"Missing fused attention output '{head_name}' while emitting direct out_proj accumulation"
+                )
+            head_allocs.append(head_alloc)
+
+        dram_temp_off = self.dram_temp_start + self.mem.alloc_dram_temp(
+            f"{node.name}_temp", M_pad * N_pad
+        )
+
+        skip_alloc = None
+        if fuse_residual1:
+            skip_name = self._residual1_skip_name(node.name)
+            skip_alloc = self.mem.abuf.get(skip_name)
+            if skip_alloc is None:
+                skip_alloc = self.mem.abuf.alloc(skip_name, M_pad * N_pad)
+            mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+            output_scale = self.calibration_scales.get(residual1_name, 6.0 / 127.0)
+            skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
+            accum_rescale = concat_scale * mean_w_scale / max(output_scale, 1e-12)
+            skip_rescale = skip_scale / max(output_scale, 1e-12)
+
+        for s in range(num_strips):
+            row_start = s * strip_rows
+            logical_rows = max(0, min(strip_rows, M - row_start))
+
+            for head_idx, (head_name, head_alloc) in enumerate(zip(head_names, head_allocs)):
+                head_strip_alloc = self.mem.abuf.alloc(
+                    f"{node.name}_head{head_idx}_strip{s}", strip_rows * head_dim_pad
+                )
+                src_off = head_alloc.offset_units + (s * strip_rows * head_dim_pad) // UNIT
+                self._emit(BufCopyInsn(
+                    src_buf=BUF_WBUF, src_off=src_off,
+                    dst_buf=BUF_ABUF, dst_off=head_strip_alloc.offset_units,
+                    length=(strip_rows * head_dim_pad) // UNIT,
+                ))
+                self._emit(SyncInsn(resource_mask=0b001))
+
+                head_scale = self.calibration_scales.get(head_name, concat_scale)
+                scale_mul = head_scale / max(concat_scale, 1e-12)
+                if not np.isclose(scale_mul, 1.0, atol=1e-4, rtol=1e-4):
+                    self._emit(ConfigTileInsn(M=0, N=head_dim_pad // TILE - 1, K=0))
+                    scale_sreg = self._alloc_sreg()
+                    self._emit(SetScaleInsn(sreg=scale_sreg, src_mode=0, imm16=_fp16_to_uint16(scale_mul)))
+                    self._emit(ScaleMulInsn(
+                        src1_buf=BUF_ABUF, src1_off=head_strip_alloc.offset_units,
+                        dst_buf=BUF_ABUF, dst_off=head_strip_alloc.offset_units,
+                        sreg=scale_sreg,
+                    ))
+                    self._emit(SyncInsn(resource_mask=0b100))
+
+                self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=head_dim_pad // TILE - 1))
+                weight_slice_off = w_alloc.offset_units + (head_idx * head_dim_pad * N_pad) // UNIT
+                self._emit(MatmulInsn(
+                    src1_buf=BUF_ABUF, src1_off=head_strip_alloc.offset_units,
+                    src2_buf=BUF_WBUF, src2_off=weight_slice_off,
+                    dst_buf=BUF_ACCUM, dst_off=0,
+                    flags=0 if head_idx == 0 else 1,
+                ))
+                self._emit(SyncInsn(resource_mask=0b010))
+                self.mem.abuf.free(f"{node.name}_head{head_idx}_strip{s}")
+
+            bias_name = node.attrs.get("bias")
+            if bias_name:
+                if bias_name not in self.prescaled_biases:
+                    raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
+                self._emit_bias_add(bias_name, N_pad, 1)
+
+            if fuse_residual1:
+                mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+                self._record_trace_event(
+                    node.name,
+                    BUF_ACCUM,
+                    0,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int32",
+                    concat_scale * mean_w_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+                dequant_sreg = self._alloc_sreg_pair()
+                self._emit(SetScaleInsn(sreg=dequant_sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
+                self._emit(SetScaleInsn(sreg=dequant_sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+                self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
+                skip_strip_off = skip_alloc.offset_units + (s * strip_rows * N_pad) // UNIT
+                self._emit(DequantAddInsn(
+                    src1_buf=BUF_ACCUM, src1_off=0,
+                    src2_buf=BUF_ABUF, src2_off=skip_strip_off,
+                    dst_buf=BUF_ABUF, dst_off=skip_strip_off,
+                    sreg=dequant_sreg,
+                ))
+                self._record_trace_event(
+                    residual1_name,
+                    BUF_ABUF,
+                    skip_strip_off,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int8",
+                    output_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+            else:
+                strip_out_off = self.mem.abuf.alloc(
+                    f"{node.name}_strip{s}", strip_rows * N_pad
+                ).offset_units
+                target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+                if pc_scale_alloc is not None:
+                    self._emit(RequantPcInsn(
+                        src1_buf=BUF_ACCUM, src1_off=0,
+                        src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
+                        dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                    ))
+                else:
+                    mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+                    requant_scale_f = concat_scale * mean_w_scale / max(target_act_scale, 1e-12)
+                    sreg = self._alloc_sreg()
+                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
+                    self._emit(RequantInsn(
+                        src1_buf=BUF_ACCUM, src1_off=0,
+                        dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                        sreg=sreg,
+                    ))
+                self._record_trace_event(
+                    node.name,
+                    BUF_ABUF,
+                    strip_out_off,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int8",
+                    target_act_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+                strip_dram_off = dram_temp_off + s * strip_rows * N_pad
+                self._emit_dma_store(BUF_ABUF, strip_out_off, strip_rows * N_pad, 2, strip_dram_off)
+                self._emit(SyncInsn(resource_mask=0b001))
+                self.mem.abuf.free(f"{node.name}_strip{s}")
+
+        for head_name in head_names:
+            self.mem.wbuf.free(head_name)
+        self.mem.wbuf.free(f"_w_{weight_name}")
+        if pc_scale_alloc is not None:
+            self.mem.wbuf.free(f"_rqpc_{weight_name}")
+
+        if fuse_residual1:
+            skip_name = self._residual1_skip_name(node.name)
+            self.precomputed_nodes.add(residual1_name)
+            alloc = self.mem.abuf.allocations.pop(skip_name, None)
+            if alloc is not None:
+                alloc.name = residual1_name
+                self.mem.abuf.allocations[residual1_name] = alloc
+            return
+
+        self.dram_temp_outputs[node.name] = dram_temp_off
+        out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
+        out_alloc.size_bytes = M_pad * N_pad
 
     def _emit_matmul_strip_mined(self, node: IRNode, M: int, N: int, K: int,
                                   w_q: np.ndarray, w_scales: np.ndarray):
@@ -303,6 +697,8 @@ class CodeGenerator:
         K = w_q.shape[0] if w_q.ndim == 2 else w_q.shape[0]
         K_pad = pad_dim(K)
         strip_rows = TILE
+        fuse_residual1 = self._dequant_add_residual1_enabled_for_output(node.name)
+        residual1_name = node.name.replace("_out_proj", "_residual1") if fuse_residual1 else None
 
         # Load weights to WBUF via allocator so live WBUF data is not clobbered.
         dram_off = self._dram_offset_required(weight_name, f"loading weight '{weight_name}'")
@@ -310,6 +706,21 @@ class CodeGenerator:
         w_alloc = self.mem.wbuf.alloc(f"_w_{weight_name}", weight_bytes)
         self._emit_dma_load(BUF_WBUF, w_alloc.offset_units, weight_bytes, 0, dram_off)
         self._emit(SyncInsn(resource_mask=0b001))
+        pc_scale_alloc = None
+        if weight_name in self.requant_pc_weight_names:
+            pc_scale_name = f"{weight_name}__requant_pc"
+            pc_scale_dram = self._dram_offset_required(
+                pc_scale_name,
+                f"loading REQUANT_PC scales for '{weight_name}'",
+            )
+            pc_scale_bytes = N_pad * 2
+            pc_scale_alloc = self.mem.wbuf.alloc(f"_rqpc_{weight_name}", pc_scale_bytes)
+            self._emit_dma_load(BUF_WBUF, pc_scale_alloc.offset_units, pc_scale_bytes, 0, pc_scale_dram)
+            self._emit(SyncInsn(resource_mask=0b001))
+        if fuse_residual1 and pc_scale_alloc is not None:
+            raise ValueError(
+                f"DEQUANT_ADD residual1 path currently requires scalar out_proj scale, got REQUANT_PC weight '{weight_name}'"
+            )
 
         # Allocate DRAM temp for output strips
         dram_temp_off = self.dram_temp_start + self.mem.alloc_dram_temp(
@@ -326,7 +737,22 @@ class CodeGenerator:
             act_alloc = self.mem.abuf.get(input_name) or \
                         self.mem.abuf.alloc(input_name, M_pad * K_pad)
 
+        skip_alloc = None
+        if fuse_residual1:
+            skip_name = self._residual1_skip_name(node.name)
+            skip_alloc = self.mem.abuf.get(skip_name)
+            if skip_alloc is None:
+                skip_alloc = self.mem.abuf.alloc(skip_name, M_pad * N_pad)
+            input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+            mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+            output_scale = self.calibration_scales.get(residual1_name, 6.0 / 127.0)
+            skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
+            accum_rescale = input_act_scale * mean_w_scale / max(output_scale, 1e-12)
+            skip_rescale = skip_scale / max(output_scale, 1e-12)
+
         for s in range(num_strips):
+            row_start = s * strip_rows
+            logical_rows = max(0, min(strip_rows, M - row_start))
             # If input is in DRAM, load this strip to a temp ABUF region
             if input_from_dram:
                 strip_input_alloc = self.mem.abuf.alloc(
@@ -364,26 +790,17 @@ class CodeGenerator:
                     raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
                 self._emit_bias_add(bias_name, N_pad, 1)
 
-            # Requantize strip: scale = input_act_scale × mean(weight_scale) / target_act_scale
             input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
-            target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
-            mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
-            requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
-            sreg = self._alloc_sreg()
-            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
-
-            strip_out_off = self.mem.abuf.alloc(f"{node.name}_strip{s}", strip_rows * N_pad).offset_units
-            self._emit(RequantInsn(
-                src1_buf=BUF_ACCUM, src1_off=0,
-                dst_buf=BUF_ABUF, dst_off=strip_out_off,
-                sreg=sreg,
-            ))
-
-            # Inline GELU if requested
             gelu_name = node.attrs.get("inline_gelu")
-            if gelu_name:
+            strip_out_off = None if fuse_residual1 else self.mem.abuf.alloc(
+                f"{node.name}_strip{s}", strip_rows * N_pad).offset_units
+
+            if self._gelu_from_accum_enabled_for(node, gelu_name):
                 gelu_sreg = self._alloc_sreg_pair()
-                gelu_in_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+                # FC1 uses per-tensor quantization, so mean_w_scale is the exact
+                # accumulator-domain real-value scale for all output channels.
+                mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+                gelu_in_scale = input_act_scale * mean_w_scale
                 gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
                 self._emit(SetScaleInsn(sreg=gelu_sreg, src_mode=0,
                                         imm16=_fp16_to_uint16(gelu_in_scale)))
@@ -391,20 +808,149 @@ class CodeGenerator:
                                         imm16=_fp16_to_uint16(gelu_out_scale)))
                 self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
                 self._emit(GeluInsn(
-                    src1_buf=BUF_ABUF, src1_off=strip_out_off,
+                    src1_buf=BUF_ACCUM, src1_off=0,
                     dst_buf=BUF_ABUF, dst_off=strip_out_off,
                     sreg=gelu_sreg,
                 ))
                 self._emit(SyncInsn(resource_mask=0b100))
+                self._record_trace_event(
+                    gelu_name,
+                    BUF_ABUF,
+                    strip_out_off,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int8",
+                    gelu_out_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+            elif fuse_residual1:
+                self._record_trace_event(
+                    node.name,
+                    BUF_ACCUM,
+                    0,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int32",
+                    input_act_scale * mean_w_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+                dequant_sreg = self._alloc_sreg_pair()
+                self._emit(SetScaleInsn(sreg=dequant_sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
+                self._emit(SetScaleInsn(sreg=dequant_sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+                self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
+                skip_strip_off = skip_alloc.offset_units + (s * strip_rows * N_pad) // UNIT
+                self._emit(DequantAddInsn(
+                    src1_buf=BUF_ACCUM, src1_off=0,
+                    src2_buf=BUF_ABUF, src2_off=skip_strip_off,
+                    dst_buf=BUF_ABUF, dst_off=skip_strip_off,
+                    sreg=dequant_sreg,
+                ))
+                self._record_trace_event(
+                    residual1_name,
+                    BUF_ABUF,
+                    skip_strip_off,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int8",
+                    output_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+            else:
+                target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+                if pc_scale_alloc is not None:
+                    self._emit(RequantPcInsn(
+                        src1_buf=BUF_ACCUM, src1_off=0,
+                        src2_buf=BUF_WBUF, src2_off=pc_scale_alloc.offset_units,
+                        dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                    ))
+                else:
+                    # Requantize strip: scale = input_act_scale × mean(weight_scale) / target_act_scale
+                    mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+                    requant_scale_f = input_act_scale * mean_w_scale / max(target_act_scale, 1e-12)
+                    sreg = self._alloc_sreg()
+                    self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(requant_scale_f)))
 
-            # Spill strip (post-GELU if inline) to DRAM
-            strip_dram_off = dram_temp_off + s * strip_rows * N_pad
-            self._emit_dma_store(BUF_ABUF, strip_out_off, strip_rows * N_pad, 2, strip_dram_off)
-            self._emit(SyncInsn(resource_mask=0b001))
-            self.mem.abuf.free(f"{node.name}_strip{s}")
+                    self._emit(RequantInsn(
+                        src1_buf=BUF_ACCUM, src1_off=0,
+                        dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                        sreg=sreg,
+                    ))
+                self._record_trace_event(
+                    node.name,
+                    BUF_ABUF,
+                    strip_out_off,
+                    strip_rows,
+                    N_pad,
+                    logical_rows,
+                    N,
+                    "int8",
+                    target_act_scale,
+                    row_start=row_start,
+                    full_rows=M,
+                    full_cols=N,
+                )
+
+                if gelu_name:
+                    gelu_sreg = self._alloc_sreg_pair()
+                    gelu_in_scale = self.calibration_scales.get(node.name, 1.0 / 127.0)
+                    gelu_out_scale = self.calibration_scales.get(gelu_name, 1.0 / 127.0)
+                    self._emit(SetScaleInsn(sreg=gelu_sreg, src_mode=0,
+                                            imm16=_fp16_to_uint16(gelu_in_scale)))
+                    self._emit(SetScaleInsn(sreg=gelu_sreg + 1, src_mode=0,
+                                            imm16=_fp16_to_uint16(gelu_out_scale)))
+                    self._emit(ConfigTileInsn(M=0, N=N_pad // TILE - 1, K=0))
+                    self._emit(GeluInsn(
+                        src1_buf=BUF_ABUF, src1_off=strip_out_off,
+                        dst_buf=BUF_ABUF, dst_off=strip_out_off,
+                        sreg=gelu_sreg,
+                    ))
+                    self._emit(SyncInsn(resource_mask=0b100))
+                    self._record_trace_event(
+                        gelu_name,
+                        BUF_ABUF,
+                        strip_out_off,
+                        strip_rows,
+                        N_pad,
+                        logical_rows,
+                        N,
+                        "int8",
+                        gelu_out_scale,
+                        row_start=row_start,
+                        full_rows=M,
+                        full_cols=N,
+                    )
+
+            if not fuse_residual1:
+                # Spill strip (post-GELU if inline) to DRAM
+                strip_dram_off = dram_temp_off + s * strip_rows * N_pad
+                self._emit_dma_store(BUF_ABUF, strip_out_off, strip_rows * N_pad, 2, strip_dram_off)
+                self._emit(SyncInsn(resource_mask=0b001))
+                self.mem.abuf.free(f"{node.name}_strip{s}")
 
         # Free weight allocation (no longer needed after all strips are processed)
         self.mem.wbuf.free(f"_w_{weight_name}")
+        if pc_scale_alloc is not None:
+            self.mem.wbuf.free(f"_rqpc_{weight_name}")
+
+        if fuse_residual1:
+            self.precomputed_nodes.add(residual1_name)
+            alloc = self.mem.abuf.allocations.pop(skip_name, None)
+            if alloc is not None:
+                alloc.name = residual1_name
+                self.mem.abuf.allocations[residual1_name] = alloc
+            return
 
         # Register output as DRAM-temp resident
         self.dram_temp_outputs[node.name] = dram_temp_off
@@ -480,8 +1026,10 @@ class CodeGenerator:
         if q_alloc is None:
             q_alloc = self.mem.abuf.alloc(node.inputs[0], M_pad * head_dim)
 
-        # Output: full [208,208] INT8 softmax probabilities in WBUF
-        qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * M_pad)
+        fused_softmax_attnv = self._block_selected(node.name, self.fused_softmax_attnv_blocks)
+        softmax_name = node.name.replace("_qkt", "_softmax")
+        attn_v_name = node.name.replace("_qkt", "_attn_v")
+        value_name = node.name.replace("_qkt", "_value")
 
         n_tiles = M_pad // TILE
         k_tiles = K_pad // TILE
@@ -492,10 +1040,28 @@ class CodeGenerator:
         qkt_in_scale = self.calibration_scales.get(
             node.name, act_scale_q * act_scale_k * node.attrs.get("scale", 0.125)
         )
-        softmax_name = node.name.replace("_qkt", "_softmax")
         softmax_out_scale = self.calibration_scales.get(softmax_name, 1.0 / 127.0)
+        if fused_softmax_attnv:
+            v_alloc = self.mem.abuf.get(value_name)
+            if v_alloc is None:
+                v_alloc = self.mem.abuf.alloc(value_name, M_pad * K_pad)
+            real_seq = node.output_shape[0]
+            if M_pad > real_seq:
+                pad_rows = M_pad - real_seq
+                v_pad_units = v_alloc.offset_units + (real_seq * K_pad) // UNIT
+                zero_pad_dram = self._dram_offset_required("__zero_pad__", "loading V padding mask")
+                self._emit_dma_load(BUF_ABUF, v_pad_units, pad_rows * K_pad, 3, zero_pad_dram)
+                self._emit(SyncInsn(resource_mask=0b001))
+            target_act_scale = self.calibration_scales.get(attn_v_name, 6.0 / 127.0)
+            attn_v_alloc = self.mem.wbuf.alloc(attn_v_name, M_pad * K_pad)
+            v_scale = self.calibration_scales.get(value_name, 6.0 / 127.0)
+        else:
+            # Output: full [208,208] INT8 softmax probabilities in WBUF
+            qkt_wbuf = self.mem.wbuf.alloc(node.name, M_pad * M_pad)
 
         for s in range(num_strips):
+            row_start = s * TILE
+            logical_rows = max(0, min(TILE, seq_len - row_start))
             # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
             self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
 
@@ -508,21 +1074,97 @@ class CodeGenerator:
                 flags=0,
             ))
             self._emit(SyncInsn(resource_mask=0b010))
+            self._record_trace_event(
+                node.name,
+                BUF_ACCUM,
+                0,
+                TILE,
+                M_pad,
+                logical_rows,
+                seq_len,
+                "int32",
+                qkt_in_scale,
+                row_start=row_start,
+                full_rows=seq_len,
+                full_cols=seq_len,
+            )
 
-            # C1: SOFTMAX directly from ACCUM to avoid QKT INT8 bottleneck.
-            # in_scale dequants INT32 accumulators; out_scale quantizes probabilities.
-            sreg = self._alloc_sreg_pair()
-            self._emit(SetScaleInsn(sreg=sreg, src_mode=0,
-                                    imm16=_fp16_to_uint16(qkt_in_scale)))
-            self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
-                                    imm16=_fp16_to_uint16(softmax_out_scale)))
-            strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
-            self._emit(SoftmaxInsn(
-                src1_buf=BUF_ACCUM, src1_off=0,
-                dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
-                sreg=sreg,
-            ))
-            self._emit(SyncInsn(resource_mask=0b100))
+            if fused_softmax_attnv:
+                self._emit(ConfigTileInsn(M=0, N=k_tiles - 1, K=n_tiles - 1))
+                sreg = self._alloc_sreg_quad()
+                self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(qkt_in_scale)))
+                self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(v_scale)))
+                self._emit(SetScaleInsn(sreg=sreg + 2, src_mode=0, imm16=_fp16_to_uint16(target_act_scale)))
+                self._emit(SetScaleInsn(sreg=sreg + 3, src_mode=0, imm16=_fp16_to_uint16(softmax_out_scale)))
+                strip_out_off = attn_v_alloc.offset_units + (s * TILE * K_pad) // UNIT
+                self._emit(SoftmaxAttnVInsn(
+                    src1_buf=BUF_ACCUM, src1_off=0,
+                    src2_buf=BUF_ABUF, src2_off=v_alloc.offset_units,
+                    dst_buf=BUF_WBUF, dst_off=strip_out_off,
+                    sreg=sreg,
+                ))
+                fused_pc = len(self.instructions) - 1
+                self._emit(SyncInsn(resource_mask=0b100))
+                self._record_trace_event(
+                    softmax_name,
+                    BUF_WBUF,
+                    0,
+                    TILE,
+                    M_pad,
+                    logical_rows,
+                    seq_len,
+                    "int8",
+                    softmax_out_scale,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=seq_len,
+                    pc=fused_pc,
+                )
+                self.trace_manifest.setdefault(fused_pc, [])[-1]["source"] = "virtual"
+                self._record_trace_event(
+                    attn_v_name,
+                    BUF_WBUF,
+                    strip_out_off,
+                    TILE,
+                    K_pad,
+                    logical_rows,
+                    head_dim,
+                    "int8",
+                    target_act_scale,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=head_dim,
+                    pc=fused_pc,
+                )
+            else:
+                # C1: SOFTMAX directly from ACCUM to avoid QKT INT8 bottleneck.
+                # in_scale dequants INT32 accumulators; out_scale quantizes probabilities.
+                sreg = self._alloc_sreg_pair()
+                self._emit(SetScaleInsn(sreg=sreg, src_mode=0,
+                                        imm16=_fp16_to_uint16(qkt_in_scale)))
+                self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0,
+                                        imm16=_fp16_to_uint16(softmax_out_scale)))
+                strip_wbuf_off = qkt_wbuf.offset_units + (s * TILE * M_pad) // UNIT
+                self._emit(SoftmaxInsn(
+                    src1_buf=BUF_ACCUM, src1_off=0,
+                    dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
+                    sreg=sreg,
+                ))
+                self._emit(SyncInsn(resource_mask=0b100))
+                self._record_trace_event(
+                    softmax_name,
+                    BUF_WBUF,
+                    strip_wbuf_off,
+                    TILE,
+                    M_pad,
+                    logical_rows,
+                    seq_len,
+                    "int8",
+                    softmax_out_scale,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=seq_len,
+                )
 
         self.mem.wbuf.free(f"kt_head{head_idx}")
         # Metadata now reflects softmax-quantized output in node.name allocation.
@@ -535,6 +1177,9 @@ class CodeGenerator:
         V_h is in ABUF. MATMUL src1=WBUF[attn], src2=ABUF[V].
         After matmul, free both attn (WBUF) and V (ABUF via last-use).
         """
+        if self._block_selected(node.name, self.fused_softmax_attnv_blocks):
+            return
+
         head_idx = node.attrs["head_idx"]
         seq_len = node.output_shape[0]
         head_dim = node.output_shape[1]
@@ -599,6 +1244,17 @@ class CodeGenerator:
             dst_buf=BUF_WBUF, dst_off=out_alloc.offset_units,
             sreg=sreg,
         ))
+        self._record_trace_event(
+            node.name,
+            BUF_WBUF,
+            out_alloc.offset_units,
+            M_pad,
+            N_pad,
+            seq_len,
+            head_dim,
+            "int8",
+            target_act_scale,
+        )
 
     def _emit_concat_heads(self, node: IRNode):
         """BUF_COPY per-head outputs from WBUF into a contiguous ABUF region.
@@ -616,6 +1272,9 @@ class CodeGenerator:
             src: WBUF[head_h + t * row_units]
             dst: ABUF[out  + t * out_row_units + h * row_units]
         """
+        if self._fused_softmax_attnv_accum_out_proj_enabled_for(node.name):
+            return
+
         head_dim = 64
         seq_len = node.output_shape[0]
         M_pad = pad_dim(seq_len)
@@ -642,6 +1301,17 @@ class CodeGenerator:
                 ))
                 self._emit(SyncInsn(resource_mask=0b001))
             self.mem.wbuf.free(inp_name)
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            M_pad,
+            total_out_dim,
+            seq_len,
+            node.output_shape[1],
+            "int8",
+            self.calibration_scales.get(node.name, 6.0 / 127.0),
+        )
 
     def _emit_scale_mul(self, node: IRNode):
         """C1: scale_mul is metadata-only; scaling is folded into QKT softmax input scale."""
@@ -705,6 +1375,17 @@ class CodeGenerator:
             sreg=sreg,
         ))
         self._emit(SyncInsn(resource_mask=0b100))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            out_scale,
+        )
 
     def _emit_layernorm(self, node: IRNode):
         """Emit LAYERNORM SFU instruction."""
@@ -752,6 +1433,17 @@ class CodeGenerator:
             sreg=sreg,
         ))
         self._emit(SyncInsn(resource_mask=0b100))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            out_scale,
+        )
 
         if gb_alloc:
             self.mem.wbuf.free(f"gb_{node.name}")
@@ -781,6 +1473,49 @@ class CodeGenerator:
         m_tiles = M_pad // TILE
         n_tiles = N_pad // TILE
 
+        if node.name in self.precomputed_nodes:
+            return
+
+        if self._dequant_add_residual1_enabled_for_residual(node.name) and node.inputs[0] in self.pending_accum_outputs:
+            skip_name = node.inputs[1]
+            if skip_name in self.dram_temp_outputs:
+                skip_alloc = self._load_dram_to_abuf(skip_name, M_pad, N_pad)
+            else:
+                skip_alloc = self.mem.abuf.get(skip_name) or \
+                            self.mem.abuf.alloc(skip_name, M_pad * N_pad)
+
+            pending = self.pending_accum_outputs.pop(node.inputs[0])
+            output_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+            skip_scale = self.calibration_scales.get(skip_name, 6.0 / 127.0)
+            accum_rescale = pending["accum_real_scale"] / max(output_scale, 1e-12)
+            skip_rescale = skip_scale / max(output_scale, 1e-12)
+            sreg = self._alloc_sreg_pair()
+            self._emit(SetScaleInsn(sreg=sreg, src_mode=0, imm16=_fp16_to_uint16(accum_rescale)))
+            self._emit(SetScaleInsn(sreg=sreg + 1, src_mode=0, imm16=_fp16_to_uint16(skip_rescale)))
+            self._emit(ConfigTileInsn(M=m_tiles - 1, N=n_tiles - 1, K=0))
+            self._emit(DequantAddInsn(
+                src1_buf=BUF_ACCUM, src1_off=0,
+                src2_buf=BUF_ABUF, src2_off=skip_alloc.offset_units,
+                dst_buf=BUF_ABUF, dst_off=skip_alloc.offset_units,
+                sreg=sreg,
+            ))
+            self._record_trace_event(
+                node.name,
+                BUF_ABUF,
+                skip_alloc.offset_units,
+                M_pad,
+                N_pad,
+                node.output_shape[0],
+                node.output_shape[1],
+                "int8",
+                output_scale,
+            )
+            alloc = self.mem.abuf.allocations.pop(skip_name, None)
+            if alloc is not None:
+                alloc.name = node.name
+                self.mem.abuf.allocations[node.name] = alloc
+            return
+
         # Resolve src1 — load from DRAM if needed
         if node.inputs[0] in self.dram_temp_outputs:
             src1_alloc = self._load_dram_to_abuf(node.inputs[0], M_pad, N_pad)
@@ -808,6 +1543,17 @@ class CodeGenerator:
             src2_buf=BUF_ABUF, src2_off=src2_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=src2_alloc.offset_units,
         ))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            src2_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            self.calibration_scales.get(node.name, 6.0 / 127.0),
+        )
 
         # Free temporary ABUF slot used for the DRAM-loaded src1
         if free_src1:
@@ -865,6 +1611,17 @@ class CodeGenerator:
             src2_buf=BUF_WBUF, src2_off=pos_alloc.offset_units,
             dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
         ))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            self.calibration_scales.get(node.name, 14.0 / 127.0),
+        )
 
         self.mem.wbuf.free("pos_embed")
 
@@ -880,6 +1637,17 @@ class CodeGenerator:
             dst_buf=BUF_ABUF, dst_off=out_alloc.offset_units,
             length=N // UNIT,
         ))
+        self._record_trace_event(
+            node.name,
+            BUF_ABUF,
+            out_alloc.offset_units,
+            1,
+            N,
+            1,
+            N,
+            "int8",
+            self.calibration_scales.get(node.name, 6.0 / 127.0),
+        )
 
     def _compact_abuf(self):
         """Defragment ABUF by moving live allocations to lower addresses.

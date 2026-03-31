@@ -3,7 +3,8 @@ import re
 from typing import Optional, Tuple, List
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
-    MatmulInsn, RequantInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    MatmulInsn, RequantInsn, RequantPcInsn, ScaleMulInsn, VaddInsn, SoftmaxInsn, LayernormInsn, GeluInsn,
+    SoftmaxAttnVInsn, DequantAddInsn,
     LoadInsn, StoreInsn, BufCopyInsn, SetAddrLoInsn, SetAddrHiInsn,
     ConfigTileInsn, SetScaleInsn, SyncInsn, NopInsn, HaltInsn, Instruction,
 )
@@ -27,11 +28,14 @@ MNEMONIC_MAP = {
     "BUF_COPY": Opcode.BUF_COPY,
     "MATMUL": Opcode.MATMUL,
     "REQUANT": Opcode.REQUANT,
+    "REQUANT_PC": Opcode.REQUANT_PC,
     "SCALE_MUL": Opcode.SCALE_MUL,
     "VADD": Opcode.VADD,
     "SOFTMAX": Opcode.SOFTMAX,
     "LAYERNORM": Opcode.LAYERNORM,
     "GELU": Opcode.GELU,
+    "SOFTMAX_ATTNV": Opcode.SOFTMAX_ATTNV,
+    "DEQUANT_ADD": Opcode.DEQUANT_ADD,
 }
 
 
@@ -160,8 +164,9 @@ def parse_line(line: str) -> Tuple[Optional[str], Optional[Instruction]]:
         params = _parse_kv_or_positional_bufcopy(args_str)
         return label, BufCopyInsn(**params)
 
-    elif opcode in (Opcode.MATMUL, Opcode.REQUANT, Opcode.SCALE_MUL, Opcode.VADD,
-                    Opcode.SOFTMAX, Opcode.LAYERNORM, Opcode.GELU):
+    elif opcode in (Opcode.MATMUL, Opcode.REQUANT, Opcode.REQUANT_PC, Opcode.SCALE_MUL, Opcode.VADD,
+                    Opcode.SOFTMAX, Opcode.LAYERNORM, Opcode.GELU, Opcode.SOFTMAX_ATTNV,
+                    Opcode.DEQUANT_ADD):
         return label, _parse_r_type(opcode, args_str)
 
     raise SyntaxError(f"Unhandled mnemonic: {mnemonic}")
@@ -200,9 +205,11 @@ def _parse_r_type(opcode: Opcode, args_str: str) -> Instruction:
     """
     cls_map = {
         Opcode.MATMUL: MatmulInsn, Opcode.REQUANT: RequantInsn,
+        Opcode.REQUANT_PC: RequantPcInsn,
         Opcode.SCALE_MUL: ScaleMulInsn, Opcode.VADD: VaddInsn,
         Opcode.SOFTMAX: SoftmaxInsn, Opcode.LAYERNORM: LayernormInsn,
-        Opcode.GELU: GeluInsn,
+        Opcode.GELU: GeluInsn, Opcode.SOFTMAX_ATTNV: SoftmaxAttnVInsn,
+        Opcode.DEQUANT_ADD: DequantAddInsn,
     }
 
     if '=' in args_str and 'src1=' in args_str:
