@@ -435,6 +435,196 @@ class TestSFUOps:
         expected = np.full((16, 16), 8, dtype=np.int8)
         np.testing.assert_array_equal(got, expected)
 
+    def test_runtime_twin_softmax_manifest_changes_simulator_output(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3000\n"
+            "SET_SCALE S1, imm=0x1c00\n"
+            "SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+        prog.compiler_manifest = {
+            "runtime_twin_uniform": {
+                "mode": "paper_exact",
+                "softmax": {
+                    "3": {
+                        "mode": "paper_exact",
+                        "range1_max": 0.05,
+                        "block": 11,
+                        "head": 1,
+                        "node_name": "block11_head1_softmax",
+                    }
+                },
+                "gelu": {},
+            }
+        }
+        baseline = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3000\n"
+            "SET_SCALE S1, imm=0x1c00\n"
+            "SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+
+        logits = np.zeros((16, 16), dtype=np.int32)
+        logits[:, 0] = 8
+        logits[:, 1] = 2
+        logits[:, 2] = -2
+
+        twin_sim = Simulator()
+        twin_sim.load_program(prog)
+        twin_sim.state.accum[:256] = logits.reshape(-1)
+        twin_sim.run()
+
+        base_sim = Simulator()
+        base_sim.load_program(baseline)
+        base_sim.state.accum[:256] = logits.reshape(-1)
+        base_sim.run()
+
+        twin_out = np.frombuffer(bytes(twin_sim.state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        base_out = np.frombuffer(bytes(base_sim.state.abuf[:256]), dtype=np.int8).reshape(16, 16)
+        assert not np.array_equal(twin_out, base_out)
+
+    def test_runtime_twin_gelu_manifest_changes_simulator_output(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3400\n"
+            "SET_SCALE S1, imm=0x2c00\n"
+            "GELU src1=ABUF[0], src2=ABUF[0], dst=ABUF[16], sreg=0, flags=0\n"
+            "HALT"
+        )
+        prog.compiler_manifest = {
+            "runtime_twin_uniform": {
+                "mode": "paper_exact",
+                "softmax": {},
+                "gelu": {
+                    "3": {
+                        "mode": "paper_exact",
+                        "positive_range_max": 0.4,
+                        "negative_extent": 1.0,
+                        "block": 9,
+                        "node_name": "block9_gelu",
+                    }
+                },
+            }
+        }
+        baseline = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3400\n"
+            "SET_SCALE S1, imm=0x2c00\n"
+            "GELU src1=ABUF[0], src2=ABUF[0], dst=ABUF[16], sreg=0, flags=0\n"
+            "HALT"
+        )
+
+        inp = (np.array(
+            [-8, -4, -1, 0, 2, 6, 9, 12] * 32,
+            dtype=np.int8,
+        ))[:256]
+
+        twin_sim = Simulator()
+        twin_sim.load_program(prog)
+        twin_sim.state.abuf[:256] = inp.tobytes()
+        twin_sim.run()
+
+        base_sim = Simulator()
+        base_sim.load_program(baseline)
+        base_sim.state.abuf[:256] = inp.tobytes()
+        base_sim.run()
+
+        twin_out = np.frombuffer(bytes(twin_sim.state.abuf[256:512]), dtype=np.int8).reshape(16, 16)
+        base_out = np.frombuffer(bytes(base_sim.state.abuf[256:512]), dtype=np.int8).reshape(16, 16)
+        assert not np.array_equal(twin_out, base_out)
+
+    def test_runtime_twin_softmax_attnv_manifest_changes_fused_output(self):
+        from taccel.golden_model.sfu import execute_softmax_attnv
+        from taccel.isa.instructions import SoftmaxAttnVInsn
+
+        twin_state = MachineState()
+        twin_state.tile_config = (0, 0, 0)
+        twin_state.scale_regs[4] = np.float16(0.125)
+        twin_state.scale_regs[5] = np.float16(0.0625)
+        twin_state.scale_regs[6] = np.float16(0.0625)
+        twin_state.scale_regs[7] = np.float16(1.0 / 256.0)
+        twin_state.current_pc = 5
+        twin_state.runtime_twin_specs = {
+            5: {
+                "kind": "softmax",
+                "mode": "paper_exact",
+                "range1_max": 0.05,
+                "block": 11,
+                "head": 2,
+                "node_name": "block11_head2_softmax",
+            }
+        }
+        base_state = MachineState()
+        base_state.tile_config = (0, 0, 0)
+        base_state.scale_regs[4] = np.float16(0.125)
+        base_state.scale_regs[5] = np.float16(0.0625)
+        base_state.scale_regs[6] = np.float16(0.0625)
+        base_state.scale_regs[7] = np.float16(1.0 / 256.0)
+        base_state.current_pc = 5
+        base_state.runtime_twin_specs = {}
+
+        insn = SoftmaxAttnVInsn(
+            src1_buf=BUF_ACCUM, src1_off=0,
+            src2_buf=BUF_ABUF, src2_off=0,
+            dst_buf=BUF_WBUF, dst_off=0,
+            sreg=4,
+            flags=0,
+        )
+        logits = np.zeros((16, 16), dtype=np.int32)
+        logits[:, 0] = 8
+        logits[:, 1] = 4
+        v = np.zeros((16, 16), dtype=np.int8)
+        v[:, 0] = 4
+        v[:, 1] = -4
+        v[:, 2] = 2
+        twin_state.accum[:256] = logits.reshape(-1)
+        base_state.accum[:256] = logits.reshape(-1)
+        twin_state.abuf[:256] = v.tobytes()
+        base_state.abuf[:256] = v.tobytes()
+
+        twin_payload = execute_softmax_attnv(twin_state, insn)
+        base_payload = execute_softmax_attnv(base_state, insn)
+
+        twin_softmax = twin_payload["softmax"]["raw"]
+        base_softmax = base_payload["softmax"]["raw"]
+        assert not np.array_equal(twin_softmax, base_softmax)
+
+    def test_runtime_twin_empty_manifest_keeps_outputs_unchanged(self):
+        prog = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3c00\n"
+            "SET_SCALE S1, imm=0x2c00\n"
+            "SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+        prog.compiler_manifest = {"runtime_twin_uniform": {"mode": "off", "softmax": {}, "gelu": {}}}
+        baseline = Assembler().assemble(
+            "CONFIG_TILE M=1, N=1, K=1\n"
+            "SET_SCALE S0, imm=0x3c00\n"
+            "SET_SCALE S1, imm=0x2c00\n"
+            "SOFTMAX src1=ACCUM[0], src2=ABUF[0], dst=ABUF[0], sreg=0, flags=0\n"
+            "HALT"
+        )
+
+        logits = np.arange(256, dtype=np.int32).reshape(16, 16) - 32
+
+        twin_sim = Simulator()
+        twin_sim.load_program(prog)
+        twin_sim.state.accum[:256] = logits.reshape(-1)
+        twin_sim.run()
+
+        base_sim = Simulator()
+        base_sim.load_program(baseline)
+        base_sim.state.accum[:256] = logits.reshape(-1)
+        base_sim.run()
+
+        np.testing.assert_array_equal(
+            np.frombuffer(bytes(twin_sim.state.abuf[:256]), dtype=np.int8),
+            np.frombuffer(bytes(base_sim.state.abuf[:256]), dtype=np.int8),
+        )
+
 
 class TestErrorHandling:
     def test_matmul_without_config_tile_raises(self):

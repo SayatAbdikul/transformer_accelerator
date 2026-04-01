@@ -61,6 +61,7 @@ class Simulator:
     def __init__(self, state: MachineState = None):
         self.state = state or MachineState()
         self.trace_manifest: Dict[int, list] = {}
+        self.runtime_twin_specs: Dict[int, Dict[str, object]] = {}
         self.trace_enabled = False
         self.trace_node_names: Optional[Set[str]] = None
         self.trace_tensors: Dict[str, np.ndarray] = {}
@@ -74,6 +75,15 @@ class Simulator:
         self.state.pc = program.entry_point
         self.state.halted = False
         self.trace_manifest = getattr(program, "trace_manifest", {}) or {}
+        self.runtime_twin_specs = {}
+        compiler_manifest = getattr(program, "compiler_manifest", {}) or {}
+        runtime_twin = compiler_manifest.get("runtime_twin_uniform", {}) or {}
+        for kind in ("softmax", "gelu"):
+            for pc_key, spec in (runtime_twin.get(kind, {}) or {}).items():
+                spec_dict = dict(spec or {})
+                spec_dict["kind"] = kind
+                self.runtime_twin_specs[int(pc_key)] = spec_dict
+        self.state.runtime_twin_specs = dict(self.runtime_twin_specs)
         self.trace_tensors = {}
         self.trace_saturation = {}
         self.trace_meta = {}
@@ -139,6 +149,7 @@ class Simulator:
             return
 
         pc = self.state.pc
+        self.state.current_pc = pc
         self._virtual_trace_payloads = {}
         if pc >= self.program.insn_count:
             raise SimulatorError(f"PC={pc} past end of program ({self.program.insn_count} insns)")

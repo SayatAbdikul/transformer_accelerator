@@ -171,6 +171,27 @@ class TestCalibrationScaleMapping:
             str(v) for v in CURRENT_BEST_SMOOTHQUANT_BLOCKS
         )
 
+    def test_diagnostic_preset_imagenet_class0_ptq4vit_base_matches_current_step4_stack(self):
+        preset = DIAGNOSTIC_PRESETS["imagenet_class0_ptq4vit_base"]
+
+        assert preset["benchmark"]["benchmark_dataset"] == "local_flat"
+        assert preset["compile_args"]["requant_pc_fc1"] is True
+        assert preset["compile_args"]["requant_pc_fc1_blocks"] == "8,9"
+        assert preset["compile_args"]["output_aware_clipping_fc1_blocks"] == "9"
+        assert preset["compile_args"]["adaround_fc1_blocks"] == "9"
+        assert preset["compile_args"]["act_percentile_nodes"] == "final_ln:99.8,block9_ln2:99.0"
+        assert preset["compile_args"]["twin_uniform_mode"] == "off"
+        assert preset["compile_args"]["requant_pc_fc2"] is False
+        assert preset["compile_args"]["output_aware_clipping_fc2_blocks"] == ""
+
+    def test_diagnostic_preset_imagenet_class0_current_best_ptq_alias_matches_base(self):
+        base = DIAGNOSTIC_PRESETS["imagenet_class0_ptq4vit_base"]
+        alias = DIAGNOSTIC_PRESETS["imagenet_class0_current_best_ptq"]
+
+        assert alias["benchmark"] == base["benchmark"]
+        assert alias["compile_args"] == base["compile_args"]
+        assert alias["trace"] == base["trace"]
+
     def test_apply_diagnostic_preset_sets_current_best_smoothquant_flags(self):
         args = SimpleNamespace(
             diagnostic_preset="current_best_sq_ln2_fc1_b0_8_10",
@@ -189,9 +210,12 @@ class TestCalibrationScaleMapping:
             bias_correction_layers="classifier",
             act_percentile_nodes="",
             output_aware_clipping_fc1_blocks="",
+            output_aware_clipping_fc2_blocks="",
+            output_aware_clipping_classifier=False,
             output_aware_clipping_candidates=25,
             output_aware_clipping_alpha_min=0.5,
             adaround_fc1_blocks="",
+            adaround_fc2_blocks="",
             attn_v_calibration="max",
             attn_v_percentile=90.0,
             attn_v_safety_margin=1.0,
@@ -202,6 +226,13 @@ class TestCalibrationScaleMapping:
             value_head_calibration="search",
             gelu_output_calibration="search",
             gelu_search_blocks="11",
+            gelu_search_objective="downstream_residual2",
+            hessian_calibration_images=0,
+            hessian_target_nodes="",
+            twin_uniform_softmax_blocks="",
+            twin_uniform_gelu_blocks="",
+            twin_uniform_mode="off",
+            twin_uniform_disable_hessian=False,
             smoothquant_targets="off",
             smoothquant_alpha=0.4,
             smoothquant_blocks="",
@@ -210,7 +241,12 @@ class TestCalibrationScaleMapping:
             requant_pc_qkv_heads="1",
             requant_pc_qkv_projections="key",
             requant_pc_qkv_exclude="11:key:1",
+            requant_pc_fc1=False,
+            requant_pc_fc1_blocks="",
+            requant_pc_fc2=False,
+            requant_pc_fc2_blocks="",
             requant_pc_out_proj=True,
+            requant_pc_out_proj_blocks="",
             fold_cls_pos_embed=True,
             trace_worst_k=0,
             trace_image_ids="139",
@@ -245,9 +281,12 @@ class TestCalibrationScaleMapping:
             bias_correction_layers="late_fc2",
             act_percentile_nodes="final_ln:99.9",
             output_aware_clipping_fc1_blocks="8,9",
+            output_aware_clipping_fc2_blocks="10",
+            output_aware_clipping_classifier=True,
             output_aware_clipping_candidates=31,
             output_aware_clipping_alpha_min=0.4,
             adaround_fc1_blocks="9",
+            adaround_fc2_blocks="10",
             attn_v_calibration="off",
             attn_v_percentile=99.0,
             attn_v_safety_margin=1.10,
@@ -261,6 +300,13 @@ class TestCalibrationScaleMapping:
             value_head_calibration="off",
             gelu_output_calibration="off",
             gelu_search_blocks="9,10,11",
+            gelu_search_objective="downstream_residual2",
+            hessian_calibration_images=0,
+            hessian_target_nodes="",
+            twin_uniform_softmax_blocks="",
+            twin_uniform_gelu_blocks="",
+            twin_uniform_mode="off",
+            twin_uniform_disable_hessian=False,
             smoothquant_targets="off",
             smoothquant_alpha=0.4,
             smoothquant_blocks="",
@@ -271,7 +317,10 @@ class TestCalibrationScaleMapping:
             requant_pc_qkv_exclude="",
             requant_pc_fc1=True,
             requant_pc_fc1_blocks="2,3,4",
+            requant_pc_fc2=True,
+            requant_pc_fc2_blocks="10",
             requant_pc_out_proj=False,
+            requant_pc_out_proj_blocks="",
             fold_cls_pos_embed=False,
             trace_worst_k=0,
             trace_image_ids="139",
@@ -304,14 +353,28 @@ class TestCalibrationScaleMapping:
                 "--bias-correction-layers", "classifier,late_fc2",
                 "--act-percentile-nodes", "final_ln:99.9,block9_ln2:99.5",
                 "--output-aware-clipping-fc1-blocks", "8,9",
+                "--output-aware-clipping-fc2-blocks", "9,10",
+                "--output-aware-clipping-classifier",
                 "--output-aware-clipping-candidates", "31",
                 "--output-aware-clipping-alpha-min", "0.4",
                 "--adaround-fc1-blocks", "9",
+                "--adaround-fc2-blocks", "10",
                 "--fused-softmax-attnv",
                 "--fused-softmax-attnv-accum-out-proj",
+                "--gelu-search-objective", "hessian_output",
+                "--hessian-calibration-images", "12",
+                "--hessian-target-nodes", "softmax,gelu",
+                "--twin-uniform-softmax-blocks", "11",
+                "--twin-uniform-gelu-blocks", "9,10",
+                "--twin-uniform-mode", "paper_exact",
+                "--twin-uniform-disable-hessian",
                 "--dequant-add-residual1-blocks=11",
                 "--requant-pc-fc1",
                 "--requant-pc-fc1-blocks=2,3,4",
+                "--requant-pc-fc2",
+                "--requant-pc-fc2-blocks=9,10",
+                "--requant-pc-out-proj",
+                "--requant-pc-out-proj-blocks=9,10,11",
                 "--trace-image-ids", "2685,2006",
             ]
         )
@@ -325,14 +388,28 @@ class TestCalibrationScaleMapping:
         assert "bias_correction_layers" in overrides
         assert "act_percentile_nodes" in overrides
         assert "output_aware_clipping_fc1_blocks" in overrides
+        assert "output_aware_clipping_fc2_blocks" in overrides
+        assert "output_aware_clipping_classifier" in overrides
         assert "output_aware_clipping_candidates" in overrides
         assert "output_aware_clipping_alpha_min" in overrides
         assert "adaround_fc1_blocks" in overrides
+        assert "adaround_fc2_blocks" in overrides
         assert "fused_softmax_attnv" in overrides
         assert "fused_softmax_attnv_accum_out_proj" in overrides
+        assert "gelu_search_objective" in overrides
+        assert "hessian_calibration_images" in overrides
+        assert "hessian_target_nodes" in overrides
+        assert "twin_uniform_softmax_blocks" in overrides
+        assert "twin_uniform_gelu_blocks" in overrides
+        assert "twin_uniform_mode" in overrides
+        assert "twin_uniform_disable_hessian" in overrides
         assert "dequant_add_residual1_blocks" in overrides
         assert "requant_pc_fc1" in overrides
         assert "requant_pc_fc1_blocks" in overrides
+        assert "requant_pc_fc2" in overrides
+        assert "requant_pc_fc2_blocks" in overrides
+        assert "requant_pc_out_proj" in overrides
+        assert "requant_pc_out_proj_blocks" in overrides
         assert "trace_image_ids" in overrides
 
     def test_preset_compile_kwargs_matches_current_best_blocks(self):
@@ -349,11 +426,21 @@ class TestCalibrationScaleMapping:
         assert kwargs["bias_correction_layers"] == ""
         assert kwargs["activation_percentile_nodes"] is None
         assert kwargs["output_aware_clipping_fc1_blocks"] is None
+        assert kwargs["output_aware_clipping_fc2_blocks"] is None
+        assert kwargs["output_aware_clipping_classifier"] is False
         assert kwargs["output_aware_clipping_candidates"] == 25
         assert kwargs["output_aware_clipping_alpha_min"] == 0.5
         assert kwargs["adaround_fc1_blocks"] is None
+        assert kwargs["adaround_fc2_blocks"] is None
         assert kwargs["requant_pc_fc1"] is False
         assert kwargs["requant_pc_fc1_blocks"] is None
+        assert kwargs["requant_pc_fc2"] is False
+        assert kwargs["requant_pc_fc2_blocks"] is None
+        assert kwargs["requant_pc_out_proj_blocks"] is None
+        assert kwargs["gelu_search_objective"] == "downstream_residual2"
+        assert kwargs["twin_uniform_mode"] == "off"
+        assert kwargs["twin_uniform_softmax_blocks"] is None
+        assert kwargs["twin_uniform_gelu_blocks"] is None
 
     def test_resolve_bias_correction_targets_supports_default_and_groups(self):
         state_dict = {
@@ -581,6 +668,24 @@ class TestCalibrationScaleMapping:
         assert tail_debug["label"] == "default"
         assert tail_debug["mean_attn_v_cosine"] > downstream_debug["mean_attn_v_cosine"]
 
+    def test_select_best_softmax_prob_downstream_supports_hessian_objective(self):
+        block_samples, out_proj_weight, out_proj_bias = self._make_seeded_block_samples(2)
+        _, debug = select_best_softmax_prob_downstream(
+            block_samples=block_samples,
+            head_idx=2,
+            default_prob=0.90,
+            default_head_probs={head_idx: 0.90 for head_idx in range(NUM_HEADS)},
+            value_scales={head_idx: 0.20 for head_idx in range(NUM_HEADS)},
+            attn_v_scale=0.20,
+            out_proj_scale=0.20,
+            out_proj_weight=out_proj_weight,
+            out_proj_bias=out_proj_bias,
+            search_objective="hessian_prob",
+        )
+
+        assert debug["label"]
+        assert debug["mean_hessian_score"] >= 0.0
+
     def test_select_best_gelu_output_scale_returns_candidate_debug(self):
         block_samples = []
         for offset in (0.0, 0.02):
@@ -606,6 +711,32 @@ class TestCalibrationScaleMapping:
         assert debug["label"]
         assert debug["mean_residual2_cosine"] <= 1.0
         assert debug["mean_saturation_rate"] >= 0.0
+
+    def test_select_best_gelu_output_scale_supports_hessian_objective(self):
+        block_samples = []
+        for offset in (0.0, 0.02, -0.01):
+            gelu = np.array([[0.12 + offset, -0.08, 0.45 - offset]], dtype=np.float32)
+            fc2_weight = np.array([[1.0, 0.2, -0.1], [-0.3, 0.5, 0.8], [0.2, -0.4, 0.6]], dtype=np.float32)
+            fc2 = (gelu @ fc2_weight.T).astype(np.float32)
+            residual1 = np.array([[0.05, -0.10, 0.02]], dtype=np.float32)
+            block_samples.append({
+                "gelu": gelu,
+                "fc2": fc2,
+                "residual1": residual1,
+                "residual2": residual1 + fc2,
+            })
+
+        scale, debug = select_best_gelu_output_scale(
+            block_samples,
+            default_scale=0.25,
+            fc2_scale=0.25,
+            fc2_weight=np.array([[1.0, 0.2, -0.1], [-0.3, 0.5, 0.8], [0.2, -0.4, 0.6]], dtype=np.float32),
+            fc2_bias=np.zeros(3, dtype=np.float32),
+            search_objective="hessian_output",
+        )
+
+        assert scale > 0.0
+        assert debug["mean_hessian_score"] >= 0.0
 
     def test_select_best_final_logit_scale_returns_candidate_debug(self):
         final_logit_samples = [

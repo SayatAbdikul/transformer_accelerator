@@ -16,6 +16,10 @@ import torch.nn as nn
 from typing import Dict, Optional, Tuple, Callable
 
 from .quantize import quantize_tensor, dequantize_tensor
+from .twin_uniform import (
+    quantize_dequant_gelu_twin,
+    quantize_dequant_softmax_twin,
+)
 
 
 def _quantize_dequantize_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -69,34 +73,135 @@ def apply_weight_quantization(model: nn.Module) -> nn.Module:
     return model_q, quantized_count
 
 
+def _apply_activation_quantization(
+    output: torch.Tensor,
+    scale: float,
+    twin_uniform_spec: Optional[Dict[str, object]] = None,
+):
+    tuple_index = None
+    if twin_uniform_spec is not None:
+        tuple_index = twin_uniform_spec.get("tuple_index")
+    if tuple_index is not None and isinstance(output, (tuple, list)):
+        items = list(output)
+        idx = int(tuple_index)
+        if 0 <= idx < len(items) and isinstance(items[idx], torch.Tensor):
+            items[idx] = _apply_activation_quantization(items[idx], scale, {
+                key: value
+                for key, value in twin_uniform_spec.items()
+                if key != "tuple_index"
+            })
+        return type(output)(items) if isinstance(output, tuple) else items
+    if not isinstance(output, torch.Tensor):
+        return output
+    if twin_uniform_spec:
+        mode = str(twin_uniform_spec.get("mode", ""))
+        arr = output.detach().cpu().numpy().astype(np.float32)
+        if mode == "softmax":
+            qdq = quantize_dequant_softmax_twin(
+                arr,
+                float(twin_uniform_spec.get("range1_max", 0.1)),
+            )
+            return torch.from_numpy(qdq).to(output.device).to(output.dtype)
+        if mode == "gelu":
+            qdq = quantize_dequant_gelu_twin(
+                arr,
+                float(twin_uniform_spec.get("positive_range_max", 1.0)),
+                negative_extent=twin_uniform_spec.get("negative_extent"),
+            )
+            return torch.from_numpy(qdq).to(output.device).to(output.dtype)
+    if scale is None or scale <= 0:
+        return output
+    q = torch.clamp(torch.round(output / scale), -128, 127)
+    return q * scale
+
+
 class ActivationQuantizer:
     """Hook-based activation quantizer using calibrated per-tensor scales.
 
     Intercepts module outputs, quantizes to INT8, and dequantizes back.
     """
 
-    def __init__(self, scales: Dict[str, float]):
+    def __init__(
+        self,
+        scales: Dict[str, float],
+        *,
+        twin_uniform_specs: Optional[Dict[str, Dict[str, object]]] = None,
+    ):
         self.scales = scales
+        self.twin_uniform_specs = twin_uniform_specs or {}
         self.hooks = []
+        self.forward_patches = []
 
     def _make_hook(self, name: str):
         scale = self.scales.get(name, None)
+        twin_uniform_spec = self.twin_uniform_specs.get(name)
 
         def hook(module, input, output):
-            if scale is None or scale <= 0:
-                return output
-            if not isinstance(output, torch.Tensor):
-                return output
-            # Quantize to INT8: clip(round(x / scale), -128, 127) * scale
-            q = torch.clamp(torch.round(output / scale), -128, 127)
-            return q * scale
+            return _apply_activation_quantization(output, scale, twin_uniform_spec)
 
         return hook
 
     def attach(self, model: nn.Module):
         """Attach quantization hooks to all Linear/Conv2d modules."""
         for name, module in model.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d, nn.LayerNorm)):
+            twin_uniform_spec = self.twin_uniform_specs.get(name)
+            if twin_uniform_spec and str(twin_uniform_spec.get("mode", "")) == "softmax":
+                if all(
+                    hasattr(module, attr)
+                    for attr in (
+                        "query",
+                        "key",
+                        "value",
+                        "num_attention_heads",
+                        "attention_head_size",
+                        "all_head_size",
+                        "scaling",
+                    )
+                ):
+                    original_forward = module.forward
+                    split = float(twin_uniform_spec.get("range1_max", 0.1))
+
+                    def patched_forward(hidden_states, *, _module=module, _split=split):
+                        batch_size = hidden_states.shape[0]
+                        new_shape = (
+                            batch_size,
+                            -1,
+                            _module.num_attention_heads,
+                            _module.attention_head_size,
+                        )
+                        key_layer = _module.key(hidden_states).view(*new_shape).transpose(1, 2)
+                        value_layer = _module.value(hidden_states).view(*new_shape).transpose(1, 2)
+                        query_layer = _module.query(hidden_states).view(*new_shape).transpose(1, 2)
+                        attention_probs = torch.matmul(
+                            query_layer,
+                            key_layer.transpose(2, 3),
+                        ) * _module.scaling
+                        attention_probs = torch.softmax(attention_probs, dim=-1)
+                        if _module.training and getattr(_module, "dropout_prob", 0.0) > 0.0:
+                            attention_probs = torch.nn.functional.dropout(
+                                attention_probs,
+                                p=float(_module.dropout_prob),
+                                training=True,
+                            )
+                        qdq = quantize_dequant_softmax_twin(
+                            attention_probs.detach().cpu().numpy().astype(np.float32),
+                            _split,
+                        )
+                        attention_probs = torch.from_numpy(qdq).to(
+                            attention_probs.device
+                        ).to(attention_probs.dtype)
+                        context_layer = torch.matmul(attention_probs, value_layer)
+                        context_layer = context_layer.transpose(1, 2).contiguous()
+                        new_context_layer_shape = context_layer.size()[:-2] + (
+                            _module.all_head_size,
+                        )
+                        context_layer = context_layer.reshape(new_context_layer_shape)
+                        return context_layer, attention_probs
+
+                    module.forward = patched_forward
+                    self.forward_patches.append((module, original_forward))
+                    continue
+            if isinstance(module, (nn.Linear, nn.Conv2d, nn.LayerNorm)) or name in self.twin_uniform_specs:
                 h = module.register_forward_hook(self._make_hook(name))
                 self.hooks.append(h)
 
@@ -104,6 +209,9 @@ class ActivationQuantizer:
         for h in self.hooks:
             h.remove()
         self.hooks.clear()
+        for module, original_forward in reversed(self.forward_patches):
+            module.forward = original_forward
+        self.forward_patches.clear()
 
 
 def calibrate_activation_scales(

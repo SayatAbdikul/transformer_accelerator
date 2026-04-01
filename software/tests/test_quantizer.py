@@ -2,6 +2,7 @@
 import pytest
 import numpy as np
 import torch
+import torch.nn as nn
 from taccel.quantizer.quantize import (
     adaround_greedy,
     dequantize_tensor,
@@ -10,7 +11,17 @@ from taccel.quantizer.quantize import (
     quantize_weights,
 )
 from taccel.quantizer.calibrate import CalibrationResult
+from taccel.quantizer.fake_quant import ActivationQuantizer
+from taccel.quantizer.hessian_guided import (
+    gelu_fc2_hessian_diag,
+    softmax_attn_v_hessian_diag,
+    weighted_quant_error_score,
+)
 from taccel.quantizer.scales import ScalePropagator
+from taccel.quantizer.twin_uniform import (
+    quantize_dequant_gelu_twin,
+    quantize_dequant_softmax_twin,
+)
 
 
 class TestQuantize:
@@ -169,6 +180,236 @@ class TestQuantize:
         mse_clip = float(np.mean((y_fp32 - y_clip) ** 2))
         mse_ada = float(np.mean((y_fp32 - y_ada) ** 2))
         assert mse_ada <= mse_clip
+
+    def test_output_aware_clipping_can_improve_fc2_like_per_tensor_output_mse(self):
+        W = np.array(
+            [
+                [18.0, 0.9, -0.8, 0.6],
+                [-16.0, -0.7, 0.5, -0.4],
+            ],
+            dtype=np.float32,
+        )
+        calibration_inputs = [
+            np.array(
+                [
+                    [0.01, -0.4, 0.3, 0.1],
+                    [0.02, 0.6, -0.5, 0.4],
+                    [0.00, 0.7, 0.2, -0.3],
+                ],
+                dtype=np.float32,
+            )
+        ]
+
+        q_base, s_base = quantize_tensor(W, per_channel=False)
+        q_clip, s_clip = quantize_tensor_clipped(
+            W,
+            calibration_inputs=calibration_inputs,
+            per_channel=False,
+            n_candidates=31,
+            alpha_min=0.2,
+        )
+
+        x = calibration_inputs[0]
+        y_fp32 = x @ W.T
+        y_base = x @ dequantize_tensor(q_base, s_base).T
+        y_clip = x @ dequantize_tensor(q_clip, s_clip).T
+
+        mse_base = float(np.mean((y_fp32 - y_base) ** 2))
+        mse_clip = float(np.mean((y_fp32 - y_clip) ** 2))
+        assert mse_clip < mse_base
+
+    def test_output_aware_clipping_can_improve_classifier_like_mse(self):
+        W = np.array(
+            [
+                [14.0, 0.12, -0.10],
+                [-13.5, -0.08, 0.11],
+                [0.2, 0.25, -0.18],
+            ],
+            dtype=np.float32,
+        )
+        calibration_inputs = [
+            np.array(
+                [
+                    [0.0, 0.8, -0.7],
+                    [0.01, -0.5, 0.6],
+                    [0.0, 0.3, -0.2],
+                ],
+                dtype=np.float32,
+            )
+        ]
+
+        q_base, s_base = quantize_tensor(W, per_channel=False)
+        q_clip, s_clip = quantize_tensor_clipped(
+            W,
+            calibration_inputs=calibration_inputs,
+            per_channel=False,
+            n_candidates=41,
+            alpha_min=0.15,
+        )
+
+        x = calibration_inputs[0]
+        y_fp32 = x @ W.T
+        y_base = x @ dequantize_tensor(q_base, s_base).T
+        y_clip = x @ dequantize_tensor(q_clip, s_clip).T
+
+        mse_base = float(np.mean((y_fp32 - y_base) ** 2))
+        mse_clip = float(np.mean((y_fp32 - y_clip) ** 2))
+        assert mse_clip < mse_base
+
+    def test_twin_uniform_softmax_is_monotonic_bounded_and_deterministic(self):
+        x = np.array([[0.0, 0.01, 0.03, 0.10, 0.35, 0.90]], dtype=np.float32)
+        qdq0, meta0 = quantize_dequant_softmax_twin(x, 0.10, return_metadata=True)
+        qdq1, meta1 = quantize_dequant_softmax_twin(x, 0.10, return_metadata=True)
+
+        assert np.all(qdq0 >= 0.0)
+        assert np.all(qdq0 <= 1.0)
+        assert np.all(np.diff(qdq0[0]) >= -1e-7)
+        np.testing.assert_allclose(qdq0, qdq1)
+        assert meta0 == meta1
+
+    def test_twin_uniform_gelu_is_deterministic_and_preserves_sign_regions(self):
+        x = np.array([[-1.20, -0.40, -0.05, 0.0, 0.20, 1.80]], dtype=np.float32)
+        qdq0, meta0 = quantize_dequant_gelu_twin(x, 1.0, negative_extent=1.5, return_metadata=True)
+        qdq1, meta1 = quantize_dequant_gelu_twin(x, 1.0, negative_extent=1.5, return_metadata=True)
+
+        np.testing.assert_allclose(qdq0, qdq1)
+        assert meta0 == meta1
+        assert np.all(qdq0[x < 0.0] <= 1e-7)
+        assert np.all(qdq0[x > 0.0] >= -1e-7)
+
+    def test_hessian_weighted_score_prefers_identical_reconstruction(self):
+        ref = np.array([[0.2, 0.8], [0.6, 0.4]], dtype=np.float32)
+        diag = np.array([[1.0, 3.0], [2.0, 4.0]], dtype=np.float32)
+        same = ref.copy()
+        perturbed = ref + np.array([[0.01, -0.04], [0.02, 0.03]], dtype=np.float32)
+
+        same_score = weighted_quant_error_score(ref, same, diag)
+        perturbed_score = weighted_quant_error_score(ref, perturbed, diag)
+
+        assert same_score == pytest.approx(0.0)
+        assert perturbed_score > same_score
+
+    def test_hessian_diag_helpers_match_reference_shape(self):
+        softmax = np.array([[0.7, 0.3], [0.1, 0.9]], dtype=np.float32)
+        value = np.array([[1.0, -2.0, 0.5], [0.2, 0.4, -0.3]], dtype=np.float32)
+        gelu = np.array([[0.1, 0.3, 0.6]], dtype=np.float32)
+        fc2 = np.array([[0.2, -0.5, 0.7], [0.1, 0.3, -0.2]], dtype=np.float32)
+
+        soft_h = softmax_attn_v_hessian_diag(softmax, value)
+        gelu_h = gelu_fc2_hessian_diag(gelu, fc2)
+
+        assert soft_h.shape == softmax.shape
+        assert gelu_h.shape == gelu.shape
+        assert np.all(soft_h >= 0.0)
+        assert np.all(gelu_h >= 0.0)
+
+    def test_activation_quantizer_can_patch_tuple_outputs_for_softmax_specs(self):
+        class TupleModule(nn.Module):
+            def forward(self, x):
+                return x, x + 0.5
+
+        class Toy(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.tuple_mod = TupleModule()
+
+            def forward(self, x):
+                return self.tuple_mod(x)
+
+        model = Toy()
+        quantizer = ActivationQuantizer(
+            scales={},
+            twin_uniform_specs={
+                "tuple_mod": {
+                    "mode": "softmax",
+                    "range1_max": 0.25,
+                    "tuple_index": 1,
+                }
+            },
+        )
+        quantizer.attach(model)
+        try:
+            out0, out1 = model(torch.tensor([[0.05, 0.85]], dtype=torch.float32))
+        finally:
+            quantizer.remove()
+
+        np.testing.assert_allclose(out0.numpy(), np.array([[0.05, 0.85]], dtype=np.float32))
+        assert np.all(out1.numpy() >= 0.0)
+        assert np.all(out1.numpy() <= 1.0)
+
+    def test_activation_quantizer_softmax_patch_changes_attention_context(self):
+        class ToySelfAttention(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_attention_heads = 2
+                self.attention_head_size = 2
+                self.all_head_size = 4
+                self.scaling = self.attention_head_size**-0.5
+                self.dropout_prob = 0.0
+                self.query = nn.Linear(4, 4, bias=False)
+                self.key = nn.Linear(4, 4, bias=False)
+                self.value = nn.Linear(4, 4, bias=False)
+
+            def forward(self, hidden_states):
+                batch_size = hidden_states.shape[0]
+                new_shape = (
+                    batch_size,
+                    -1,
+                    self.num_attention_heads,
+                    self.attention_head_size,
+                )
+                key_layer = self.key(hidden_states).view(*new_shape).transpose(1, 2)
+                value_layer = self.value(hidden_states).view(*new_shape).transpose(1, 2)
+                query_layer = self.query(hidden_states).view(*new_shape).transpose(1, 2)
+                attention_probs = torch.matmul(query_layer, key_layer.transpose(2, 3)) * self.scaling
+                attention_probs = torch.softmax(attention_probs, dim=-1)
+                context_layer = torch.matmul(attention_probs, value_layer)
+                context_layer = context_layer.transpose(1, 2).contiguous()
+                return context_layer.reshape(batch_size, -1, self.all_head_size), attention_probs
+
+        class Toy(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = ToySelfAttention()
+
+        torch.manual_seed(0)
+        model = Toy().eval()
+        x = torch.tensor(
+            [[[0.1, -0.2, 0.3, 0.4], [0.5, -0.4, 0.2, -0.1], [-0.3, 0.7, -0.6, 0.2]]],
+            dtype=torch.float32,
+        )
+
+        baseline_context, baseline_probs = model.attn(x)
+
+        quantizer = ActivationQuantizer(
+            scales={},
+            twin_uniform_specs={
+                "attn": {
+                    "mode": "softmax",
+                    "range1_max": 0.05,
+                }
+            },
+        )
+        quantizer.attach(model)
+        try:
+            patched_context, patched_probs = model.attn(x)
+        finally:
+            quantizer.remove()
+
+        restored_context, restored_probs = model.attn(x)
+
+        assert not np.allclose(patched_context.detach().numpy(), baseline_context.detach().numpy())
+        assert not np.allclose(patched_probs.detach().numpy(), baseline_probs.detach().numpy())
+        np.testing.assert_allclose(
+            restored_context.detach().numpy(),
+            baseline_context.detach().numpy(),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            restored_probs.detach().numpy(),
+            baseline_probs.detach().numpy(),
+            atol=1e-6,
+        )
 
 
 class TestScalePropagator:

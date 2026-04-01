@@ -36,6 +36,13 @@ from taccel.quantizer.fake_quant import (
 
 MODEL_NAME  = "facebook/deit-tiny-patch16-224"
 WEIGHTS_PATH = "pytorch_model.bin"
+LOCAL_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+LOCAL_IMAGENET_CLASS0_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "images",
+    "imagenet_one_class",
+    "000_tench_Tinca_tinca",
+)
 
 # ── 150 candidate COCO val2017 image IDs ──────────────────────────────────────
 # Drawn from the official COCO val2017 annotation set.  Not all IDs exist;
@@ -63,10 +70,14 @@ COCO_BASE = "http://images.cocodataset.org/val2017/{:012d}.jpg"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def load_model():
+def load_model(*, output_attentions: bool = False):
     print(f"  Loading {MODEL_NAME} from {WEIGHTS_PATH} ...")
     state_dict = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=False)
-    config = AutoConfig.from_pretrained(MODEL_NAME)
+    config = AutoConfig.from_pretrained(MODEL_NAME, local_files_only=True)
+    if output_attentions:
+        config.output_attentions = True
+        if hasattr(config, "_attn_implementation"):
+            config._attn_implementation = "eager"
     model = AutoModelForImageClassification.from_config(config)
     model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -74,7 +85,7 @@ def load_model():
 
 
 def load_processor():
-    return AutoImageProcessor.from_pretrained(MODEL_NAME)
+    return AutoImageProcessor.from_pretrained(MODEL_NAME, local_files_only=True)
 
 
 def fetch_image(img_id: int):
@@ -120,6 +131,128 @@ def collect_images(max_images: int, workers: int = 12) -> list:
 
     collected.sort(key=lambda x: x[0])
     return collected[:max_images]
+
+
+def parse_csv_int_set(text: str):
+    if not text:
+        return set()
+    return {int(part.strip()) for part in text.split(",") if part.strip()}
+
+
+def discover_local_flat_images(image_root: str, max_images: int) -> list:
+    """Load up to max_images from a flat local image directory."""
+    print(f"  Loading up to {max_images} local images from {image_root} ...")
+    names = [
+        name for name in os.listdir(image_root)
+        if os.path.isfile(os.path.join(image_root, name))
+        and os.path.splitext(name)[1].lower() in LOCAL_IMAGE_EXTENSIONS
+    ]
+    collected = []
+    for name in sorted(names):
+        path = os.path.join(image_root, name)
+        with Image.open(path) as img:
+            collected.append((os.path.splitext(name)[0], img.convert("RGB")))
+        if len(collected) >= max_images:
+            break
+    return collected
+
+
+def collect_twin_uniform_specs(
+    model: torch.nn.Module,
+    sample_inputs: list,
+    *,
+    softmax_blocks: set,
+    gelu_blocks: set,
+    percentile: float = 99.9,
+):
+    """Collect PTQ4ViT twin-uniform split parameters from calibration runs."""
+    module_map = dict(model.named_modules())
+    records = {}
+    handles = []
+
+    for block_idx in sorted(softmax_blocks):
+        name = f"vit.encoder.layer.{block_idx}.attention.attention"
+        module = module_map.get(name)
+        if module is None:
+            continue
+
+        def _make_softmax_hook(module_name):
+            def hook(_module, _inputs, output):
+                probs = output[1] if isinstance(output, tuple) and len(output) > 1 else None
+                if isinstance(probs, torch.Tensor):
+                    records.setdefault(module_name, []).append(
+                        probs.detach().cpu().numpy().astype(np.float32)
+                    )
+            return hook
+
+        handles.append(module.register_forward_hook(_make_softmax_hook(name)))
+
+    for block_idx in sorted(gelu_blocks):
+        name = f"vit.encoder.layer.{block_idx}.intermediate.intermediate_act_fn"
+        module = module_map.get(name)
+        if module is None:
+            continue
+
+        def _make_gelu_hook(module_name):
+            def hook(_module, _inputs, output):
+                if isinstance(output, torch.Tensor):
+                    records.setdefault(module_name, []).append(
+                        output.detach().cpu().numpy().astype(np.float32)
+                    )
+            return hook
+
+        handles.append(module.register_forward_hook(_make_gelu_hook(name)))
+
+    model.eval()
+    with torch.no_grad():
+        for inp in sample_inputs:
+            outputs = model(**inp)
+            attentions = getattr(outputs, "attentions", None)
+            if attentions:
+                for block_idx in sorted(softmax_blocks):
+                    if block_idx >= len(attentions):
+                        continue
+                    probs = attentions[block_idx]
+                    if isinstance(probs, torch.Tensor):
+                        name = f"vit.encoder.layer.{block_idx}.attention.attention"
+                        records.setdefault(name, []).append(
+                            probs.detach().cpu().numpy().astype(np.float32)
+                        )
+
+    for handle in handles:
+        handle.remove()
+
+    specs = {}
+    for block_idx in sorted(softmax_blocks):
+        name = f"vit.encoder.layer.{block_idx}.attention.attention"
+        tensors = records.get(name, [])
+        if not tensors:
+            continue
+        flat = np.concatenate([tensor.reshape(-1) for tensor in tensors]).astype(np.float32)
+        specs[name] = {
+            "mode": "softmax",
+            "range1_max": float(np.clip(np.percentile(flat, percentile), 1e-4, 1.0)),
+            "tuple_index": 1,
+        }
+
+    for block_idx in sorted(gelu_blocks):
+        name = f"vit.encoder.layer.{block_idx}.intermediate.intermediate_act_fn"
+        tensors = records.get(name, [])
+        if not tensors:
+            continue
+        flat = np.concatenate([tensor.reshape(-1) for tensor in tensors]).astype(np.float32)
+        positive = flat[flat > 0.0]
+        negative = -flat[flat < 0.0]
+        specs[name] = {
+            "mode": "gelu",
+            "positive_range_max": float(
+                max(np.percentile(positive, percentile), 1e-6) if positive.size else 1e-6
+            ),
+            "negative_extent": float(
+                max(np.percentile(negative, percentile), 1e-6) if negative.size else 1e-6
+            ),
+        }
+    return specs
 
 
 def run_inference(model, processor, image: Image.Image) -> np.ndarray:
@@ -192,17 +325,47 @@ def run_experiment(name, model_fp32, model_q, processor, images, id2label):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--benchmark-dataset",
+        choices=["coco", "local_flat"],
+        default="coco",
+        help="Dataset source for the fake-quant benchmark",
+    )
+    parser.add_argument(
+        "--local-image-dir",
+        default=LOCAL_IMAGENET_CLASS0_DIR,
+        help="Flat local image directory used when --benchmark-dataset=local_flat",
+    )
     parser.add_argument("--max-images", type=int, default=100,
                         help="Number of COCO val images to test (default: 100)")
     parser.add_argument("--workers", type=int, default=12,
                         help="Parallel download workers (default: 12)")
     parser.add_argument("--no-act-quant", action="store_true",
                         help="Skip W8A8 experiment (only run W8)")
+    parser.add_argument(
+        "--act-quant-percentile",
+        type=float,
+        default=99.99,
+        help="Percentile used for standard activation calibration",
+    )
+    parser.add_argument(
+        "--twin-uniform-softmax-blocks",
+        default="",
+        help="Comma-separated attention block indices for PTQ4ViT twin-uniform softmax",
+    )
+    parser.add_argument(
+        "--twin-uniform-gelu-blocks",
+        default="",
+        help="Comma-separated MLP block indices for PTQ4ViT twin-uniform GELU",
+    )
     args = parser.parse_args()
+    twin_softmax_blocks = parse_csv_int_set(args.twin_uniform_softmax_blocks)
+    twin_gelu_blocks = parse_csv_int_set(args.twin_uniform_gelu_blocks)
+    needs_output_attentions = bool(twin_softmax_blocks)
 
     # ── Load model ────────────────────────────────────────────────────────
     print_header("Loading model")
-    model_fp32 = load_model()
+    model_fp32 = load_model(output_attentions=needs_output_attentions)
     processor  = load_processor()
     id2label   = model_fp32.config.id2label
     param_count = sum(p.numel() for p in model_fp32.parameters())
@@ -228,13 +391,21 @@ def main():
     print(f"  Weight MSE (FP32 vs INT8-dequant) : {weight_mse:.2e}")
     print(f"  Weight SNR                        : {weight_snr:.1f} dB")
 
-    # ── Download images ───────────────────────────────────────────────────
-    print_header(f"Collecting {args.max_images} COCO val2017 images")
-    images = collect_images(args.max_images, workers=args.workers)
-    if not images:
-        print("  No images downloaded. Check network connectivity.")
-        sys.exit(1)
-    print(f"\n  Collected {len(images)} images successfully.")
+    # ── Collect images ────────────────────────────────────────────────────
+    if args.benchmark_dataset == "local_flat":
+        print_header(f"Collecting {args.max_images} local images")
+        images = discover_local_flat_images(args.local_image_dir, args.max_images)
+        if not images:
+            print("  No local images found.")
+            sys.exit(1)
+        print(f"\n  Collected {len(images)} local images successfully.")
+    else:
+        print_header(f"Collecting {args.max_images} COCO val2017 images")
+        images = collect_images(args.max_images, workers=args.workers)
+        if not images:
+            print("  No images downloaded. Check network connectivity.")
+            sys.exit(1)
+        print(f"\n  Collected {len(images)} images successfully.")
 
     # ── Experiment 1: W8 (weight-only) ───────────────────────────────────
     wq_metrics = run_experiment(
@@ -247,11 +418,17 @@ def main():
     # ── Experiment 2: W8A8 (weight + activation) ──────────────────────────
     agg_waq = {}
     waq_metrics = []
+    agg_twin = {}
+    twin_metrics = []
     if not args.no_act_quant:
         print_header("Calibrating activation scales (using all test images)")
         sample_inputs = [processor(images=img, return_tensors="pt")
                          for _, img in images]
-        act_scales = calibrate_activation_scales(model_fp32, sample_inputs)
+        act_scales = calibrate_activation_scales(
+            model_fp32,
+            sample_inputs,
+            percentile=args.act_quant_percentile,
+        )
         print(f"  Calibrated {len(act_scales)} activation tensors")
 
         # Show 5 representative scales
@@ -270,6 +447,43 @@ def main():
         agg_waq = aggregate(waq_metrics)
         print_aggregate(agg_waq, len(waq_metrics), "W8A8")
 
+        if twin_softmax_blocks or twin_gelu_blocks:
+            print_header("Calibrating PTQ4ViT twin-uniform specs")
+            twin_specs = collect_twin_uniform_specs(
+                model_fp32,
+                sample_inputs,
+                softmax_blocks=twin_softmax_blocks,
+                gelu_blocks=twin_gelu_blocks,
+            )
+            missing_softmax = {
+                block_idx for block_idx in twin_softmax_blocks
+                if f"vit.encoder.layer.{block_idx}.attention.attention" not in twin_specs
+            }
+            if missing_softmax:
+                missing = ", ".join(str(idx) for idx in sorted(missing_softmax))
+                raise RuntimeError(
+                    "Failed to collect twin-uniform softmax specs for block(s): "
+                    f"{missing}. Ensure output attentions are enabled."
+                )
+            if twin_specs:
+                for name, spec in sorted(twin_specs.items()):
+                    if spec["mode"] == "softmax":
+                        print(f"    {name:<55}: split={spec['range1_max']:.5f}")
+                    else:
+                        print(
+                            f"    {name:<55}: pos={spec['positive_range_max']:.5f} "
+                            f"neg={spec['negative_extent']:.5f}"
+                        )
+            act_qtz = ActivationQuantizer(act_scales, twin_uniform_specs=twin_specs)
+            act_qtz.attach(model_wq)
+            twin_metrics = run_experiment(
+                f"Experiment 3 — W8A8 + PTQ4ViT twin-uniform ({len(images)} images)",
+                model_fp32, model_wq, processor, images, id2label,
+            )
+            act_qtz.remove()
+            agg_twin = aggregate(twin_metrics)
+            print_aggregate(agg_twin, len(twin_metrics), "W8A8 + Twin")
+
     # ── Final summary table ───────────────────────────────────────────────
     print_header("Summary — FP32 → INT8 quantization impact")
 
@@ -280,26 +494,27 @@ def main():
         return f"{v:{fmt}}"
 
     w8a8_col = "  W8A8  " if not args.no_act_quant else "  n/a   "
+    twin_col = "  Twin  " if agg_twin else "  n/a   "
 
     print(f"""
   Model                  : {MODEL_NAME}
-  Images tested          : {len(images)} COCO val2017
+  Images tested          : {len(images)} {'COCO val2017' if args.benchmark_dataset == 'coco' else args.local_image_dir}
   Quantized layers       : {n_quantized} Linear/Conv2d
   Weight quantization    : per-channel symmetric INT8
   Weight SNR             : {weight_snr:.1f} dB
 
-  ┌─────────────────────────────────┬──────────────────────┬──────────────────────┐
-  │ Metric                          │    W8 (weight-only)  │{w8a8_col}(w+act)   │
-  ├─────────────────────────────────┼──────────────────────┼──────────────────────┤
-  │ top-1 class preserved           │{_f(agg_wq,'top1_match','.1f',True):>21} │{_f(agg_waq,'top1_match','.1f',True) if agg_waq else '  n/a':>21} │
-  │ top-5 overlap                   │{_f(agg_wq,'top5_match','.1f',True):>21} │{_f(agg_waq,'top5_match','.1f',True) if agg_waq else '  n/a':>21} │
-  │ logit cosine similarity (mean)  │{_f(agg_wq,'cosine_sim','8.6f'):>21} │{_f(agg_waq,'cosine_sim','8.6f') if agg_waq else '  n/a':>21} │
-  │ logit cosine similarity (min)   │{agg_wq.get('cosine_sim_min',float('nan')):>21.6f} │{agg_waq.get('cosine_sim_min',float('nan')):>21.6f} │
-  │ logit MSE (mean)                │{_f(agg_wq,'logit_mse','8.5f'):>21} │{_f(agg_waq,'logit_mse','8.5f') if agg_waq else '  n/a':>21} │
-  │ logit SNR (mean, dB)            │{_f(agg_wq,'logit_snr_db','8.2f'):>21} │{_f(agg_waq,'logit_snr_db','8.2f') if agg_waq else '  n/a':>21} │
-  │ logit SNR (min, dB)             │{agg_wq.get('logit_snr_db_min',float('nan')):>21.2f} │{agg_waq.get('logit_snr_db_min',float('nan')):>21.2f} │
-  │ softmax KL divergence (mean)    │{_f(agg_wq,'softmax_kl_div','8.6f'):>21} │{_f(agg_waq,'softmax_kl_div','8.6f') if agg_waq else '  n/a':>21} │
-  └─────────────────────────────────┴──────────────────────┴──────────────────────┘
+  ┌─────────────────────────────────┬──────────────────────┬──────────────────────┬──────────────────────┐
+  │ Metric                          │    W8 (weight-only)  │{w8a8_col}(w+act)   │{twin_col}(PTQ4ViT) │
+  ├─────────────────────────────────┼──────────────────────┼──────────────────────┼──────────────────────┤
+  │ top-1 class preserved           │{_f(agg_wq,'top1_match','.1f',True):>21} │{_f(agg_waq,'top1_match','.1f',True) if agg_waq else '  n/a':>21} │{_f(agg_twin,'top1_match','.1f',True) if agg_twin else '  n/a':>21} │
+  │ top-5 overlap                   │{_f(agg_wq,'top5_match','.1f',True):>21} │{_f(agg_waq,'top5_match','.1f',True) if agg_waq else '  n/a':>21} │{_f(agg_twin,'top5_match','.1f',True) if agg_twin else '  n/a':>21} │
+  │ logit cosine similarity (mean)  │{_f(agg_wq,'cosine_sim','8.6f'):>21} │{_f(agg_waq,'cosine_sim','8.6f') if agg_waq else '  n/a':>21} │{_f(agg_twin,'cosine_sim','8.6f') if agg_twin else '  n/a':>21} │
+  │ logit cosine similarity (min)   │{agg_wq.get('cosine_sim_min',float('nan')):>21.6f} │{agg_waq.get('cosine_sim_min',float('nan')):>21.6f} │{agg_twin.get('cosine_sim_min',float('nan')):>21.6f} │
+  │ logit MSE (mean)                │{_f(agg_wq,'logit_mse','8.5f'):>21} │{_f(agg_waq,'logit_mse','8.5f') if agg_waq else '  n/a':>21} │{_f(agg_twin,'logit_mse','8.5f') if agg_twin else '  n/a':>21} │
+  │ logit SNR (mean, dB)            │{_f(agg_wq,'logit_snr_db','8.2f'):>21} │{_f(agg_waq,'logit_snr_db','8.2f') if agg_waq else '  n/a':>21} │{_f(agg_twin,'logit_snr_db','8.2f') if agg_twin else '  n/a':>21} │
+  │ logit SNR (min, dB)             │{agg_wq.get('logit_snr_db_min',float('nan')):>21.2f} │{agg_waq.get('logit_snr_db_min',float('nan')):>21.2f} │{agg_twin.get('logit_snr_db_min',float('nan')):>21.2f} │
+  │ softmax KL divergence (mean)    │{_f(agg_wq,'softmax_kl_div','8.6f'):>21} │{_f(agg_waq,'softmax_kl_div','8.6f') if agg_waq else '  n/a':>21} │{_f(agg_twin,'softmax_kl_div','8.6f') if agg_twin else '  n/a':>21} │
+  └─────────────────────────────────┴──────────────────────┴──────────────────────┴──────────────────────┘
 
   top-1 mismatch images (W8):""")
 
@@ -327,6 +542,20 @@ def main():
         else:
             print("    none")
 
+    if agg_twin:
+        print(f"\n  top-1 mismatch images (W8A8 + PTQ4ViT twin):")
+        mismatches_twin = [(m["img_id"], m["top1_fp32"], m["top1_q"])
+                           for m in twin_metrics if not m["top1_match"]]
+        if mismatches_twin:
+            for img_id, c_fp32, c_q in mismatches_twin[:20]:
+                lf = id2label.get(c_fp32, str(c_fp32))
+                lq = id2label.get(c_q,    str(c_q))
+                print(f"    id={img_id:<6}  fp32={c_fp32} {lf}  →  int8={c_q} {lq}")
+            if len(mismatches_twin) > 20:
+                print(f"    ... and {len(mismatches_twin)-20} more")
+        else:
+            print("    none")
+
     print()
 
     # ── Save JSON ─────────────────────────────────────────────────────────
@@ -334,14 +563,21 @@ def main():
         "config": {
             "model": MODEL_NAME,
             "n_images": len(images),
+            "benchmark_dataset": args.benchmark_dataset,
+            "local_image_dir": args.local_image_dir if args.benchmark_dataset == "local_flat" else None,
             "n_quantized_layers": n_quantized,
             "weight_mse": weight_mse,
             "weight_snr_db": weight_snr,
+            "act_quant_percentile": args.act_quant_percentile,
+            "twin_uniform_softmax_blocks": sorted(twin_softmax_blocks),
+            "twin_uniform_gelu_blocks": sorted(twin_gelu_blocks),
         },
         "W8": {"aggregate": agg_wq, "per_image": wq_metrics},
     }
     if not args.no_act_quant:
         results["W8A8"] = {"aggregate": agg_waq, "per_image": waq_metrics}
+    if agg_twin:
+        results["W8A8_PTQ4ViT"] = {"aggregate": agg_twin, "per_image": twin_metrics}
 
     out = "quantization_comparison.json"
     with open(out, "w") as f:

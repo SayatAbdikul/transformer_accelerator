@@ -56,7 +56,10 @@ class Compiler:
         requant_pc_qkv_selection: Optional[set],
         requant_pc_fc1: bool,
         requant_pc_fc1_blocks: Optional[set],
+        requant_pc_fc2: bool,
+        requant_pc_fc2_blocks: Optional[set],
         requant_pc_out_proj: bool,
+        requant_pc_out_proj_blocks: Optional[set],
         requant_pc_weight_names: set,
         requant_pc_scale_tables: Dict[str, np.ndarray],
         data_base: int,
@@ -140,7 +143,16 @@ class Compiler:
                         sorted(int(block_idx) for block_idx in requant_pc_fc1_blocks)
                         if requant_pc_fc1_blocks is not None else None
                     ),
+                    "requant_pc_fc2": bool(requant_pc_fc2),
+                    "requant_pc_fc2_blocks": (
+                        sorted(int(block_idx) for block_idx in requant_pc_fc2_blocks)
+                        if requant_pc_fc2_blocks is not None else None
+                    ),
                     "requant_pc_out_proj": bool(requant_pc_out_proj),
+                    "requant_pc_out_proj_blocks": (
+                        sorted(int(block_idx) for block_idx in requant_pc_out_proj_blocks)
+                        if requant_pc_out_proj_blocks is not None else None
+                    ),
                 },
                 "enabled_experiments": sorted(
                     name for name, enabled in (
@@ -152,6 +164,7 @@ class Compiler:
                         ("fused_softmax_attnv_accum_out_proj", fused_softmax_attnv_accum_out_proj),
                         ("requant_pc_qkv", requant_pc_qkv),
                         ("requant_pc_fc1", requant_pc_fc1),
+                        ("requant_pc_fc2", requant_pc_fc2),
                         ("requant_pc_out_proj", requant_pc_out_proj),
                     )
                     if enabled
@@ -196,7 +209,10 @@ class Compiler:
                 requant_pc_qkv_selection: Optional[set] = None,
                 requant_pc_fc1: bool = False,
                 requant_pc_fc1_blocks: Optional[set] = None,
-                requant_pc_out_proj: bool = False) -> ProgramBinary:
+                requant_pc_fc2: bool = False,
+                requant_pc_fc2_blocks: Optional[set] = None,
+                requant_pc_out_proj: bool = False,
+                requant_pc_out_proj_blocks: Optional[set] = None) -> ProgramBinary:
         """Compile a DeiT-tiny model.
 
         Args:
@@ -341,7 +357,14 @@ class Compiler:
                         requant_pc_fc1_blocks is None or layer_idx in requant_pc_fc1_blocks
                     ),
                 ),
-                ("output.dense",          f"{b}_gelu",   f"{b}_fc2",      False),
+                (
+                    "output.dense",
+                    f"{b}_gelu",
+                    f"{b}_fc2",
+                    requant_pc_fc2 and (
+                        requant_pc_fc2_blocks is None or layer_idx in requant_pc_fc2_blocks
+                    ),
+                ),
             ]
             for dense_name, input_scale_key, output_scale_key, use_requant_pc in layer_specs:
                 wname = f"{prefix}.{dense_name}.weight"
@@ -350,6 +373,14 @@ class Compiler:
                     continue
                 act_scale_b = cal_scales.get(input_scale_key, 6.0 / 127.0)
                 override_quant = (weight_quantization_overrides or {}).get(wname)
+                if dense_name == "attention.output.dense" and (
+                    not requant_pc_out_proj
+                    or (
+                        requant_pc_out_proj_blocks is not None
+                        and layer_idx not in requant_pc_out_proj_blocks
+                    )
+                ):
+                    use_requant_pc = False
                 if use_requant_pc:
                     _, w_scales = quant_weights[wname]
                     if w_scales is None:
@@ -578,7 +609,10 @@ class Compiler:
             requant_pc_qkv_selection=requant_pc_qkv_selection,
             requant_pc_fc1=requant_pc_fc1,
             requant_pc_fc1_blocks=requant_pc_fc1_blocks,
+            requant_pc_fc2=requant_pc_fc2,
+            requant_pc_fc2_blocks=requant_pc_fc2_blocks,
             requant_pc_out_proj=requant_pc_out_proj,
+            requant_pc_out_proj_blocks=requant_pc_out_proj_blocks,
             requant_pc_weight_names=requant_pc_weight_names,
             requant_pc_scale_tables=requant_pc_scale_tables,
             data_base=data_base,

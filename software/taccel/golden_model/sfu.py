@@ -26,6 +26,10 @@ workload.
 import numpy as np
 from . import memory
 from ..isa.opcodes import BUF_ACCUM
+from ..quantizer.twin_uniform import (
+    quantize_dequant_gelu_twin,
+    quantize_dequant_softmax_twin,
+)
 from ..utils.int8_ops import clip_int8
 
 CYCLE_PER_ELEMENT = 2
@@ -77,6 +81,14 @@ def _get_quad_scales(state, sreg: int):
     if sreg >= 13:
         raise ConfigError("SFU sreg+3 out of range")
     return tuple(np.float32(state.scale_regs[sreg + idx]) for idx in range(4))
+
+
+def _runtime_twin_spec(state, kind: str):
+    specs = getattr(state, "runtime_twin_specs", {}) or {}
+    spec = specs.get(int(getattr(state, "current_pc", -1)))
+    if not spec or spec.get("kind") != kind or spec.get("mode") != "paper_exact":
+        return None
+    return spec
 
 
 def execute_layernorm(state, insn):
@@ -152,6 +164,12 @@ def execute_softmax(state, insn):
     x_shifted = x - x.max(axis=-1, keepdims=True)
     exp_x = np.exp(x_shifted).astype(np.float32)
     x_out = exp_x / exp_x.sum(axis=-1, keepdims=True)
+    softmax_spec = _runtime_twin_spec(state, "softmax")
+    if softmax_spec is not None:
+        x_out = quantize_dequant_softmax_twin(
+            x_out,
+            float(softmax_spec.get("range1_max", 1.0)),
+        ).astype(np.float32)
 
     # Requantize: round-half-to-even, clip to INT8
     if out_scale == np.float32(0):
@@ -195,6 +213,13 @@ def execute_gelu(state, insn):
     from scipy.special import erf
     sqrt2 = np.float32(np.sqrt(np.float32(2.0)))
     x_out = x * np.float32(0.5) * (np.float32(1.0) + erf(x / sqrt2).astype(np.float32))
+    gelu_spec = _runtime_twin_spec(state, "gelu")
+    if gelu_spec is not None:
+        x_out = quantize_dequant_gelu_twin(
+            x_out,
+            float(gelu_spec.get("positive_range_max", max(out_scale * 127.0, 1e-8))),
+            negative_extent=float(gelu_spec.get("negative_extent", 1e-8)),
+        ).astype(np.float32)
 
     # Requantize: round-half-to-even, clip to INT8
     if out_scale == np.float32(0):
@@ -242,6 +267,12 @@ def execute_softmax_attnv(state, insn):
     qkt_shifted = qkt - qkt.max(axis=-1, keepdims=True)
     exp_qkt = np.exp(qkt_shifted).astype(np.float32)
     softmax = exp_qkt / exp_qkt.sum(axis=-1, keepdims=True)
+    softmax_spec = _runtime_twin_spec(state, "softmax")
+    if softmax_spec is not None:
+        softmax = quantize_dequant_softmax_twin(
+            softmax,
+            float(softmax_spec.get("range1_max", 1.0)),
+        ).astype(np.float32)
     attn_v = np.matmul(softmax, v).astype(np.float32)
 
     if out_scale == np.float32(0):

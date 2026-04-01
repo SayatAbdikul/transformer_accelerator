@@ -156,6 +156,57 @@ class TestCompilerGuards:
         assert kt_total_3_heads < WBUF_SIZE, \
             f"3 heads K^T ({kt_total_3_heads}B) doesn't fit in WBUF ({WBUF_SIZE}B)"
 
+    def test_compiler_manifest_records_fc2_and_out_proj_requant_pc_options(self):
+        compiler = Compiler()
+        weight_name = "vit.encoder.layer.9.output.dense.weight"
+        codegen = SimpleNamespace(
+            trace_manifest={},
+            dram_layout={},
+            mem=SimpleNamespace(dram_temp_total=0),
+        )
+
+        manifest = compiler._build_compiler_manifest(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.linspace(0.01, 0.16, 16, dtype=np.float16),
+                ),
+            },
+            cal_scales={},
+            prescaled_biases={},
+            codegen=codegen,
+            bias_correction_biases=[],
+            weight_quantization_overrides={},
+            gelu_from_accum=False,
+            gelu_from_accum_blocks=None,
+            dequant_add_residual1_blocks=None,
+            fused_softmax_attnv_blocks=None,
+            fused_softmax_attnv_accum_out_proj=False,
+            requant_pc_qkv=False,
+            requant_pc_qkv_selection=None,
+            requant_pc_fc1=False,
+            requant_pc_fc1_blocks=None,
+            requant_pc_fc2=True,
+            requant_pc_fc2_blocks={9},
+            requant_pc_out_proj=True,
+            requant_pc_out_proj_blocks={10, 11},
+            requant_pc_weight_names={weight_name},
+            requant_pc_scale_tables={
+                weight_name: np.linspace(0.02, 0.32, 16, dtype=np.float16),
+            },
+            data_base=0,
+            input_offset=0,
+            pos_embed_patch_dram_offset=0,
+            pos_embed_cls_dram_offset=0,
+            cls_token_dram_offset=0,
+        )
+
+        assert manifest["compiler"]["options"]["requant_pc_fc2"] is True
+        assert manifest["compiler"]["options"]["requant_pc_fc2_blocks"] == [9]
+        assert manifest["compiler"]["options"]["requant_pc_out_proj"] is True
+        assert manifest["compiler"]["options"]["requant_pc_out_proj_blocks"] == [10, 11]
+        assert manifest["weights"][weight_name]["uses_requant_pc"] is True
+
 
 class TestBiasCorrection:
     class _TinyLinear(torch.nn.Module):

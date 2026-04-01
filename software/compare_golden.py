@@ -46,7 +46,16 @@ from taccel.quantizer.bias_correction import (
 )
 from taccel.quantizer.quantize import quantize_tensor, quantize_weights
 from taccel.quantizer.calibrate import calibrate_model, collect_layer_inputs
+from taccel.quantizer.hessian_guided import (
+    gelu_fc2_hessian_diag,
+    softmax_attn_v_hessian_diag,
+    weighted_quant_error_score,
+)
 from taccel.quantizer.smooth_quant import apply_smooth_quant, compute_smooth_factors
+from taccel.quantizer.twin_uniform import (
+    quantize_dequant_gelu_twin,
+    quantize_dequant_softmax_twin,
+)
 from taccel.compiler.tiler import pad_dim
 
 MODEL_NAME = "facebook/deit-tiny-patch16-224"
@@ -395,6 +404,152 @@ DIAGNOSTIC_PRESETS = {
             "trace_image_ids": "",
         },
     },
+    "imagenet_class0_ptq4vit_base": {
+        "description": "Current best late-MLP ImageNet class-0 control used for PTQ4ViT-inspired experiments",
+        "benchmark": {
+            "benchmark_dataset": "local_flat",
+            "benchmark_image_source": "local",
+            "local_benchmark_image_dir": IMAGENET_CLASS0_IMAGE_DIR,
+            "eval_image_ids": list(IMAGENET_CLASS0_SAMPLE_IDS),
+            "calibration_image_ids": list(IMAGENET_CLASS0_SAMPLE_IDS),
+        },
+        "compile_args": {
+            "softmax_calibration": "max",
+            "softmax_percentile": 99.0,
+            "softmax_min_prob": 1e-4,
+            "softmax_max_prob": 1.0,
+            "final_logit_calibration": "off",
+            "bias_correction": False,
+            "bias_correction_layers": "classifier",
+            "act_percentile_nodes": "final_ln:99.8,block9_ln2:99.0",
+            "output_aware_clipping_fc1_blocks": "9",
+            "output_aware_clipping_fc2_blocks": "",
+            "output_aware_clipping_classifier": False,
+            "output_aware_clipping_candidates": 31,
+            "output_aware_clipping_alpha_min": 0.5,
+            "adaround_fc1_blocks": "9",
+            "adaround_fc2_blocks": "",
+            "softmax_search_heads": "",
+            "softmax_search_objective": "local_prob",
+            "attn_v_calibration": "off",
+            "attn_v_percentile": 99.0,
+            "attn_v_safety_margin": 1.10,
+            "attn_v_search_blocks": "",
+            "attn_v_search_objective": "local_attn_v",
+            "gelu_output_calibration": "off",
+            "gelu_search_blocks": "9,10,11",
+            "gelu_search_objective": "downstream_residual2",
+            "hessian_calibration_images": 100,
+            "hessian_target_nodes": "",
+            "twin_uniform_softmax_blocks": "",
+            "twin_uniform_gelu_blocks": "",
+            "twin_uniform_mode": "off",
+            "twin_uniform_disable_hessian": False,
+            "gelu_from_accum": False,
+            "gelu_from_accum_blocks": "",
+            "dequant_add_residual1_blocks": "",
+            "dequant_add_residual1_scale_mode": "max",
+            "dequant_add_residual1_scale_percentile": 99.9,
+            "dequant_add_residual1_scale_alpha": 1.0,
+            "fused_softmax_attnv": False,
+            "fused_softmax_attnv_blocks": "",
+            "fused_softmax_attnv_accum_out_proj": False,
+            "per_head_qkv_calibration": False,
+            "value_head_calibration": "off",
+            "smoothquant_targets": "off",
+            "smoothquant_alpha": 0.5,
+            "smoothquant_blocks": "",
+            "requant_pc_qkv": False,
+            "requant_pc_qkv_blocks": "",
+            "requant_pc_qkv_heads": "",
+            "requant_pc_qkv_projections": "all",
+            "requant_pc_qkv_exclude": "",
+            "requant_pc_fc1": True,
+            "requant_pc_fc1_blocks": "8,9",
+            "requant_pc_fc2": False,
+            "requant_pc_fc2_blocks": "",
+            "requant_pc_out_proj": False,
+            "requant_pc_out_proj_blocks": "",
+            "fold_cls_pos_embed": False,
+        },
+        "trace": {
+            "trace_worst_k": 5,
+            "trace_image_ids": "",
+        },
+    },
+    "imagenet_class0_current_best_ptq": {
+        "description": "Alias for the canonical ImageNet class-0 PTQ control",
+        "benchmark": {
+            "benchmark_dataset": "local_flat",
+            "benchmark_image_source": "local",
+            "local_benchmark_image_dir": IMAGENET_CLASS0_IMAGE_DIR,
+            "eval_image_ids": list(IMAGENET_CLASS0_SAMPLE_IDS),
+            "calibration_image_ids": list(IMAGENET_CLASS0_SAMPLE_IDS),
+        },
+        "compile_args": {
+            "softmax_calibration": "max",
+            "softmax_percentile": 99.0,
+            "softmax_min_prob": 1e-4,
+            "softmax_max_prob": 1.0,
+            "final_logit_calibration": "off",
+            "bias_correction": False,
+            "bias_correction_layers": "classifier",
+            "act_percentile_nodes": "final_ln:99.8,block9_ln2:99.0",
+            "output_aware_clipping_fc1_blocks": "9",
+            "output_aware_clipping_fc2_blocks": "",
+            "output_aware_clipping_classifier": False,
+            "output_aware_clipping_candidates": 31,
+            "output_aware_clipping_alpha_min": 0.5,
+            "adaround_fc1_blocks": "9",
+            "adaround_fc2_blocks": "",
+            "softmax_search_heads": "",
+            "softmax_search_objective": "local_prob",
+            "attn_v_calibration": "off",
+            "attn_v_percentile": 99.0,
+            "attn_v_safety_margin": 1.10,
+            "attn_v_search_blocks": "",
+            "attn_v_search_objective": "local_attn_v",
+            "gelu_output_calibration": "off",
+            "gelu_search_blocks": "9,10,11",
+            "gelu_search_objective": "downstream_residual2",
+            "hessian_calibration_images": 100,
+            "hessian_target_nodes": "",
+            "twin_uniform_softmax_blocks": "",
+            "twin_uniform_gelu_blocks": "",
+            "twin_uniform_mode": "off",
+            "twin_uniform_disable_hessian": False,
+            "gelu_from_accum": False,
+            "gelu_from_accum_blocks": "",
+            "dequant_add_residual1_blocks": "",
+            "dequant_add_residual1_scale_mode": "max",
+            "dequant_add_residual1_scale_percentile": 99.9,
+            "dequant_add_residual1_scale_alpha": 1.0,
+            "fused_softmax_attnv": False,
+            "fused_softmax_attnv_blocks": "",
+            "fused_softmax_attnv_accum_out_proj": False,
+            "per_head_qkv_calibration": False,
+            "value_head_calibration": "off",
+            "smoothquant_targets": "off",
+            "smoothquant_alpha": 0.5,
+            "smoothquant_blocks": "",
+            "requant_pc_qkv": False,
+            "requant_pc_qkv_blocks": "",
+            "requant_pc_qkv_heads": "",
+            "requant_pc_qkv_projections": "all",
+            "requant_pc_qkv_exclude": "",
+            "requant_pc_fc1": True,
+            "requant_pc_fc1_blocks": "8,9",
+            "requant_pc_fc2": False,
+            "requant_pc_fc2_blocks": "",
+            "requant_pc_out_proj": False,
+            "requant_pc_out_proj_blocks": "",
+            "fold_cls_pos_embed": False,
+        },
+        "trace": {
+            "trace_worst_k": 5,
+            "trace_image_ids": "",
+        },
+    },
 }
 
 
@@ -472,9 +627,12 @@ def build_run_config(
             "bias_correction_layers": args.bias_correction_layers,
             "act_percentile_nodes": args.act_percentile_nodes,
             "output_aware_clipping_fc1_blocks": args.output_aware_clipping_fc1_blocks,
+            "output_aware_clipping_fc2_blocks": args.output_aware_clipping_fc2_blocks,
+            "output_aware_clipping_classifier": bool(args.output_aware_clipping_classifier),
             "output_aware_clipping_candidates": int(args.output_aware_clipping_candidates),
             "output_aware_clipping_alpha_min": float(args.output_aware_clipping_alpha_min),
             "adaround_fc1_blocks": args.adaround_fc1_blocks,
+            "adaround_fc2_blocks": args.adaround_fc2_blocks,
             "softmax_search_heads": args.softmax_search_heads,
             "softmax_search_objective": args.softmax_search_objective,
             "attn_v_calibration": args.attn_v_calibration,
@@ -495,6 +653,13 @@ def build_run_config(
             "value_head_calibration": args.value_head_calibration,
             "gelu_output_calibration": args.gelu_output_calibration,
             "gelu_search_blocks": args.gelu_search_blocks,
+            "gelu_search_objective": args.gelu_search_objective,
+            "hessian_calibration_images": int(args.hessian_calibration_images),
+            "hessian_target_nodes": args.hessian_target_nodes,
+            "twin_uniform_softmax_blocks": args.twin_uniform_softmax_blocks,
+            "twin_uniform_gelu_blocks": args.twin_uniform_gelu_blocks,
+            "twin_uniform_mode": args.twin_uniform_mode,
+            "twin_uniform_disable_hessian": bool(args.twin_uniform_disable_hessian),
             "smoothquant_targets": args.smoothquant_targets,
             "smoothquant_alpha": float(args.smoothquant_alpha),
             "smoothquant_blocks": (
@@ -508,6 +673,8 @@ def build_run_config(
             "requant_pc_qkv_exclude": args.requant_pc_qkv_exclude,
             "requant_pc_fc1": bool(args.requant_pc_fc1),
             "requant_pc_fc1_blocks": args.requant_pc_fc1_blocks,
+            "requant_pc_fc2": bool(args.requant_pc_fc2),
+            "requant_pc_fc2_blocks": args.requant_pc_fc2_blocks,
             "requant_pc_qkv_selection": (
                 [
                     {"block": int(block), "projection": proj, "head": int(head)}
@@ -516,6 +683,7 @@ def build_run_config(
                 if requant_pc_qkv_selection is not None else None
             ),
             "requant_pc_out_proj": bool(args.requant_pc_out_proj),
+            "requant_pc_out_proj_blocks": args.requant_pc_out_proj_blocks,
             "fold_cls_pos_embed": bool(args.fold_cls_pos_embed),
         },
         "trace_flags": {
@@ -551,10 +719,19 @@ def preset_compile_kwargs(preset):
         "output_aware_clipping_fc1_blocks": parse_csv_int_set(
             compile_args.get("output_aware_clipping_fc1_blocks", "")
         ),
+        "output_aware_clipping_fc2_blocks": parse_csv_int_set(
+            compile_args.get("output_aware_clipping_fc2_blocks", "")
+        ),
+        "output_aware_clipping_classifier": bool(
+            compile_args.get("output_aware_clipping_classifier", False)
+        ),
         "output_aware_clipping_candidates": int(compile_args.get("output_aware_clipping_candidates", 25)),
         "output_aware_clipping_alpha_min": float(compile_args.get("output_aware_clipping_alpha_min", 0.5)),
         "adaround_fc1_blocks": parse_csv_int_set(
             compile_args.get("adaround_fc1_blocks", "")
+        ),
+        "adaround_fc2_blocks": parse_csv_int_set(
+            compile_args.get("adaround_fc2_blocks", "")
         ),
         "softmax_search_heads": (
             {
@@ -578,6 +755,17 @@ def preset_compile_kwargs(preset):
             {int(part) for part in compile_args["gelu_search_blocks"].split(",") if part.strip()}
             if compile_args["gelu_search_blocks"] else None
         ),
+        "gelu_search_objective": compile_args.get("gelu_search_objective", "downstream_residual2"),
+        "hessian_calibration_images": int(compile_args.get("hessian_calibration_images", 0) or 0),
+        "hessian_target_nodes": compile_args.get("hessian_target_nodes", ""),
+        "twin_uniform_softmax_blocks": parse_csv_int_set(
+            compile_args.get("twin_uniform_softmax_blocks", "")
+        ),
+        "twin_uniform_gelu_blocks": parse_csv_int_set(
+            compile_args.get("twin_uniform_gelu_blocks", "")
+        ),
+        "twin_uniform_mode": compile_args.get("twin_uniform_mode", "off"),
+        "twin_uniform_disable_hessian": compile_args.get("twin_uniform_disable_hessian", False),
         "value_head_mode": compile_args["value_head_calibration"],
         "per_head_qkv_calibration": compile_args["per_head_qkv_calibration"],
         "gelu_from_accum": compile_args["gelu_from_accum"],
@@ -604,7 +792,10 @@ def preset_compile_kwargs(preset):
         ),
         "requant_pc_fc1": compile_args["requant_pc_fc1"],
         "requant_pc_fc1_blocks": parse_csv_int_set(compile_args["requant_pc_fc1_blocks"]),
+        "requant_pc_fc2": compile_args.get("requant_pc_fc2", False),
+        "requant_pc_fc2_blocks": parse_csv_int_set(compile_args.get("requant_pc_fc2_blocks", "")),
         "requant_pc_out_proj": compile_args["requant_pc_out_proj"],
+        "requant_pc_out_proj_blocks": parse_csv_int_set(compile_args.get("requant_pc_out_proj_blocks", "")),
     }
 
 
@@ -991,21 +1182,47 @@ def build_fc1_weight_quantization_overrides(
     alpha_min: float,
 ):
     """Collect activation samples and build FC1 quantization overrides."""
+    return build_block_dense_weight_quantization_overrides(
+        model,
+        sample_inputs,
+        clip_block_indices,
+        module_suffix="intermediate.dense",
+        requant_pc_enabled=requant_pc_fc1,
+        requant_pc_blocks=requant_pc_fc1_blocks,
+        adaround_block_indices=adaround_block_indices,
+        n_candidates=n_candidates,
+        alpha_min=alpha_min,
+    )
+
+
+def build_block_dense_weight_quantization_overrides(
+    model,
+    sample_inputs: list,
+    clip_block_indices,
+    *,
+    module_suffix: str,
+    requant_pc_enabled: bool,
+    requant_pc_blocks,
+    adaround_block_indices=None,
+    n_candidates: int,
+    alpha_min: float,
+):
+    """Collect activation samples and build block-dense quantization overrides."""
     clip_blocks = set(clip_block_indices or [])
     adaround_blocks = set(adaround_block_indices or [])
     target_blocks = sorted(clip_blocks.union(adaround_blocks))
     if not target_blocks:
         return {}
-    module_names = [f"vit.encoder.layer.{block_idx}.intermediate.dense" for block_idx in target_blocks]
+    module_names = [f"vit.encoder.layer.{block_idx}.{module_suffix}" for block_idx in target_blocks]
     inputs_by_module = collect_layer_inputs(model, sample_inputs, module_names)
     overrides = {}
     for block_idx in target_blocks:
-        module_name = f"vit.encoder.layer.{block_idx}.intermediate.dense"
+        module_name = f"vit.encoder.layer.{block_idx}.{module_suffix}"
         overrides[f"{module_name}.weight"] = {
             "mode": "output_aware_clipping",
             "per_channel": bool(
-                requant_pc_fc1 and (
-                    requant_pc_fc1_blocks is None or block_idx in requant_pc_fc1_blocks
+                requant_pc_enabled and (
+                    requant_pc_blocks is None or block_idx in requant_pc_blocks
                 )
             ),
             "n_candidates": int(n_candidates if block_idx in clip_blocks else 1),
@@ -1014,6 +1231,30 @@ def build_fc1_weight_quantization_overrides(
             "adaround": bool(block_idx in adaround_blocks),
         }
     return overrides
+
+
+def build_classifier_weight_quantization_override(
+    model,
+    sample_inputs: list,
+    *,
+    enabled: bool,
+    n_candidates: int,
+    alpha_min: float,
+):
+    """Collect classifier inputs and build a per-tensor clipping override."""
+    if not enabled:
+        return {}
+    inputs_by_module = collect_layer_inputs(model, sample_inputs, ["classifier"])
+    return {
+        "classifier.weight": {
+            "mode": "output_aware_clipping",
+            "per_channel": False,
+            "n_candidates": int(n_candidates),
+            "alpha_min": float(alpha_min),
+            "calibration_inputs": inputs_by_module["classifier"],
+            "adaround": False,
+        }
+    }
 
 
 def fold_pos_embed_int8(base_rows_fp32: np.ndarray, pos_rows_fp32: np.ndarray, act_scale: float) -> np.ndarray:
@@ -1246,6 +1487,55 @@ def quantize_dequant_tensor(tensor: np.ndarray, scale: float) -> np.ndarray:
         return np.zeros_like(tensor, dtype=np.float32)
     q = np.clip(np.round(tensor / scale), -128, 127).astype(np.int8)
     return q.astype(np.float32) * np.float32(scale)
+
+
+def quantize_dequant_softmax_candidate(
+    tensor: np.ndarray,
+    max_prob: float,
+    *,
+    twin_uniform_mode: str = "off",
+):
+    """Quantize-dequant a softmax tensor with either uniform or twin-uniform."""
+    if twin_uniform_mode == "paper_exact":
+        qdq, meta = quantize_dequant_softmax_twin(
+            tensor,
+            max_prob,
+            return_metadata=True,
+        )
+        return qdq.astype(np.float32), meta
+    scale = max(float(max_prob), 1e-8) / 127.0
+    q = np.clip(np.round(np.asarray(tensor, dtype=np.float32) / scale), 0, 127).astype(np.int8)
+    meta = {
+        "mode": "uniform",
+        "scale": float(scale),
+        "saturation_rate": float(np.mean(q == 127)) if q.size else 0.0,
+        "zero_fraction": float(np.mean(q == 0)) if q.size else 1.0,
+    }
+    return q.astype(np.float32) * np.float32(scale), meta
+
+
+def quantize_dequant_gelu_candidate(
+    tensor: np.ndarray,
+    positive_range_max: float,
+    *,
+    twin_uniform_mode: str = "off",
+    negative_extent: float | None = None,
+):
+    """Quantize-dequant a GELU tensor with either uniform or twin-uniform."""
+    if twin_uniform_mode == "paper_exact":
+        qdq, meta = quantize_dequant_gelu_twin(
+            tensor,
+            positive_range_max,
+            negative_extent=negative_extent,
+            return_metadata=True,
+        )
+        return qdq.astype(np.float32), meta
+    scale = max(float(positive_range_max), 1e-8) / 127.0
+    qdq = quantize_dequant_tensor(tensor, scale)
+    meta = quantization_diagnostics(tensor, scale)
+    meta["mode"] = "uniform"
+    meta["scale"] = float(scale)
+    return qdq.astype(np.float32), meta
 
 
 def quantization_diagnostics(tensor: np.ndarray, scale: float) -> dict:
@@ -2025,6 +2315,10 @@ def _uses_downstream_attn_v_objective(objective: str) -> bool:
     return objective in {"downstream_out_proj", "tail_out_proj", "tail_attn_v"}
 
 
+def _uses_replay_softmax_objective(objective: str) -> bool:
+    return objective in {"hessian_prob"} or _uses_downstream_softmax_objective(objective)
+
+
 def calibrate_softmax_scales(
     model,
     sample_inputs: list,
@@ -2059,7 +2353,7 @@ def calibrate_softmax_scales(
                 softmax_probs[key] = default_prob
                 debug[key] = {"label": "default_skip", "max_prob": default_prob}
                 continue
-            if _uses_downstream_softmax_objective(search_objective):
+            if _uses_replay_softmax_objective(search_objective):
                 context = downstream_contexts.get(key)
                 if context is None:
                     best_prob, best_debug = default_prob, {
@@ -2092,6 +2386,7 @@ def calibrate_softmax_scales(
                         min_prob=min_prob,
                         max_prob=max_prob,
                         search_objective=search_objective,
+                        twin_uniform_mode=context.get("twin_uniform_mode", "off"),
                     )
                     best_debug["objective"] = search_objective
             else:
@@ -2501,6 +2796,7 @@ def select_best_softmax_prob_downstream(
     min_prob: float = 1e-4,
     max_prob: float = 1.0,
     search_objective: str = "downstream_out_proj",
+    twin_uniform_mode: str = "off",
 ) -> tuple:
     """Choose a softmax target by maximizing downstream block out_proj cosine."""
     flat = np.concatenate([sample["heads"][head_idx]["softmax"].reshape(-1) for sample in block_samples]).astype(np.float32)
@@ -2517,38 +2813,46 @@ def select_best_softmax_prob_downstream(
     best = None
     for label, raw in candidate_specs:
         target_prob = float(np.clip(raw, min_prob, max_prob))
-        softmax_scale = target_prob / 127.0
         out_proj_cosines = []
         attn_v_cosines = []
         sat_rates = []
+        hessian_scores = []
         for sample in block_samples:
             head_outputs = []
             for h in range(NUM_HEADS):
-                soft_scale = (
-                    softmax_scale
-                    if h == head_idx
-                    else float(np.clip(default_head_probs[h], min_prob, max_prob)) / 127.0
-                )
                 value_scale = value_scales[h]
-                _, variant_tensors = replay_attention_head_variants(
-                    sample["heads"][h]["softmax"],
-                    sample["heads"][h]["value"],
-                    sample["heads"][h]["attn_v"],
-                    soft_scale,
-                    value_scale,
-                    attn_v_scale,
-                )
-                head_outputs.append(variant_tensors["qdq_softmax_value"]["attn_v_qdq"])
+                value_qdq = quantize_dequant_tensor(sample["heads"][h]["value"], value_scale)
                 if h == head_idx:
+                    softmax_qdq, soft_meta = quantize_dequant_softmax_candidate(
+                        sample["heads"][h]["softmax"],
+                        target_prob,
+                        twin_uniform_mode=twin_uniform_mode,
+                    )
+                else:
+                    softmax_qdq, _ = quantize_dequant_softmax_candidate(
+                        sample["heads"][h]["softmax"],
+                        float(np.clip(default_head_probs[h], min_prob, max_prob)),
+                        twin_uniform_mode="off",
+                    )
+                    soft_meta = None
+                attn_v_raw = (softmax_qdq @ value_qdq).astype(np.float32)
+                attn_v_qdq = quantize_dequant_tensor(attn_v_raw, attn_v_scale)
+                head_outputs.append(attn_v_qdq)
+                if h == head_idx:
+                    hessian_scores.append(
+                        weighted_quant_error_score(
+                            sample["heads"][h]["softmax"],
+                            softmax_qdq,
+                            softmax_attn_v_hessian_diag(sample["heads"][h]["softmax"], value_qdq),
+                        )
+                    )
                     attn_v_cosines.append(
                         tensor_error_metrics(
                             sample["heads"][h]["attn_v"],
-                            variant_tensors["qdq_softmax_value"]["attn_v_qdq"],
+                            attn_v_qdq,
                         )["cosine_sim"]
                     )
-                    sat_rates.append(
-                        quantization_diagnostics(sample["heads"][h]["softmax"], softmax_scale)["qdq_saturation_rate"]
-                    )
+                    sat_rates.append(float(soft_meta.get("saturation_rate", 0.0)) if soft_meta else 0.0)
 
             out_proj_metrics = replay_block_downstream_variants(
                 {"candidate": head_outputs},
@@ -2568,8 +2872,22 @@ def select_best_softmax_prob_downstream(
             "min_attn_v_cosine": float(np.min(attn_v_cosines)),
             "mean_saturation_rate": float(np.mean(sat_rates)),
             "mean_attn_v_cosine": float(np.mean(attn_v_cosines)),
+            "mean_hessian_score": float(np.mean(hessian_scores)),
         }
-        if search_objective == "tail_out_proj":
+        if search_objective == "hessian_prob":
+            score = (
+                candidate["mean_hessian_score"],
+                candidate["mean_saturation_rate"],
+                -candidate["mean_attn_v_cosine"],
+                -candidate["mean_out_proj_cosine"],
+            )
+            best_score = None if best is None else (
+                best["mean_hessian_score"],
+                best["mean_saturation_rate"],
+                -best["mean_attn_v_cosine"],
+                -best["mean_out_proj_cosine"],
+            )
+        elif search_objective == "tail_out_proj":
             score = (
                 -candidate["min_out_proj_cosine"],
                 -candidate["mean_out_proj_cosine"],
@@ -2955,15 +3273,23 @@ def select_best_gelu_output_scale(
     fc2_scale: float,
     fc2_weight: np.ndarray,
     fc2_bias: np.ndarray,
+    *,
+    search_objective: str = "downstream_residual2",
+    twin_uniform_mode: str = "off",
 ) -> tuple:
     """Choose a GELU output scale by maximizing downstream residual2 cosine."""
     flat = np.concatenate([np.abs(sample["gelu"]).reshape(-1) for sample in block_samples]).astype(np.float32)
+    negative_extent = max(
+        float(max(-np.min(sample["gelu"]), 0.0))
+        for sample in block_samples
+    ) if block_samples else 1e-8
     candidate_specs = [
         ("default", default_scale * 127.0),
         ("default_x0.95", default_scale * 127.0 * 0.95),
         ("default_x0.90", default_scale * 127.0 * 0.90),
         ("p99.9", float(np.percentile(flat, 99.9))),
         ("p99.5", float(np.percentile(flat, 99.5))),
+        ("p99.0", float(np.percentile(flat, 99.0))),
     ]
 
     best = None
@@ -2972,14 +3298,27 @@ def select_best_gelu_output_scale(
         residual2_cosines = []
         fc2_cosines = []
         sat_rates = []
+        hessian_scores = []
         for sample in block_samples:
-            gelu_qdq = quantize_dequant_tensor(sample["gelu"], scale)
+            gelu_qdq, gelu_meta = quantize_dequant_gelu_candidate(
+                sample["gelu"],
+                scale * 127.0,
+                twin_uniform_mode=twin_uniform_mode,
+                negative_extent=negative_extent,
+            )
             fc2_raw = (gelu_qdq @ fc2_weight.T + fc2_bias).astype(np.float32)
             fc2_qdq = quantize_dequant_tensor(fc2_raw, fc2_scale)
             residual2 = sample["residual1"].astype(np.float32) + fc2_qdq
             residual2_cosines.append(tensor_error_metrics(sample["residual2"], residual2)["cosine_sim"])
             fc2_cosines.append(tensor_error_metrics(sample["fc2"], fc2_qdq)["cosine_sim"])
-            sat_rates.append(quantization_diagnostics(sample["gelu"], scale)["qdq_saturation_rate"])
+            sat_rates.append(float(gelu_meta.get("saturation_rate", 0.0)))
+            hessian_scores.append(
+                weighted_quant_error_score(
+                    sample["gelu"],
+                    gelu_qdq,
+                    gelu_fc2_hessian_diag(sample["gelu"], fc2_weight),
+                )
+            )
 
         candidate = {
             "label": label,
@@ -2987,17 +3326,33 @@ def select_best_gelu_output_scale(
             "mean_residual2_cosine": float(np.mean(residual2_cosines)),
             "mean_fc2_cosine": float(np.mean(fc2_cosines)),
             "mean_saturation_rate": float(np.mean(sat_rates)),
+            "mean_hessian_score": float(np.mean(hessian_scores)),
         }
-        score = (
-            -candidate["mean_residual2_cosine"],
-            candidate["mean_saturation_rate"],
-            -candidate["mean_fc2_cosine"],
-        )
-        if best is None or score < (
-            -best["mean_residual2_cosine"],
-            best["mean_saturation_rate"],
-            -best["mean_fc2_cosine"],
-        ):
+        if search_objective == "hessian_output":
+            score = (
+                candidate["mean_hessian_score"],
+                candidate["mean_saturation_rate"],
+                -candidate["mean_fc2_cosine"],
+                -candidate["mean_residual2_cosine"],
+            )
+            best_score = None if best is None else (
+                best["mean_hessian_score"],
+                best["mean_saturation_rate"],
+                -best["mean_fc2_cosine"],
+                -best["mean_residual2_cosine"],
+            )
+        else:
+            score = (
+                -candidate["mean_residual2_cosine"],
+                candidate["mean_saturation_rate"],
+                -candidate["mean_fc2_cosine"],
+            )
+            best_score = None if best is None else (
+                -best["mean_residual2_cosine"],
+                best["mean_saturation_rate"],
+                -best["mean_fc2_cosine"],
+            )
+        if best is None or score < best_score:
             best = candidate
     return best["scale"], best
 
@@ -3266,6 +3621,69 @@ def build_calibration_scales(calibration, softmax_max_probs: dict = None,
     return scales
 
 
+def build_runtime_twin_uniform_manifest(
+    program,
+    *,
+    softmax_max_probs: dict,
+    cal_scales: dict,
+    twin_uniform_softmax_blocks,
+    twin_uniform_gelu_blocks,
+    twin_uniform_mode: str,
+    block_replay_samples: dict,
+):
+    """Build per-PC twin-uniform specs from compare_golden selections."""
+    if twin_uniform_mode == "off":
+        return {"mode": "off", "softmax": {}, "gelu": {}}
+
+    softmax_blocks = set(twin_uniform_softmax_blocks or [])
+    gelu_blocks = set(twin_uniform_gelu_blocks or [])
+    if not softmax_blocks and not gelu_blocks:
+        return {"mode": twin_uniform_mode, "softmax": {}, "gelu": {}}
+
+    softmax_specs = {}
+    gelu_specs = {}
+
+    for pc, events in sorted((program.trace_manifest or {}).items()):
+        for event in events:
+            node_name = str(event.get("node_name", ""))
+            softmax_match = re.match(r"block(\d+)_head(\d+)_softmax$", node_name)
+            if softmax_match:
+                block_idx = int(softmax_match.group(1))
+                head_idx = int(softmax_match.group(2))
+                if block_idx in softmax_blocks and (block_idx, head_idx) in softmax_max_probs:
+                    softmax_specs[str(pc)] = {
+                        "mode": twin_uniform_mode,
+                        "range1_max": float(softmax_max_probs[(block_idx, head_idx)]),
+                        "block": block_idx,
+                        "head": head_idx,
+                        "node_name": node_name,
+                    }
+                continue
+
+            gelu_match = re.match(r"block(\d+)_gelu$", node_name)
+            if gelu_match:
+                block_idx = int(gelu_match.group(1))
+                if block_idx not in gelu_blocks:
+                    continue
+                block_samples = block_replay_samples.get(block_idx, [])
+                negative_extent = max(
+                    [float(max(-np.min(sample["gelu"]), 0.0)) for sample in block_samples] or [1e-8]
+                )
+                gelu_specs[str(pc)] = {
+                    "mode": twin_uniform_mode,
+                    "positive_range_max": float(cal_scales.get(node_name, 1.0 / 127.0) * 127.0),
+                    "negative_extent": float(max(negative_extent, 1e-8)),
+                    "block": block_idx,
+                    "node_name": node_name,
+                }
+
+    return {
+        "mode": twin_uniform_mode,
+        "softmax": softmax_specs,
+        "gelu": gelu_specs,
+    }
+
+
 def compile_model(
     model,
     state_dict,
@@ -3280,9 +3698,12 @@ def compile_model(
     bias_correction_layers="",
     activation_percentile_nodes=None,
     output_aware_clipping_fc1_blocks=None,
+    output_aware_clipping_fc2_blocks=None,
+    output_aware_clipping_classifier=False,
     output_aware_clipping_candidates=25,
     output_aware_clipping_alpha_min=0.5,
     adaround_fc1_blocks=None,
+    adaround_fc2_blocks=None,
     softmax_search_heads=None,
     softmax_search_objective="local_prob",
     attn_v_mode="max",
@@ -3292,6 +3713,13 @@ def compile_model(
     attn_v_search_objective="local_attn_v",
     gelu_output_mode="off",
     gelu_search_blocks=None,
+    gelu_search_objective="downstream_residual2",
+    hessian_calibration_images=0,
+    hessian_target_nodes="",
+    twin_uniform_softmax_blocks=None,
+    twin_uniform_gelu_blocks=None,
+    twin_uniform_mode="off",
+    twin_uniform_disable_hessian=False,
     value_head_mode="off",
     per_head_qkv_calibration=False,
     gelu_from_accum=False,
@@ -3309,7 +3737,10 @@ def compile_model(
     requant_pc_qkv_selection=None,
     requant_pc_fc1=False,
     requant_pc_fc1_blocks=None,
+    requant_pc_fc2=False,
+    requant_pc_fc2_blocks=None,
     requant_pc_out_proj=False,
+    requant_pc_out_proj_blocks=None,
 ):
     """Compile the model to a ProgramBinary using calibration from sample images.
 
@@ -3363,30 +3794,49 @@ def compile_model(
     qkv_head_scales = {}
     if per_head_qkv_calibration:
         qkv_head_scales = calibrate_qkv_head_scales(compile_model_ref, sample_inputs)
-    if softmax_mode == "search" and _uses_downstream_softmax_objective(softmax_search_objective) and not softmax_search_heads:
-        softmax_search_heads = {(11, 1), (11, 2)}
+    if softmax_mode == "search" and _uses_replay_softmax_objective(softmax_search_objective) and not softmax_search_heads:
+        softmax_search_heads = (
+            {(11, 0), (11, 1), (11, 2)}
+            if softmax_search_objective == "hessian_prob"
+            else {(11, 1), (11, 2)}
+        )
     if attn_v_mode == "search" and _uses_downstream_attn_v_objective(attn_v_search_objective) and attn_v_search_blocks is None:
         attn_v_search_blocks = {11}
     if gelu_output_mode == "search" and gelu_search_blocks is None:
-        gelu_search_blocks = {9, 10, 11}
+        gelu_search_blocks = {9, 10} if gelu_search_objective == "hessian_output" else {9, 10, 11}
+    if twin_uniform_mode != "off":
+        if twin_uniform_softmax_blocks is None:
+            twin_uniform_softmax_blocks = {11}
+        if twin_uniform_gelu_blocks is None:
+            twin_uniform_gelu_blocks = {9, 10}
+    if hessian_calibration_images and hessian_calibration_images > 0:
+        replay_sample_inputs = sample_inputs[: min(len(sample_inputs), int(hessian_calibration_images))]
+    else:
+        replay_sample_inputs = sample_inputs
 
     downstream_contexts = {}
     block_replay_samples = {}
     needed_blocks = set()
-    if softmax_mode == "search" and _uses_downstream_softmax_objective(softmax_search_objective):
+    if softmax_mode == "search" and _uses_replay_softmax_objective(softmax_search_objective):
         needed_blocks.update(layer_idx for layer_idx, _ in softmax_search_heads)
     if attn_v_mode == "search" and _uses_downstream_attn_v_objective(attn_v_search_objective):
         needed_blocks.update(attn_v_search_blocks)
     if gelu_output_mode == "search":
         needed_blocks.update(gelu_search_blocks)
+    if twin_uniform_mode != "off" and twin_uniform_gelu_blocks is not None:
+        needed_blocks.update(twin_uniform_gelu_blocks)
     if dequant_add_residual1_blocks is not None and dequant_add_residual1_scale_mode != "default":
         needed_blocks.update(dequant_add_residual1_blocks)
     if fused_softmax_attnv_accum_out_proj and fused_softmax_attnv_blocks is not None:
         needed_blocks.update(fused_softmax_attnv_blocks)
     if needed_blocks:
-        block_replay_samples = collect_block_replay_tensors(compile_model_ref, sample_inputs, sorted(needed_blocks))
+        block_replay_samples = collect_block_replay_tensors(
+            compile_model_ref,
+            replay_sample_inputs,
+            sorted(needed_blocks),
+        )
 
-    if softmax_mode == "search" and _uses_downstream_softmax_objective(softmax_search_objective):
+    if softmax_mode == "search" and _uses_replay_softmax_objective(softmax_search_objective):
         value_scales_by_head = default_value_head_scales(
             calibration,
             qkv_head_scales=qkv_head_scales,
@@ -3406,6 +3856,16 @@ def compile_model(
                 "out_proj_scale": out_proj_scale,
                 "out_proj_weight": layer.weight.detach().cpu().numpy().astype(np.float32),
                 "out_proj_bias": layer.bias.detach().cpu().numpy().astype(np.float32),
+                "twin_uniform_mode": (
+                    twin_uniform_mode
+                    if (
+                        not twin_uniform_disable_hessian
+                        and twin_uniform_mode != "off"
+                        and twin_uniform_softmax_blocks is not None
+                        and layer_idx in twin_uniform_softmax_blocks
+                    )
+                    else "off"
+                ),
             }
 
     softmax_max_probs, qkt_max_abs, softmax_debug = calibrate_softmax_scales(
@@ -3512,6 +3972,17 @@ def compile_model(
                 fc2_scale=fc2_scale,
                 fc2_weight=layer.weight.detach().cpu().numpy().astype(np.float32),
                 fc2_bias=layer.bias.detach().cpu().numpy().astype(np.float32),
+                search_objective=gelu_search_objective,
+                twin_uniform_mode=(
+                    twin_uniform_mode
+                    if (
+                        not twin_uniform_disable_hessian
+                        and twin_uniform_mode != "off"
+                        and twin_uniform_gelu_blocks is not None
+                        and block_idx in twin_uniform_gelu_blocks
+                    )
+                    else "off"
+                ),
             )
             gelu_block_scales[block_idx] = best_scale
             gelu_debug[block_idx] = best_debug
@@ -3669,13 +4140,25 @@ def compile_model(
                 f"(experimental){' [' + sample + (' ...' if selected > 6 else '') + ']' if sample else ''}"
             )
     if requant_pc_out_proj:
-        print("  REQUANT_PC: enabled for out_proj matmuls (experimental)")
+        shown_out_proj_blocks = (
+            ",".join(str(block_idx) for block_idx in sorted(requant_pc_out_proj_blocks))
+            if requant_pc_out_proj_blocks is not None else "all"
+        )
+        print(
+            f"  REQUANT_PC: enabled for out_proj matmuls blocks={shown_out_proj_blocks} (experimental)"
+        )
     if requant_pc_fc1:
         shown_fc1_blocks = (
             ",".join(str(block_idx) for block_idx in sorted(requant_pc_fc1_blocks))
             if requant_pc_fc1_blocks is not None else "all"
         )
         print(f"  REQUANT_PC: enabled for FC1 matmuls blocks={shown_fc1_blocks} (experimental)")
+    if requant_pc_fc2:
+        shown_fc2_blocks = (
+            ",".join(str(block_idx) for block_idx in sorted(requant_pc_fc2_blocks))
+            if requant_pc_fc2_blocks is not None else "all"
+        )
+        print(f"  REQUANT_PC: enabled for FC2 matmuls blocks={shown_fc2_blocks} (experimental)")
     if fused_softmax_attnv_blocks is not None:
         print(
             "  Fused SOFTMAX_ATTNV blocks: "
@@ -3720,8 +4203,14 @@ def compile_model(
             print(f"  Residual1 scales: {shown}")
 
     weight_quantization_overrides = {}
-    if output_aware_clipping_fc1_blocks is not None or adaround_fc1_blocks is not None:
-        weight_quantization_overrides = build_fc1_weight_quantization_overrides(
+    if (
+        output_aware_clipping_fc1_blocks is not None
+        or adaround_fc1_blocks is not None
+        or output_aware_clipping_fc2_blocks is not None
+        or adaround_fc2_blocks is not None
+        or output_aware_clipping_classifier
+    ):
+        weight_quantization_overrides.update(build_fc1_weight_quantization_overrides(
             compile_model_ref,
             sample_inputs,
             output_aware_clipping_fc1_blocks,
@@ -3730,7 +4219,25 @@ def compile_model(
             requant_pc_fc1_blocks=requant_pc_fc1_blocks,
             n_candidates=output_aware_clipping_candidates,
             alpha_min=output_aware_clipping_alpha_min,
-        )
+        ))
+        weight_quantization_overrides.update(build_block_dense_weight_quantization_overrides(
+            compile_model_ref,
+            sample_inputs,
+            output_aware_clipping_fc2_blocks,
+            module_suffix="output.dense",
+            requant_pc_enabled=requant_pc_fc2,
+            requant_pc_blocks=requant_pc_fc2_blocks,
+            adaround_block_indices=adaround_fc2_blocks,
+            n_candidates=output_aware_clipping_candidates,
+            alpha_min=output_aware_clipping_alpha_min,
+        ))
+        weight_quantization_overrides.update(build_classifier_weight_quantization_override(
+            compile_model_ref,
+            sample_inputs,
+            enabled=output_aware_clipping_classifier,
+            n_candidates=output_aware_clipping_candidates,
+            alpha_min=output_aware_clipping_alpha_min,
+        ))
         if output_aware_clipping_fc1_blocks is not None:
             shown = ",".join(str(block_idx) for block_idx in sorted(output_aware_clipping_fc1_blocks))
             print(
@@ -3749,6 +4256,26 @@ def compile_model(
         if adaround_fc1_blocks is not None:
             shown = ",".join(str(block_idx) for block_idx in sorted(adaround_fc1_blocks))
             print(f"  AdaRound FC1 blocks={shown} (experimental)")
+        if output_aware_clipping_fc2_blocks is not None:
+            shown = ",".join(str(block_idx) for block_idx in sorted(output_aware_clipping_fc2_blocks))
+            print(
+                "  Output-aware clipping FC2 blocks="
+                f"{shown} candidates={output_aware_clipping_candidates} alpha_min={output_aware_clipping_alpha_min:.2f}"
+            )
+            if requant_pc_fc2:
+                pc_blocks = (
+                    set(range(DEPTH)) if requant_pc_fc2_blocks is None else set(requant_pc_fc2_blocks)
+                )
+                mode_summary = " ".join(
+                    f"b{block_idx}={'pc' if block_idx in pc_blocks else 'tensor'}"
+                    for block_idx in sorted(output_aware_clipping_fc2_blocks)
+                )
+                print(f"  Output-aware clipping FC2 modes: {mode_summary}")
+        if adaround_fc2_blocks is not None:
+            shown = ",".join(str(block_idx) for block_idx in sorted(adaround_fc2_blocks))
+            print(f"  AdaRound FC2 blocks={shown} (experimental)")
+        if output_aware_clipping_classifier:
+            print("  Output-aware clipping classifier: enabled")
 
     bias_correction_targets = []
     bias_corrections = None
@@ -3807,9 +4334,22 @@ def compile_model(
         requant_pc_qkv_selection=requant_pc_qkv_selection,
         requant_pc_fc1=requant_pc_fc1,
         requant_pc_fc1_blocks=requant_pc_fc1_blocks,
+        requant_pc_fc2=requant_pc_fc2,
+        requant_pc_fc2_blocks=requant_pc_fc2_blocks,
         requant_pc_out_proj=requant_pc_out_proj,
+        requant_pc_out_proj_blocks=requant_pc_out_proj_blocks,
     )
     program.compiler_manifest = dict(program.compiler_manifest or {})
+    runtime_twin_uniform = build_runtime_twin_uniform_manifest(
+        program,
+        softmax_max_probs=softmax_max_probs,
+        cal_scales=cal_scales,
+        twin_uniform_softmax_blocks=twin_uniform_softmax_blocks,
+        twin_uniform_gelu_blocks=twin_uniform_gelu_blocks,
+        twin_uniform_mode=twin_uniform_mode,
+        block_replay_samples=block_replay_samples,
+    )
+    program.compiler_manifest["runtime_twin_uniform"] = runtime_twin_uniform
     program.compiler_manifest["compare_golden_compile"] = {
         "sample_image_count": int(len(sample_images)),
         "softmax": {
@@ -3842,6 +4382,25 @@ def compile_model(
                 sorted(int(block_idx) for block_idx in gelu_search_blocks)
                 if gelu_search_blocks is not None else []
             ),
+            "search_objective": gelu_search_objective,
+        },
+        "ptq4vit": {
+            "hessian_calibration_images": int(hessian_calibration_images),
+            "hessian_target_nodes": hessian_target_nodes,
+            "twin_uniform_softmax_blocks": (
+                sorted(int(block_idx) for block_idx in twin_uniform_softmax_blocks)
+                if twin_uniform_softmax_blocks is not None else []
+            ),
+            "twin_uniform_gelu_blocks": (
+                sorted(int(block_idx) for block_idx in twin_uniform_gelu_blocks)
+                if twin_uniform_gelu_blocks is not None else []
+            ),
+            "twin_uniform_mode": twin_uniform_mode,
+            "twin_uniform_disable_hessian": bool(twin_uniform_disable_hessian),
+            "runtime_twin_uniform": {
+                "softmax_pc_count": int(len(runtime_twin_uniform.get("softmax", {}))),
+                "gelu_pc_count": int(len(runtime_twin_uniform.get("gelu", {}))),
+            },
         },
         "smoothquant": {
             "targets": smoothquant_targets,
@@ -4014,6 +4573,16 @@ def main():
         help="Comma-separated FC1 block indices to quantize with output-aware clipping",
     )
     parser.add_argument(
+        "--output-aware-clipping-fc2-blocks",
+        default="",
+        help="Comma-separated FC2 block indices to quantize with output-aware clipping",
+    )
+    parser.add_argument(
+        "--output-aware-clipping-classifier",
+        action="store_true",
+        help="Apply output-aware clipping to classifier weights",
+    )
+    parser.add_argument(
         "--output-aware-clipping-candidates",
         type=int,
         default=25,
@@ -4031,13 +4600,18 @@ def main():
         help="Comma-separated FC1 block indices to refine with greedy AdaRound after clipping/rounding",
     )
     parser.add_argument(
+        "--adaround-fc2-blocks",
+        default="",
+        help="Comma-separated FC2 block indices to refine with greedy AdaRound after clipping/rounding",
+    )
+    parser.add_argument(
         "--softmax-search-heads",
         default="",
         help="Comma-separated block:head pairs to search when --softmax-calibration=search",
     )
     parser.add_argument(
         "--softmax-search-objective",
-        choices=["local_prob", "downstream_out_proj", "tail_out_proj", "tail_attn_v"],
+        choices=["local_prob", "downstream_out_proj", "tail_out_proj", "tail_attn_v", "hessian_prob"],
         default="local_prob",
         help="Objective used when --softmax-calibration=search",
     )
@@ -4118,6 +4692,44 @@ def main():
         help="Comma-separated block indices used by --gelu-output-calibration=search",
     )
     parser.add_argument(
+        "--gelu-search-objective",
+        choices=["downstream_residual2", "hessian_output"],
+        default="downstream_residual2",
+        help="Objective used when --gelu-output-calibration=search",
+    )
+    parser.add_argument(
+        "--hessian-calibration-images",
+        type=int,
+        default=0,
+        help="Optional limit on calibration images used for Hessian-guided replay objectives (0 = all)",
+    )
+    parser.add_argument(
+        "--hessian-target-nodes",
+        default="",
+        help="Optional label or explicit node list for Hessian-guided experiments (metadata only in v1)",
+    )
+    parser.add_argument(
+        "--twin-uniform-softmax-blocks",
+        default="",
+        help="Comma-separated block indices that use PTQ4ViT twin-uniform softmax emulation during search",
+    )
+    parser.add_argument(
+        "--twin-uniform-gelu-blocks",
+        default="",
+        help="Comma-separated block indices that use PTQ4ViT twin-uniform GELU emulation during search",
+    )
+    parser.add_argument(
+        "--twin-uniform-mode",
+        choices=["off", "paper_exact"],
+        default="off",
+        help="Twin-uniform software emulation mode for PTQ4ViT-inspired search",
+    )
+    parser.add_argument(
+        "--twin-uniform-disable-hessian",
+        action="store_true",
+        help="Disable twin-uniform emulation inside Hessian-guided search ablations",
+    )
+    parser.add_argument(
         "--smoothquant-targets",
         choices=["off", "ln1_qkv", "ln2_fc1", "both"],
         default="off",
@@ -4170,9 +4782,24 @@ def main():
         help="Comma-separated block indices for selective FC1 REQUANT_PC rollout (default: all blocks)",
     )
     parser.add_argument(
+        "--requant-pc-fc2",
+        action="store_true",
+        help="Experimental: use REQUANT_PC for FC2 matmuls",
+    )
+    parser.add_argument(
+        "--requant-pc-fc2-blocks",
+        default="",
+        help="Comma-separated block indices for selective FC2 REQUANT_PC rollout (default: all blocks)",
+    )
+    parser.add_argument(
         "--requant-pc-out-proj",
         action="store_true",
         help="Experimental: use REQUANT_PC for out_proj matmuls",
+    )
+    parser.add_argument(
+        "--requant-pc-out-proj-blocks",
+        default="",
+        help="Comma-separated block indices for selective out_proj REQUANT_PC rollout (default: all blocks)",
     )
     parser.add_argument(
         "--dequant-add-residual1-blocks",
@@ -4292,6 +4919,26 @@ def main():
         )
         if invalid_requant_pc_fc1_blocks:
             parser.error(f"--requant-pc-fc1-blocks out of range: {invalid_requant_pc_fc1_blocks}")
+    requant_pc_fc2_blocks = parse_csv_int_set(args.requant_pc_fc2_blocks)
+    if requant_pc_fc2_blocks is not None and not args.requant_pc_fc2:
+        parser.error("--requant-pc-fc2-blocks requires --requant-pc-fc2")
+    if requant_pc_fc2_blocks is not None:
+        invalid_requant_pc_fc2_blocks = sorted(
+            block_idx for block_idx in requant_pc_fc2_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_requant_pc_fc2_blocks:
+            parser.error(f"--requant-pc-fc2-blocks out of range: {invalid_requant_pc_fc2_blocks}")
+    requant_pc_out_proj_blocks = parse_csv_int_set(args.requant_pc_out_proj_blocks)
+    if requant_pc_out_proj_blocks is not None and not args.requant_pc_out_proj:
+        parser.error("--requant-pc-out-proj-blocks requires --requant-pc-out-proj")
+    if requant_pc_out_proj_blocks is not None:
+        invalid_requant_pc_out_proj_blocks = sorted(
+            block_idx for block_idx in requant_pc_out_proj_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_requant_pc_out_proj_blocks:
+            parser.error(
+                f"--requant-pc-out-proj-blocks out of range: {invalid_requant_pc_out_proj_blocks}"
+            )
     output_aware_clipping_fc1_blocks = parse_csv_int_set(args.output_aware_clipping_fc1_blocks)
     if output_aware_clipping_fc1_blocks is not None:
         invalid_output_aware_fc1_blocks = sorted(
@@ -4299,6 +4946,13 @@ def main():
         )
         if invalid_output_aware_fc1_blocks:
             parser.error(f"--output-aware-clipping-fc1-blocks out of range: {invalid_output_aware_fc1_blocks}")
+    output_aware_clipping_fc2_blocks = parse_csv_int_set(args.output_aware_clipping_fc2_blocks)
+    if output_aware_clipping_fc2_blocks is not None:
+        invalid_output_aware_fc2_blocks = sorted(
+            block_idx for block_idx in output_aware_clipping_fc2_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_output_aware_fc2_blocks:
+            parser.error(f"--output-aware-clipping-fc2-blocks out of range: {invalid_output_aware_fc2_blocks}")
     try:
         activation_percentile_nodes = parse_activation_percentile_overrides(args.act_percentile_nodes)
         resolve_activation_percentile_targets(activation_percentile_nodes)
@@ -4311,6 +4965,13 @@ def main():
         )
         if invalid_adaround_fc1_blocks:
             parser.error(f"--adaround-fc1-blocks out of range: {invalid_adaround_fc1_blocks}")
+    adaround_fc2_blocks = parse_csv_int_set(args.adaround_fc2_blocks)
+    if adaround_fc2_blocks is not None:
+        invalid_adaround_fc2_blocks = sorted(
+            block_idx for block_idx in adaround_fc2_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_adaround_fc2_blocks:
+            parser.error(f"--adaround-fc2-blocks out of range: {invalid_adaround_fc2_blocks}")
     if args.output_aware_clipping_candidates < 1:
         parser.error("--output-aware-clipping-candidates must be >= 1")
     if not (0.0 < args.output_aware_clipping_alpha_min <= 1.0):
@@ -4363,6 +5024,20 @@ def main():
             parser.error(f"--fused-softmax-attnv-blocks out of range: {invalid_fused_softmax_blocks}")
     if args.fused_softmax_attnv_accum_out_proj and fused_softmax_attnv_blocks is None:
         parser.error("--fused-softmax-attnv-accum-out-proj requires fused softmax->attn@V blocks")
+    twin_uniform_softmax_blocks = parse_csv_int_set(args.twin_uniform_softmax_blocks)
+    if twin_uniform_softmax_blocks is not None:
+        invalid_twin_softmax_blocks = sorted(
+            block_idx for block_idx in twin_uniform_softmax_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_twin_softmax_blocks:
+            parser.error(f"--twin-uniform-softmax-blocks out of range: {invalid_twin_softmax_blocks}")
+    twin_uniform_gelu_blocks = parse_csv_int_set(args.twin_uniform_gelu_blocks)
+    if twin_uniform_gelu_blocks is not None:
+        invalid_twin_gelu_blocks = sorted(
+            block_idx for block_idx in twin_uniform_gelu_blocks if not (0 <= block_idx < DEPTH)
+        )
+        if invalid_twin_gelu_blocks:
+            parser.error(f"--twin-uniform-gelu-blocks out of range: {invalid_twin_gelu_blocks}")
     smoothquant_blocks = parse_csv_int_set(args.smoothquant_blocks)
     if smoothquant_blocks is not None:
         invalid_smoothquant_blocks = sorted(
@@ -4529,9 +5204,12 @@ def main():
         bias_correction_layers=args.bias_correction_layers,
         activation_percentile_nodes=activation_percentile_nodes,
         output_aware_clipping_fc1_blocks=output_aware_clipping_fc1_blocks,
+        output_aware_clipping_fc2_blocks=output_aware_clipping_fc2_blocks,
+        output_aware_clipping_classifier=args.output_aware_clipping_classifier,
         output_aware_clipping_candidates=args.output_aware_clipping_candidates,
         output_aware_clipping_alpha_min=args.output_aware_clipping_alpha_min,
         adaround_fc1_blocks=adaround_fc1_blocks,
+        adaround_fc2_blocks=adaround_fc2_blocks,
         softmax_search_heads=(
             {
                 tuple(int(part) for part in item.split(":", 1))
@@ -4554,6 +5232,13 @@ def main():
             {int(part) for part in args.gelu_search_blocks.split(",") if part.strip()}
             if args.gelu_search_blocks else None
         ),
+        gelu_search_objective=args.gelu_search_objective,
+        hessian_calibration_images=args.hessian_calibration_images,
+        hessian_target_nodes=args.hessian_target_nodes,
+        twin_uniform_softmax_blocks=twin_uniform_softmax_blocks,
+        twin_uniform_gelu_blocks=twin_uniform_gelu_blocks,
+        twin_uniform_mode=args.twin_uniform_mode,
+        twin_uniform_disable_hessian=args.twin_uniform_disable_hessian,
         smoothquant_targets=args.smoothquant_targets,
         smoothquant_alpha=args.smoothquant_alpha,
         smoothquant_blocks=smoothquant_blocks,
@@ -4561,7 +5246,10 @@ def main():
         requant_pc_qkv_selection=requant_pc_qkv_selection,
         requant_pc_fc1=args.requant_pc_fc1,
         requant_pc_fc1_blocks=requant_pc_fc1_blocks,
+        requant_pc_fc2=args.requant_pc_fc2,
+        requant_pc_fc2_blocks=requant_pc_fc2_blocks,
         requant_pc_out_proj=args.requant_pc_out_proj,
+        requant_pc_out_proj_blocks=requant_pc_out_proj_blocks,
         value_head_mode=args.value_head_calibration,
         per_head_qkv_calibration=args.per_head_qkv_calibration,
         gelu_from_accum=args.gelu_from_accum,
