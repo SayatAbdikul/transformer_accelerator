@@ -37,6 +37,8 @@ module fetch_unit
   input  logic        fetch_req,      // pulse: request fetch of insn at PC
   output logic        insn_valid,     // pulse: insn_data holds valid instruction
   output logic [63:0] insn_data,      // fetched instruction (big-endian word)
+  output logic        fetch_fault,    // sticky fault until reset
+  output logic [3:0]  fetch_fault_code,
 
   // --- AXI4 read channels (AR + R) ---
   // Address channel
@@ -85,19 +87,28 @@ module fetch_unit
   endfunction
 
   // -------------------------------------------------------------------------
-  // FSM: IDLE → AR_REQ → WAIT_R
+  // FSM: IDLE → AR_REQ → WAIT_R / FAULT
   // -------------------------------------------------------------------------
   typedef enum logic [1:0] {
     S_IDLE   = 2'd0,
     S_AR_REQ = 2'd1,   // driving AR channel, waiting for ar_ready
-    S_WAIT_R = 2'd2    // ar accepted, waiting for R data
+    S_WAIT_R = 2'd2,   // ar accepted, waiting for R data
+    S_FAULT  = 2'd3
   } fetch_state_t;
 
   fetch_state_t state, next_state;
+  logic [3:0]   fault_code_r;
 
   always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) state <= S_IDLE;
-    else        state <= next_state;
+    if (!rst_n) begin
+      state        <= S_IDLE;
+      fault_code_r <= 4'(FAULT_NONE);
+    end else begin
+      state <= next_state;
+      if (state == S_WAIT_R && m_axi_r_valid &&
+          ((m_axi_r_resp != 2'b00) || !m_axi_r_last))
+        fault_code_r <= 4'(FAULT_DRAM_OOB);
+    end
   end
 
   // Latch pc_odd at the time of AR handshake so we select the right half
@@ -114,6 +125,8 @@ module fetch_unit
     m_axi_r_ready     = 1'b0;
     insn_valid        = 1'b0;
     insn_data         = 64'h0;
+    fetch_fault       = 1'b0;
+    fetch_fault_code  = fault_code_r;
 
     case (state)
       S_IDLE: begin
@@ -131,14 +144,22 @@ module fetch_unit
       S_WAIT_R: begin
         m_axi_r_ready = 1'b1;
         if (m_axi_r_valid) begin
-          // Extract the relevant 8 bytes and byte-swap to get BE word
-          if (pc_odd_q)
-            insn_data = bswap64(m_axi_r_data[127:64]);
-          else
-            insn_data = bswap64(m_axi_r_data[63:0]);
-          insn_valid = 1'b1;
-          next_state = S_IDLE;
+          if ((m_axi_r_resp != 2'b00) || !m_axi_r_last) begin
+            next_state = S_FAULT;
+          end else begin
+            // Extract the relevant 8 bytes and byte-swap to get BE word
+            if (pc_odd_q)
+              insn_data = bswap64(m_axi_r_data[127:64]);
+            else
+              insn_data = bswap64(m_axi_r_data[63:0]);
+            insn_valid = 1'b1;
+            next_state = S_IDLE;
+          end
         end
+      end
+
+      S_FAULT: begin
+        fetch_fault = 1'b1;
       end
 
       default: next_state = S_IDLE;

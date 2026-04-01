@@ -120,6 +120,8 @@ module taccel_top
   logic [63:0]    insn_data_w;
   logic [63:0]    insn_data_q;
   decoded_insn_t  insn;
+  logic           fetch_fault_w;
+  logic [3:0]     fetch_fault_code_w;
 
   // Register file control signals
   logic        scale_we;
@@ -147,6 +149,12 @@ module taccel_top
   logic       dma_busy;
   logic       dma_fault_w;
   logic [3:0] dma_fault_code_w;
+  logic       dma_sram_fault_w;
+
+  logic       ext_fault_w;
+  logic [3:0] ext_fault_code_w;
+  logic       sys_sram_fault_now;
+  logic       sys_sram_fault_latched;
 
   // Phase 3: systolic controller active; sfu/alu still stubbed
   logic sys_busy, sfu_busy, alu_busy;
@@ -196,6 +204,29 @@ module taccel_top
   assign dma_sram_rdata   = sram_a_rdata;
   assign sys_sram_a_rdata = sram_a_rdata;
   assign sys_sram_b_rdata = sram_b_rdata;
+  assign dma_sram_fault_w = dma_sram_en & sram_a_fault;
+  assign sys_sram_fault_now = (sys_sram_b_en & sram_b_fault) |
+                              (sys_sram_a_en & ~dma_sram_en & sram_a_fault);
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+      sys_sram_fault_latched <= 1'b0;
+    else if (sys_sram_fault_now)
+      sys_sram_fault_latched <= 1'b1;
+  end
+
+  assign ext_fault_w = fetch_fault_w | dma_fault_w | sys_sram_fault_now | sys_sram_fault_latched;
+
+  always_comb begin
+    if (fetch_fault_w)
+      ext_fault_code_w = fetch_fault_code_w;
+    else if (dma_fault_w)
+      ext_fault_code_w = dma_fault_code_w;
+    else if (sys_sram_fault_now || sys_sram_fault_latched)
+      ext_fault_code_w = 4'(FAULT_SRAM_OOB);
+    else
+      ext_fault_code_w = 4'(FAULT_NONE);
+  end
 
   // =========================================================================
   // Instruction register
@@ -218,6 +249,8 @@ module taccel_top
     .fetch_req      (fetch_req),
     .insn_valid     (insn_valid_w),
     .insn_data      (insn_data_w),
+    .fetch_fault    (fetch_fault_w),
+    .fetch_fault_code(fetch_fault_code_w),
     .m_axi_ar_addr  (fetch_ar_addr),
     .m_axi_ar_valid (fetch_ar_valid),
     /* verilator lint_off PINCONNECTEMPTY */
@@ -266,8 +299,8 @@ module taccel_top
     .sys_busy       (sys_busy),
     .sfu_busy       (sfu_busy),
     .alu_busy       (alu_busy),
-    .dma_fault      (dma_fault_w),
-    .dma_fault_code (dma_fault_code_w),
+    .ext_fault      (ext_fault_w),
+    .ext_fault_code (ext_fault_code_w),
     .done           (done),
     .fault          (fault),
     .fault_code     (fault_code)
@@ -322,6 +355,7 @@ module taccel_top
     .sram_row        (dma_sram_row),
     .sram_wdata      (dma_sram_wdata),
     .sram_rdata      (dma_sram_rdata),
+    .sram_fault      (dma_sram_fault_w),
     // AXI read
     .dma_ar_addr     (dma_ar_addr),
     .dma_ar_len      (dma_ar_len),
@@ -383,9 +417,7 @@ module taccel_top
     .a_row   (sram_a_row),
     .a_wdata (sram_a_wdata),
     .a_rdata (sram_a_rdata),
-    /* verilator lint_off PINCONNECTEMPTY */
-    .a_fault (),   // Phase 2: SRAM OOB reported via a_fault; checked in Phase 6
-    /* verilator lint_on PINCONNECTEMPTY */
+    .a_fault (sram_a_fault),
     // Port B: systolic source reads
     .b_en    (sram_b_en),
     .b_buf   (sram_b_buf),

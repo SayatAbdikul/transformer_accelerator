@@ -1,6 +1,6 @@
-// Verilator integration tests for the Phase 1 control unit.
+// Verilator integration tests for the Phase A control/top-level contract.
 //
-// Tests the fetch → decode → issue pipeline for Phase 1 instructions:
+// Tests the fetch → decode → issue pipeline, including:
 //   - NOP then HALT: done asserted, no fault
 //   - CONFIG_TILE: tile registers updated correctly
 //   - SET_SCALE (immediate): scale register updated
@@ -8,7 +8,9 @@
 //   - SYNC 0b000 (NOP-like): passes without stall
 //   - SYNC with all-idle units: completes immediately
 //   - Illegal opcode: fault asserted, correct fault code
+//   - Legal but unsupported ops: FAULT_UNSUPPORTED_OP
 //   - MATMUL without CONFIG_TILE: FAULT_NO_CONFIG
+//   - Fetch / DMA / systolic SRAM fault plumbing
 //   - Multi-instruction sequence
 
 #include "Vtaccel_top.h"
@@ -51,6 +53,19 @@ struct Sim {
         return run_until_halt(dut.get(), dram, timeout);
     }
 };
+
+static void expect_fault_program(const char* name,
+                                 const std::vector<uint64_t>& prog,
+                                 uint32_t expected_fault_code,
+                                 int timeout = 5000) {
+    Sim s;
+    s.load(prog);
+    s.run(timeout);
+    EXPECT(s.dut->fault == 1, "fault should assert");
+    EXPECT(s.dut->done == 0, "done should remain 0 on fault");
+    EXPECT(s.dut->fault_code == expected_fault_code, "unexpected fault code");
+    TEST_PASS(name);
+}
 
 // ============================================================================
 // Test: NOP → HALT
@@ -109,7 +124,7 @@ static void test_config_tile() {
 
 // ============================================================================
 // Test: CONFIG_TILE → MATMUL → HALT  (MATMUL dispatched, completes immediately
-//       since sys_busy is tied to 0 in Phase 1)
+//       with SYNC waiting for completion)
 // ============================================================================
 static void test_config_tile_then_matmul() {
     const char* name = "config_tile_then_matmul_no_fault";
@@ -191,7 +206,7 @@ static void test_sync_all_idle() {
 }
 
 // ============================================================================
-// Test: Illegal opcode 0x11 → fault
+// Test: Illegal opcode 0x14 → fault
 // ============================================================================
 static void test_illegal_opcode() {
     const char* name = "illegal_opcode_fault";
@@ -205,6 +220,60 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
+// Test: legal-but-unsupported instructions fault as FAULT_UNSUPPORTED_OP
+// ============================================================================
+static void test_unsupported_ops() {
+    struct UnsupportedCase {
+        const char* name;
+        uint64_t insn;
+    };
+    const UnsupportedCase cases[] = {
+        { "unsupported_buf_copy",      insn::BUF_COPY(0, 0, 1, 0, 16, 1, 0) },
+        { "unsupported_requant",       insn::REQUANT(2, 0, 0, 0, 0) },
+        { "unsupported_requant_pc",    insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0) },
+        { "unsupported_scale_mul",     insn::SCALE_MUL(2, 0, 2, 0, 0) },
+        { "unsupported_vadd",          insn::VADD(0, 0, 0, 16, 0, 32, 0) },
+        { "unsupported_softmax",       insn::SOFTMAX(2, 0, 0, 0, 0) },
+        { "unsupported_layernorm",     insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0) },
+        { "unsupported_gelu",          insn::GELU(0, 0, 0, 0, 0) },
+        { "unsupported_softmax_attnv", insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 0) },
+        { "unsupported_dequant_add",   insn::DEQUANT_ADD(2, 0, 0, 0, 0, 0, 0) },
+    };
+
+    for (const auto& tc : cases)
+        expect_fault_program(tc.name, {tc.insn}, 6, 500);
+}
+
+// ============================================================================
+// Test: SET_SCALE from SRAM is rejected in Phase A
+// ============================================================================
+static void test_set_scale_from_buffer_unsupported() {
+    expect_fault_program("unsupported_set_scale_abuf",
+                         { insn::SET_SCALE(0, 7, 1) }, 6, 500);
+    expect_fault_program("unsupported_set_scale_wbuf",
+                         { insn::SET_SCALE(0, 7, 2) }, 6, 500);
+    expect_fault_program("unsupported_set_scale_accum",
+                         { insn::SET_SCALE(0, 7, 3) }, 6, 500);
+}
+
+// ============================================================================
+// Test: oversized single-burst DMA requests are rejected before dispatch
+// ============================================================================
+static void test_oversized_dma_unsupported() {
+    expect_fault_program("unsupported_load_xfer_gt_256", {
+        insn::SET_ADDR_LO(0, 0),
+        insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(0, 0, 257, 0, 0)
+    }, 6, 1000);
+
+    expect_fault_program("unsupported_store_xfer_gt_256", {
+        insn::SET_ADDR_LO(0, 0),
+        insn::SET_ADDR_HI(0, 0),
+        insn::STORE(0, 0, 257, 0, 0)
+    }, 6, 1000);
+}
+
+// ============================================================================
 // Test: MATMUL without prior CONFIG_TILE → FAULT_NO_CONFIG
 // ============================================================================
 static void test_matmul_no_config() {
@@ -214,6 +283,71 @@ static void test_matmul_no_config() {
     s.run(500);
     EXPECT(s.dut->fault == 1, "fault for missing CONFIG_TILE");
     EXPECT(s.dut->fault_code == 4, "fault_code = FAULT_NO_CONFIG (4)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: fetch RRESP fault is surfaced architecturally
+// ============================================================================
+static void test_fetch_rresp_fault() {
+    const char* name = "fetch_rresp_fault";
+    Sim s;
+    s.load({ insn::NOP(), insn::HALT() });
+    s.dram.inject_next_read(/*resp=*/2);
+    s.run(500);
+    EXPECT(s.dut->fault == 1, "fault asserted for fetch RRESP error");
+    EXPECT(s.dut->fault_code == 2, "fault_code = FAULT_DRAM_OOB (2)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: single-beat fetch without RLAST faults
+// ============================================================================
+static void test_fetch_missing_rlast_fault() {
+    const char* name = "fetch_missing_rlast_fault";
+    Sim s;
+    s.load({ insn::NOP(), insn::HALT() });
+    s.dram.inject_next_read(/*resp=*/0, /*force_last=*/0);
+    s.run(500);
+    EXPECT(s.dut->fault == 1, "fault asserted for missing fetch RLAST");
+    EXPECT(s.dut->fault_code == 2, "fault_code = FAULT_DRAM_OOB (2)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: DMA Port A SRAM OOB faults as FAULT_SRAM_OOB
+// ============================================================================
+static void test_dma_sram_oob_fault() {
+    const char* name = "dma_sram_oob_fault";
+    Sim s;
+    s.load({
+        insn::SET_ADDR_LO(0, 0),
+        insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(0/*ABUF*/, 8192, 1, 0, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+    s.run(2000);
+    EXPECT(s.dut->fault == 1, "fault asserted for DMA SRAM OOB");
+    EXPECT(s.dut->fault_code == 3, "fault_code = FAULT_SRAM_OOB (3)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// Test: systolic SRAM OOB faults as FAULT_SRAM_OOB
+// ============================================================================
+static void test_systolic_sram_oob_fault() {
+    const char* name = "systolic_sram_oob_fault";
+    Sim s;
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::MATMUL(0/*ABUF*/, 8192, 1/*WBUF*/, 0, 2/*ACCUM*/, 0, 0),
+        insn::SYNC(0b010),
+        insn::HALT(),
+    });
+    s.run(5000);
+    EXPECT(s.dut->fault == 1, "fault asserted for systolic SRAM OOB");
+    EXPECT(s.dut->fault_code == 3, "fault_code = FAULT_SRAM_OOB (3)");
     TEST_PASS(name);
 }
 
@@ -267,7 +401,14 @@ int main(int argc, char** argv) {
     test_sync_nop();
     test_sync_all_idle();
     test_illegal_opcode();
+    test_unsupported_ops();
+    test_set_scale_from_buffer_unsupported();
+    test_oversized_dma_unsupported();
     test_matmul_no_config();
+    test_fetch_rresp_fault();
+    test_fetch_missing_rlast_fault();
+    test_dma_sram_oob_fault();
+    test_systolic_sram_oob_fault();
     test_long_nop_sequence();
     test_load_dispatch();
 

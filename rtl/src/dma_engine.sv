@@ -47,6 +47,7 @@ module dma_engine
   output logic [15:0]  sram_row,
   output logic [127:0] sram_wdata,
   input  logic [127:0] sram_rdata,     // valid 1 cycle after sram_en && !sram_we
+  input  logic         sram_fault,     // OOB or reserved buffer on the selected row
 
   // --- AXI4 read channels (LOAD) ---
   output logic [AXI_ADDR_W-1:0] dma_ar_addr,
@@ -148,9 +149,14 @@ module dma_engine
 
         D_LOAD_R: begin
           if (dma_r_valid) begin
-            beat_cnt <= beat_cnt + 16'h1;
-            if (dma_r_last)
-              state <= D_IDLE;
+            if (sram_fault) begin
+              fault_code_r <= 4'(FAULT_SRAM_OOB);
+              state        <= D_FAULT;
+            end else begin
+              beat_cnt <= beat_cnt + 16'h1;
+              if (dma_r_last)
+                state <= D_IDLE;
+            end
           end
         end
 
@@ -168,7 +174,12 @@ module dma_engine
         D_STORE_SRAM_PRE: begin
           // sram_en=1, sram_we=0 driven combinationally below;
           // SRAM output will be valid on the next cycle (registered output).
-          state <= D_STORE_W;
+          if (sram_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= D_FAULT;
+          end else begin
+            state <= D_STORE_W;
+          end
         end
 
         D_STORE_W: begin

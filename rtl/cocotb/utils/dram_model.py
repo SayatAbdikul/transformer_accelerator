@@ -20,6 +20,7 @@ big-endian instruction word.
 """
 
 import struct
+from typing import Optional
 import cocotb
 from cocotb.triggers import RisingEdge, Timer
 
@@ -30,6 +31,8 @@ class DramModel:
     def __init__(self, size: int = 16 * 1024 * 1024):
         self.mem = bytearray(size)
         self.size = size
+        self._next_r_resp = 0
+        self._next_r_last_override = None
 
     # -----------------------------------------------------------------------
     # Write helpers
@@ -53,6 +56,11 @@ class DramModel:
 
     def read_bytes(self, addr: int, length: int) -> bytes:
         return bytes(self.mem[addr:addr + length])
+
+    def inject_next_read(self, resp: int = 0, force_last: Optional[int] = None) -> None:
+        """Override the next AXI read beat's RRESP and/or RLAST."""
+        self._next_r_resp = int(resp) & 0x3
+        self._next_r_last_override = None if force_last is None else int(force_last)
 
     @staticmethod
     def _sig_int(sig, default: int = 0) -> int:
@@ -118,9 +126,13 @@ class DramModel:
                     val = int.from_bytes(chunk, 'little')
                     dut.m_axi_r_data.value  = val
                     dut.m_axi_r_valid.value = 1
-                    dut.m_axi_r_resp.value  = 0
+                    dut.m_axi_r_resp.value  = self._next_r_resp
                     is_last = (req['beat'] >= req['ar_len'])
+                    if self._next_r_last_override is not None:
+                        is_last = bool(self._next_r_last_override)
                     dut.m_axi_r_last.value  = 1 if is_last else 0
+                    self._next_r_resp = 0
+                    self._next_r_last_override = None
 
                     # Gate ar_ready while waiting for this beat to be accepted,
                     # so a concurrent fetch AR isn't silently dropped.

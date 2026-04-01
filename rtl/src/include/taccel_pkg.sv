@@ -29,8 +29,11 @@ package taccel_pkg;
     OP_VADD        = 5'h0D,
     OP_SOFTMAX     = 5'h0E,
     OP_LAYERNORM   = 5'h0F,
-    OP_GELU        = 5'h10
-    // 5'h11–5'h1F: reserved — illegal instruction fault
+    OP_GELU        = 5'h10,
+    OP_REQUANT_PC  = 5'h11,
+    OP_SOFTMAX_ATTNV = 5'h12,
+    OP_DEQUANT_ADD = 5'h13
+    // 5'h14–5'h1F: reserved — illegal instruction fault
   } opcode_t;
 
   // -------------------------------------------------------------------------
@@ -74,11 +77,12 @@ package taccel_pkg;
   // -------------------------------------------------------------------------
   typedef enum logic [3:0] {
     FAULT_NONE       = 4'h0,
-    FAULT_ILLEGAL_OP = 4'h1,   // reserved opcode 0x11–0x1F
+    FAULT_ILLEGAL_OP = 4'h1,   // reserved opcode 0x14–0x1F
     FAULT_DRAM_OOB   = 4'h2,   // DRAM address out of bounds
     FAULT_SRAM_OOB   = 4'h3,   // SRAM offset out of bounds
     FAULT_NO_CONFIG  = 4'h4,   // compute instruction without CONFIG_TILE
-    FAULT_BAD_BUF    = 4'h5    // buffer ID 0b11 (reserved)
+    FAULT_BAD_BUF    = 4'h5,   // buffer ID 0b11 (reserved)
+    FAULT_UNSUPPORTED_OP = 4'h6 // legal ISA op or parameter not yet implemented
   } fault_code_t;
 
   // -------------------------------------------------------------------------
@@ -95,7 +99,8 @@ package taccel_pkg;
     logic [4:0]  opcode;
     logic        illegal;      // 1 = reserved opcode OR reserved buffer ID
 
-    // ---- R-TYPE: MATMUL, REQUANT, SCALE_MUL, VADD, SOFTMAX, LAYERNORM, GELU ----
+    // ---- R-TYPE: MATMUL, REQUANT, SCALE_MUL, VADD, SOFTMAX, LAYERNORM, GELU,
+    //              REQUANT_PC, SOFTMAX_ATTNV, DEQUANT_ADD ----
     // Bits [58:57] = src1_buf, [56:41] = src1_off, [40:39] = src2_buf,
     //      [38:23] = src2_off, [22:21] = dst_buf,  [20:5]  = dst_off,
     //      [4:1]   = sreg,     [0]     = flags

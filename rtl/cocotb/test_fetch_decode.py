@@ -1,7 +1,7 @@
 """cocotb tests for Phase 1: fetch-decode-execute pipeline.
 
-Tests NOP/HALT, CONFIG_TILE, SET_SCALE, SET_ADDR_LO/HI, SYNC, illegal opcode,
-and MATMUL-without-CONFIG_TILE fault.
+Tests supported setup/dispatch paths plus Phase A fault behavior for illegal
+opcodes, unsupported legal instructions, and fetch-side AXI read faults.
 
 Each test:
   1. Loads instructions into the DramModel
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from utils.dram_model import DramModel
 from utils.insn_builder import (
     NOP, HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
-    LOAD, MATMUL, ILLEGAL_OP,
+    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM
 )
 
@@ -190,13 +190,64 @@ async def test_load_dispatch_no_stall(dut):
 
 @cocotb.test()
 async def test_illegal_opcode_fault(dut):
-    """Reserved opcode 0x11 → fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
+    """Reserved opcode 0x14 → fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
     dram, _ = await init_dut(dut)
     done, fault, fault_code, _ = await run_program(dut, dram, [ILLEGAL_OP()])
     assert fault == 1,       f"Expected fault=1, got {fault}"
     assert done  == 0,       f"Expected done=0 on fault, got {done}"
     assert fault_code == 1,  f"Expected FAULT_ILLEGAL_OP=1, got {fault_code}"
     dut._log.info(f"Illegal opcode fault_code={fault_code}")
+
+
+@cocotb.test()
+async def test_unsupported_buf_copy_fault(dut):
+    """BUF_COPY is legal in the ISA but unsupported in Phase A."""
+    dram, _ = await init_dut(dut)
+    done, fault, fault_code, _ = await run_program(
+        dut, dram,
+        [BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, 16, 1, 0)]
+    )
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+
+
+@cocotb.test()
+async def test_unsupported_requant_pc_fault(dut):
+    """New legal opcodes decode, then fault as unsupported until implemented."""
+    dram, _ = await init_dut(dut)
+    done, fault, fault_code, _ = await run_program(
+        dut, dram,
+        [REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, sreg=0, flags=0)]
+    )
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+
+
+@cocotb.test()
+async def test_set_scale_from_buffer_fault(dut):
+    """SET_SCALE src_mode != 0 is intentionally rejected in Phase A."""
+    dram, _ = await init_dut(dut)
+    done, fault, fault_code, _ = await run_program(dut, dram, [SET_SCALE(0, 7, src_mode=1)])
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+
+
+@cocotb.test()
+async def test_oversized_load_fault(dut):
+    """LOAD lengths beyond the current single-burst DMA limit fault immediately."""
+    dram, _ = await init_dut(dut)
+    prog = [
+        SET_ADDR_LO(0, 0),
+        SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, 257, 0, 0),
+    ]
+    done, fault, fault_code, _ = await run_program(dut, dram, prog)
+    assert done == 0
+    assert fault == 1
+    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
 
 
 @cocotb.test()
@@ -209,6 +260,46 @@ async def test_matmul_without_config_tile_fault(dut):
     )
     assert fault == 1,       f"Expected fault=1"
     assert fault_code == 4,  f"Expected FAULT_NO_CONFIG=4, got {fault_code}"
+
+
+@cocotb.test()
+async def test_fetch_rresp_fault(dut):
+    """Fetch maps non-OKAY RRESP to FAULT_DRAM_OOB."""
+    dram, _ = await init_dut(dut)
+    dram.write_program([NOP(), HALT()])
+    dram.inject_next_read(resp=2)
+    await RisingEdge(dut.clk)
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if int(dut.fault.value):
+            assert int(dut.done.value) == 0
+            assert int(dut.fault_code.value) == 2
+            return
+    raise AssertionError("Expected fetch RRESP fault")
+
+
+@cocotb.test()
+async def test_fetch_missing_rlast_fault(dut):
+    """Single-beat fetch without RLAST is treated as malformed and faults."""
+    dram, _ = await init_dut(dut)
+    dram.write_program([NOP(), HALT()])
+    dram.inject_next_read(resp=0, force_last=0)
+    await RisingEdge(dut.clk)
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if int(dut.fault.value):
+            assert int(dut.done.value) == 0
+            assert int(dut.fault_code.value) == 2
+            return
+    raise AssertionError("Expected missing-RLAST fetch fault")
 
 
 @cocotb.test()

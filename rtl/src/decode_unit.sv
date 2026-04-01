@@ -26,10 +26,10 @@ module decode_unit
   assign opcode_raw = insn_data[63:59];
 
   // -------------------------------------------------------------------------
-  // Illegal opcode: reserved range 0x11–0x1F
+  // Illegal opcode: reserved range 0x14–0x1F
   // -------------------------------------------------------------------------
   logic illegal_opcode;
-  assign illegal_opcode = (opcode_raw > 5'h10);
+  assign illegal_opcode = (opcode_raw > 5'h13);
 
   // -------------------------------------------------------------------------
   // Illegal buffer ID check (R-type, M-type, B-type only)
@@ -40,7 +40,8 @@ module decode_unit
     if (!illegal_opcode) begin
       case (opcode_raw)
         // R-type: check src1, src2, dst
-        5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h0E, 5'h0F, 5'h10: begin
+        5'h0A, 5'h0B, 5'h0C, 5'h0D, 5'h0E,
+        5'h0F, 5'h10, 5'h11, 5'h12, 5'h13: begin
           if (insn_data[58:57] == 2'b11 ||
               insn_data[40:39] == 2'b11 ||
               insn_data[22:21] == 2'b11)

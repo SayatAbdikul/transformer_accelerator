@@ -119,21 +119,73 @@ inline uint64_t STORE(int buf_id, int sram_off, int xfer_len,
            (uint64_t(addr_reg&3) << M_ADDR_REG_SHIFT) |
            (uint64_t(dram_off)   << M_DRAM_OFF_SHIFT);
 }
+inline uint64_t BUF_COPY(int src_buf, int src_off, int dst_buf, int dst_off,
+                         int length, int src_rows, int transpose = 0) {
+    return (uint64_t(0x09)        << OPCODE_SHIFT)      |
+           (uint64_t(src_buf & 3) << B_SRC_BUF_SHIFT)   |
+           (uint64_t(src_off)     << B_SRC_OFF_SHIFT)   |
+           (uint64_t(dst_buf & 3) << B_DST_BUF_SHIFT)   |
+           (uint64_t(dst_off)     << B_DST_OFF_SHIFT)   |
+           (uint64_t(length)      << B_LENGTH_SHIFT)    |
+           (uint64_t(src_rows)    << B_SRC_ROWS_SHIFT)  |
+           (uint64_t(transpose & 1) << B_TRANSPOSE_SHIFT);
+}
+inline uint64_t R_TYPE(int opcode, int src1_buf, int src1_off, int src2_buf,
+                       int src2_off, int dst_buf, int dst_off, int sreg,
+                       int flags = 0) {
+    return (uint64_t(opcode & 0x1F) << OPCODE_SHIFT)   |
+           (uint64_t(src1_buf & 3)  << R_SRC1_BUF_SHIFT) |
+           (uint64_t(src1_off)      << R_SRC1_OFF_SHIFT) |
+           (uint64_t(src2_buf & 3)  << R_SRC2_BUF_SHIFT) |
+           (uint64_t(src2_off)      << R_SRC2_OFF_SHIFT) |
+           (uint64_t(dst_buf & 3)   << R_DST_BUF_SHIFT) |
+           (uint64_t(dst_off)       << R_DST_OFF_SHIFT) |
+           (uint64_t(sreg & 0xF)    << R_SREG_SHIFT) |
+           (uint64_t(flags & 1)     << R_FLAGS_SHIFT);
+}
 inline uint64_t MATMUL(int src1_buf, int src1_off, int src2_buf, int src2_off,
                        int dst_buf, int dst_off, int sreg, int flags = 0) {
-    return (uint64_t(0x0A)         << OPCODE_SHIFT) |
-           (uint64_t(src1_buf & 3) << R_SRC1_BUF_SHIFT) |
-           (uint64_t(src1_off)     << R_SRC1_OFF_SHIFT) |
-           (uint64_t(src2_buf & 3) << R_SRC2_BUF_SHIFT) |
-           (uint64_t(src2_off)     << R_SRC2_OFF_SHIFT) |
-           (uint64_t(dst_buf & 3)  << R_DST_BUF_SHIFT) |
-           (uint64_t(dst_off)      << R_DST_OFF_SHIFT) |
-           (uint64_t(sreg & 0xF)   << R_SREG_SHIFT) |
-           (uint64_t(flags & 1)    << R_FLAGS_SHIFT);
+    return R_TYPE(0x0A, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t REQUANT(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                        int sreg, int flags = 0) {
+    return R_TYPE(0x0B, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t REQUANT_PC(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                           int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x11, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t SCALE_MUL(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                          int sreg, int flags = 0) {
+    return R_TYPE(0x0C, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t VADD(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                     int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x0D, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t SOFTMAX(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                        int sreg, int flags = 0) {
+    return R_TYPE(0x0E, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t LAYERNORM(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                          int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x0F, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t GELU(int src1_buf, int src1_off, int dst_buf, int dst_off,
+                     int sreg, int flags = 0) {
+    return R_TYPE(0x10, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t SOFTMAX_ATTNV(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                              int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x12, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
+}
+inline uint64_t DEQUANT_ADD(int src1_buf, int src1_off, int src2_buf, int src2_off,
+                            int dst_buf, int dst_off, int sreg, int flags = 0) {
+    return R_TYPE(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags);
 }
 
 // Illegal opcode for fault tests
-constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x11) << OPCODE_SHIFT; }
+constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x14) << OPCODE_SHIFT; }
 
 } // namespace insn
 
@@ -146,7 +198,7 @@ public:
         : mem_(size_bytes, 0), pending_valid_(false), pending_addr_(0),
           pending_timer_(0), r_valid_(false),
           aw_pending_(false), aw_addr_(0), aw_len_(0), w_beat_cnt_(0),
-          b_pending_(false)
+          b_pending_(false), next_r_resp_(0), next_r_last_override_(-1)
     {}
 
     // Write a big-endian 64-bit instruction word at instruction index pc_idx
@@ -167,6 +219,11 @@ public:
     void write_program(const std::vector<uint64_t>& insns) {
         for (size_t i = 0; i < insns.size(); i++)
             write_insn((int)i, insns[i]);
+    }
+
+    void inject_next_read(int resp, int force_last = -1) {
+        next_r_resp_ = resp & 0x3;
+        next_r_last_override_ = force_last;
     }
 
     // Write raw bytes at byte address
@@ -228,11 +285,15 @@ public:
                 rdata[3] = (hi >> 32) & 0xFFFFFFFF;
 
                 bool is_last = (pending_beat_ >= (int)pending_ar_len_);
+                if (next_r_last_override_ >= 0)
+                    is_last = (next_r_last_override_ != 0);
                 dut->m_axi_r_valid = 1;
                 dut->m_axi_r_last  = is_last ? 1 : 0;
-                dut->m_axi_r_resp  = 0;
+                dut->m_axi_r_resp  = next_r_resp_;
                 r_valid_           = true;
                 pending_beat_++;
+                next_r_resp_ = 0;
+                next_r_last_override_ = -1;
                 if (is_last)
                     pending_valid_ = false;
             }
@@ -305,6 +366,8 @@ private:
     int      aw_len_;
     int      w_beat_cnt_;
     bool     b_pending_;
+    int      next_r_resp_;
+    int      next_r_last_override_;
 };
 
 // ============================================================================

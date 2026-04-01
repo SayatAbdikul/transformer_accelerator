@@ -333,11 +333,53 @@ int main(int argc, char** argv) {
     end_test();
 
     // -----------------------------------------------------------------------
-    // Reserved opcode 0x11 → illegal=1
+    // REQUANT_PC / SOFTMAX_ATTNV / DEQUANT_ADD are legal in the Phase A ISA
     // -----------------------------------------------------------------------
-    begin_test("decode_illegal_opcode_0x11");
+    begin_test("decode_requant_pc");
     apply(uint64_t(0x11) << OPCODE_SHIFT);
     CHK(opcode,  0x11);
+    CHK(illegal, 0);
+    end_test();
+
+    begin_test("decode_softmax_attnv");
+    apply((uint64_t(0x12) << OPCODE_SHIFT)      |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT)  |
+          (uint64_t(3)    << R_SRC1_OFF_SHIFT)  |
+          (uint64_t(0)    << R_SRC2_BUF_SHIFT)  |
+          (uint64_t(4)    << R_SRC2_OFF_SHIFT)  |
+          (uint64_t(1)    << R_DST_BUF_SHIFT)   |
+          (uint64_t(5)    << R_DST_OFF_SHIFT)   |
+          (uint64_t(6)    << R_SREG_SHIFT));
+    CHK(opcode,  0x12);
+    CHK(illegal, 0);
+    CHK(src1_buf, 2);
+    CHK(src2_buf, 0);
+    CHK(dst_buf,  1);
+    CHK(sreg,     6);
+    end_test();
+
+    begin_test("decode_dequant_add");
+    apply((uint64_t(0x13) << OPCODE_SHIFT)      |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT)  |
+          (uint64_t(9)    << R_SRC1_OFF_SHIFT)  |
+          (uint64_t(0)    << R_SRC2_BUF_SHIFT)  |
+          (uint64_t(11)   << R_SRC2_OFF_SHIFT)  |
+          (uint64_t(0)    << R_DST_BUF_SHIFT)   |
+          (uint64_t(13)   << R_DST_OFF_SHIFT)   |
+          (uint64_t(2)    << R_SREG_SHIFT));
+    CHK(opcode,   0x13);
+    CHK(illegal,  0);
+    CHK(src1_off, 9);
+    CHK(src2_off, 11);
+    CHK(dst_off,  13);
+    end_test();
+
+    // -----------------------------------------------------------------------
+    // Reserved opcode 0x14 → illegal=1
+    // -----------------------------------------------------------------------
+    begin_test("decode_illegal_opcode_0x14");
+    apply(uint64_t(0x14) << OPCODE_SHIFT);
+    CHK(opcode,  0x14);
     CHK(illegal, 1);
     end_test();
 
@@ -354,6 +396,17 @@ int main(int argc, char** argv) {
           (uint64_t(0)    << R_SRC1_BUF_SHIFT)|
           (uint64_t(1)    << R_SRC2_BUF_SHIFT)|
           (uint64_t(3)    << R_DST_BUF_SHIFT));   // 0b11 = reserved
+    CHK(illegal, 1);
+    end_test();
+
+    // -----------------------------------------------------------------------
+    // New legal R-type opcodes must still reject reserved buffer IDs
+    // -----------------------------------------------------------------------
+    begin_test("decode_illegal_buf_dequant_add_dst_0b11");
+    apply((uint64_t(0x13) << OPCODE_SHIFT)    |
+          (uint64_t(2)    << R_SRC1_BUF_SHIFT)|
+          (uint64_t(0)    << R_SRC2_BUF_SHIFT)|
+          (uint64_t(3)    << R_DST_BUF_SHIFT));
     CHK(illegal, 1);
     end_test();
 

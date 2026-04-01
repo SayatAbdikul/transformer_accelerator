@@ -9,12 +9,13 @@
 //   FETCH       — fetch_req asserted, waiting for insn_valid pulse
 //   ISSUE       — decode + execute one instruction (1 cycle)
 //   SYNC_WAIT   — barrier: stall until selected units drain
-//   DISP_WAIT   — wait for in-flight ALU to finish (REQUANT/SCALE_MUL/VADD/BUF_COPY)
+//   DISP_WAIT   — reserved for future blocking helper engines
 //   HALT        — terminal: done=1
 //   FAULT       — terminal: fault=1
 //
-// Phase 1: dma_busy / sys_busy / sfu_busy / alu_busy tied to 0 externally.
-// All dispatched instructions therefore complete in 0 cycles.
+// Phase A: only the fetch path, DMA LOAD/STORE, and systolic MATMUL are
+// architecturally supported. Legal-but-unimplemented helper/SFU instructions
+// fault as FAULT_UNSUPPORTED_OP instead of retiring as silent no-ops.
 
 `ifndef CONTROL_UNIT_SV
 `define CONTROL_UNIT_SV
@@ -66,9 +67,9 @@ module control_unit
   input  logic          sfu_busy,
   input  logic          alu_busy,
 
-  // --- Fault from execution units ---
-  input  logic          dma_fault,
-  input  logic [3:0]    dma_fault_code,
+  // --- External fault path from fetch / DMA / top-level memory plumbing ---
+  input  logic          ext_fault,
+  input  logic [3:0]    ext_fault_code,
 
   // --- Status outputs ---
   output logic          done,
@@ -108,17 +109,42 @@ module control_unit
   assign sync_clear_now = ~|(insn.sync_mask & {sfu_busy, sys_busy, dma_busy});
 
   // -------------------------------------------------------------------------
-  // Helper: does this opcode require CONFIG_TILE to have been set?
+  // Helper: legal ISA operations and parameterizations that are not yet
+  // implemented in the current RTL.
   // -------------------------------------------------------------------------
-  function automatic logic needs_tile(input logic [4:0] op);
-    return (op == OP_MATMUL   ||
-            op == OP_REQUANT  ||
-            op == OP_SCALE_MUL||
-            op == OP_VADD     ||
-            op == OP_SOFTMAX  ||
-            op == OP_LAYERNORM||
-            op == OP_GELU);
+  function automatic logic unsupported_op(
+    input logic [4:0]  op,
+    input logic [1:0]  s_src_mode,
+    input logic [15:0] m_xfer_len
+  );
+    begin
+      case (op)
+        OP_BUF_COPY,
+        OP_REQUANT,
+        OP_REQUANT_PC,
+        OP_SCALE_MUL,
+        OP_VADD,
+        OP_SOFTMAX,
+        OP_LAYERNORM,
+        OP_GELU,
+        OP_SOFTMAX_ATTNV,
+        OP_DEQUANT_ADD:
+          unsupported_op = 1'b1;
+
+        OP_SET_SCALE:
+          unsupported_op = (s_src_mode != 2'b00);
+
+        OP_LOAD, OP_STORE:
+          unsupported_op = (m_xfer_len == 16'h0) || (m_xfer_len > 16'd256);
+
+        default:
+          unsupported_op = 1'b0;
+      endcase
+    end
   endfunction
+
+  logic unsupported_now;
+  assign unsupported_now = unsupported_op(insn.opcode, insn.s_src_mode, insn.m_xfer_len);
 
   // -------------------------------------------------------------------------
   // Sequential FSM + registers
@@ -145,18 +171,23 @@ module control_unit
         // registered into insn_data_q in taccel_top on this same posedge, so
         // insn is valid on the NEXT cycle (S_ISSUE).
         S_FETCH:
-          if (insn_valid)
+          if (ext_fault) begin
+            fault_code_r <= ext_fault_code;
+            state        <= S_FAULT;
+          end else if (insn_valid)
             state <= S_ISSUE;
 
         // ------------------------------------------------------------------
         S_ISSUE: begin
-          // DMA async fault takes priority
-          if (dma_fault) begin
-            fault_code_r <= dma_fault_code;
+          if (ext_fault) begin
+            fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (insn.illegal) begin
-            fault_code_r <= (insn.opcode > 5'h10) ?
+            fault_code_r <= (insn.opcode > 5'h13) ?
                              4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            state        <= S_FAULT;
+          end else if (unsupported_now) begin
+            fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
             state        <= S_FAULT;
           end else begin
             case (insn.opcode)
@@ -215,39 +246,6 @@ module control_unit
                 end
               end
 
-              // SFU: dispatched (non-blocking)
-              OP_SOFTMAX, OP_LAYERNORM, OP_GELU: begin
-                if (!tile_valid) begin
-                  fault_code_r <= 4'(FAULT_NO_CONFIG);
-                  state        <= S_FAULT;
-                end else begin
-                  pc_reg <= pc_reg + 56'h1;
-                  state  <= S_FETCH;
-                end
-              end
-
-              // Issue-stage ALU: stalls pipeline until done
-              OP_REQUANT, OP_SCALE_MUL, OP_VADD: begin
-                if (!tile_valid) begin
-                  fault_code_r <= 4'(FAULT_NO_CONFIG);
-                  state        <= S_FAULT;
-                end else if (alu_busy) begin
-                  state <= S_DISP_WAIT;
-                end else begin
-                  pc_reg <= pc_reg + 56'h1;
-                  state  <= S_FETCH;
-                end
-              end
-
-              OP_BUF_COPY: begin
-                if (alu_busy) begin
-                  state <= S_DISP_WAIT;
-                end else begin
-                  pc_reg <= pc_reg + 56'h1;
-                  state  <= S_FETCH;
-                end
-              end
-
               default: begin
                 fault_code_r <= 4'(FAULT_ILLEGAL_OP);
                 state        <= S_FAULT;
@@ -258,8 +256,8 @@ module control_unit
 
         // ------------------------------------------------------------------
         S_SYNC_WAIT: begin
-          if (dma_fault) begin
-            fault_code_r <= dma_fault_code;
+          if (ext_fault) begin
+            fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (sync_clear_q) begin
             pc_reg <= pc_reg + 56'h1;
@@ -269,7 +267,10 @@ module control_unit
 
         // ------------------------------------------------------------------
         S_DISP_WAIT: begin
-          if (!alu_busy) begin
+          if (ext_fault) begin
+            fault_code_r <= ext_fault_code;
+            state        <= S_FAULT;
+          end else if (!alu_busy) begin
             pc_reg <= pc_reg + 56'h1;
             state  <= S_FETCH;
           end
@@ -317,13 +318,13 @@ module control_unit
       end
 
       S_ISSUE: begin
-        if (!insn.illegal && !dma_fault) begin
+        if (!insn.illegal && !ext_fault && !unsupported_now) begin
           case (insn.opcode)
             OP_CONFIG_TILE:
               tile_we = 1'b1;
 
             OP_SET_SCALE:
-              scale_we = (insn.s_src_mode == 2'b00);
+              scale_we = 1'b1;
 
             OP_SET_ADDR_LO:
               addr_lo_we = 1'b1;
@@ -336,13 +337,6 @@ module control_unit
 
             OP_MATMUL:
               sys_dispatch = tile_valid;
-
-            OP_SOFTMAX, OP_LAYERNORM, OP_GELU:
-              sfu_dispatch = tile_valid;
-
-            OP_REQUANT, OP_SCALE_MUL, OP_VADD, OP_BUF_COPY:
-              alu_dispatch = !alu_busy &&
-                             (insn.opcode == OP_BUF_COPY || tile_valid);
 
             default: ;
           endcase

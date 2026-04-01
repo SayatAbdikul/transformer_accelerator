@@ -100,19 +100,82 @@ def STORE(buf_id: int, sram_off: int, xfer_len: int,
             ((dram_off)     << M_DRAM_OFF_SHIFT))
 
 
-def MATMUL(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
-           dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
-    return ((0x0A << OPCODE_SHIFT)          |
+def BUF_COPY(src_buf: int, src_off: int, dst_buf: int, dst_off: int,
+             length: int, src_rows: int, transpose: int = 0) -> int:
+    return ((0x09 << OPCODE_SHIFT)            |
+            ((src_buf & 3) << B_SRC_BUF_SHIFT) |
+            ((src_off)     << B_SRC_OFF_SHIFT) |
+            ((dst_buf & 3) << B_DST_BUF_SHIFT) |
+            ((dst_off)     << B_DST_OFF_SHIFT) |
+            ((length)      << B_LENGTH_SHIFT) |
+            ((src_rows)    << B_SRC_ROWS_SHIFT) |
+            ((transpose & 1) << B_TRANSPOSE_SHIFT))
+
+
+def _r_type(opcode: int, src1_buf: int, src1_off: int, src2_buf: int,
+            src2_off: int, dst_buf: int, dst_off: int, sreg: int,
+            flags: int = 0) -> int:
+    return ((opcode << OPCODE_SHIFT)         |
             ((src1_buf & 3) << R_SRC1_BUF_SHIFT) |
-            ((src1_off)     << R_SRC1_OFF_SHIFT)  |
-            ((src2_buf & 3) << R_SRC2_BUF_SHIFT)  |
-            ((src2_off)     << R_SRC2_OFF_SHIFT)  |
-            ((dst_buf & 3)  << R_DST_BUF_SHIFT)   |
-            ((dst_off)      << R_DST_OFF_SHIFT)    |
-            ((sreg & 0xF)   << R_SREG_SHIFT)       |
+            ((src1_off)     << R_SRC1_OFF_SHIFT) |
+            ((src2_buf & 3) << R_SRC2_BUF_SHIFT) |
+            ((src2_off)     << R_SRC2_OFF_SHIFT) |
+            ((dst_buf & 3)  << R_DST_BUF_SHIFT) |
+            ((dst_off)      << R_DST_OFF_SHIFT) |
+            ((sreg & 0xF)   << R_SREG_SHIFT) |
             ((flags & 1)    << R_FLAGS_SHIFT))
 
 
+def MATMUL(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+           dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0A, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
+def REQUANT(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
+            sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0B, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
+
+
+def REQUANT_PC(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+               dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x11, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
+def SCALE_MUL(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
+              sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0C, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
+
+
+def VADD(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+         dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0D, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
+def SOFTMAX(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
+            sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0E, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
+
+
+def LAYERNORM(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+              dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x0F, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
+def GELU(src1_buf: int, src1_off: int, dst_buf: int, dst_off: int,
+         sreg: int, flags: int = 0) -> int:
+    return _r_type(0x10, src1_buf, src1_off, 0, 0, dst_buf, dst_off, sreg, flags)
+
+
+def SOFTMAX_ATTNV(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+                  dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x12, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
+def DEQUANT_ADD(src1_buf: int, src1_off: int, src2_buf: int, src2_off: int,
+                dst_buf: int, dst_off: int, sreg: int, flags: int = 0) -> int:
+    return _r_type(0x13, src1_buf, src1_off, src2_buf, src2_off, dst_buf, dst_off, sreg, flags)
+
+
 def ILLEGAL_OP() -> int:
-    """Reserved opcode 0x11 for fault testing."""
-    return 0x11 << OPCODE_SHIFT
+    """Reserved opcode 0x14 for fault testing."""
+    return 0x14 << OPCODE_SHIFT
