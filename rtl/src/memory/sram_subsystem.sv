@@ -1,4 +1,4 @@
-// SRAM subsystem: ABUF, WBUF, ACCUM — three dual-port SRAMs.
+// SRAM subsystem: ABUF, WBUF, ACCUM -- three dual-port SRAMs.
 //
 // Each SRAM row is 128 bits (16 bytes), matching the 16-byte DMA transfer unit.
 //
@@ -13,6 +13,8 @@
 // (16-bit, in 16-byte units).  Muxing to the correct SRAM is done here.
 //
 // OOB check: asserts sram_fault if the offset exceeds the buffer's max row.
+// The SRAMs themselves are not touched when a fault is detected; callers use
+// the fault bit to convert the access into an architectural error.
 
 `ifndef SRAM_SUBSYSTEM_SV
 `define SRAM_SUBSYSTEM_SV
@@ -29,7 +31,7 @@ module sram_subsystem
   input  logic        a_en,
   input  logic        a_we,
   input  logic [1:0]  a_buf,          // BUF_ABUF / BUF_WBUF / BUF_ACCUM
-  input  logic [15:0] a_row,          // row offset in 16-byte units
+  input  logic [15:0]  a_row,         // row offset in 16-byte units
   input  logic [127:0] a_wdata,
   output logic [127:0] a_rdata,
   output logic         a_fault,       // 1 = OOB or reserved buf
@@ -37,7 +39,7 @@ module sram_subsystem
   // --- Port B (read only) ---
   input  logic        b_en,
   input  logic [1:0]  b_buf,
-  input  logic [15:0] b_row,
+  input  logic [15:0]  b_row,
   output logic [127:0] b_rdata,
   output logic         b_fault
 );
@@ -61,7 +63,7 @@ module sram_subsystem
   assign b_fault = oob_check(b_buf, b_row);
 
   // -------------------------------------------------------------------------
-  // ABUF
+  // ABUF instance and enable decode.
   // -------------------------------------------------------------------------
   logic [127:0] abuf_a_rdata, abuf_b_rdata;
   logic         abuf_a_en, abuf_b_en, abuf_a_we;
@@ -83,7 +85,7 @@ module sram_subsystem
   );
 
   // -------------------------------------------------------------------------
-  // WBUF
+  // WBUF instance and enable decode.
   // -------------------------------------------------------------------------
   logic [127:0] wbuf_a_rdata, wbuf_b_rdata;
   logic         wbuf_a_en, wbuf_b_en, wbuf_a_we;
@@ -105,7 +107,7 @@ module sram_subsystem
   );
 
   // -------------------------------------------------------------------------
-  // ACCUM
+  // ACCUM instance and enable decode.
   // -------------------------------------------------------------------------
   logic [127:0] accum_a_rdata, accum_b_rdata;
   logic         accum_a_en, accum_b_en, accum_a_we;
@@ -127,7 +129,9 @@ module sram_subsystem
   );
 
   // -------------------------------------------------------------------------
-  // Read-data mux (1 cycle latency, combinational after SRAM output register)
+  // Read-data mux.
+  // `sram_dp` returns data one cycle after the request, so we register the
+  // selected buffer ID and use it to choose the returning row.
   // -------------------------------------------------------------------------
   logic [1:0] a_buf_q, b_buf_q;
   always_ff @(posedge clk) begin

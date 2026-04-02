@@ -200,12 +200,12 @@ async def test_illegal_opcode_fault(dut):
 
 
 @cocotb.test()
-async def test_unsupported_buf_copy_fault(dut):
-    """BUF_COPY is legal in the ISA but unsupported in Phase A."""
+async def test_buf_copy_same_buffer_transpose_fault(dut):
+    """Same-buffer transpose remains intentionally unsupported in Phase C."""
     dram, _ = await init_dut(dut)
     done, fault, fault_code, _ = await run_program(
         dut, dram,
-        [BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, 16, 1, 0)]
+        [BUF_COPY(BUF_ABUF, 0, BUF_ABUF, 16, 16, 1, 1)]
     )
     assert done == 0
     assert fault == 1

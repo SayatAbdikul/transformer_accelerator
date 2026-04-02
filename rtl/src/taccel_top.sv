@@ -1,4 +1,4 @@
-// TACCEL top-level: fetch → decode → issue → execute.
+// TACCEL top-level: fetch -> decode -> issue -> execute.
 //
 // Phase 2 additions:
 //   - DMA engine instantiated (LOAD/STORE via AXI4 master)
@@ -15,6 +15,16 @@
 //   - explicit AR grant tracking for fetch vs DMA
 //   - burst-boundary fetch interleave between DMA read bursts
 //   - R channel ownership based on the accepted AR request
+//
+// Phase C helper engine:
+//   - blocking SRAM-local helper path for BUF_COPY / VADD / REQUANT
+//   - helper owns SRAM ahead of DMA / systolic while active
+//
+// This module is mostly glue:
+//   - arbitrate shared AXI read access between fetch and DMA
+//   - arbitrate shared SRAM ports between helper, DMA, and systolic
+//   - fan out decoded instruction fields to the right execution unit
+//   - collapse submodule faults into one architectural fault path
 
 `ifndef TACCEL_TOP_SV
 `define TACCEL_TOP_SV
@@ -147,7 +157,8 @@ module taccel_top
   assign fetch_ar_ready = m_axi_ar_ready & ~rd_inflight_q &
                           (~dma_ar_valid | prefer_fetch_after_dma_q);
 
-  // R channel routing
+  // R channel routing follows the owner captured when the winning AR request is
+  // accepted, which keeps fetch and DMA from inferring ownership heuristically.
   assign dma_r_valid    = m_axi_r_valid &  rd_inflight_q &  dma_r_owner_q;
   assign fetch_r_valid  = m_axi_r_valid &  rd_inflight_q & ~dma_r_owner_q;
   assign m_axi_r_ready  = rd_inflight_q ? (dma_r_owner_q ? dma_r_ready : fetch_r_ready)
@@ -180,14 +191,24 @@ module taccel_top
   logic        tile_valid;
   logic [15:0] scale_rdata0, scale_rdata1;
   logic [55:0] addr_rdata;
+  logic [1:0]  helper_src1_buf_w, helper_src2_buf_w, helper_dst_buf_w;
+  logic [15:0] helper_src1_off_w, helper_src2_off_w, helper_dst_off_w;
 
   // Dispatch signals
-  logic dma_dispatch, sys_dispatch, sfu_dispatch, alu_dispatch;
+  logic dma_dispatch, sys_dispatch, sfu_dispatch, helper_dispatch;
 
   // Explicit intermediate: Icarus fails to evaluate complex expressions in port
   // connections (e.g. enum comparisons), so we pull is_store out to a named wire.
   logic dma_is_store;
   assign dma_is_store = (insn_data_q[63:59] == 5'(OP_STORE));
+  // BUF_COPY uses the B-type field aliases instead of the R-type aliases used
+  // by VADD / REQUANT, so remap the helper inputs here once.
+  assign helper_src1_buf_w = (insn.opcode == OP_BUF_COPY) ? insn.b_src_buf : insn.src1_buf;
+  assign helper_src1_off_w = (insn.opcode == OP_BUF_COPY) ? insn.b_src_off : insn.src1_off;
+  assign helper_src2_buf_w = (insn.opcode == OP_BUF_COPY) ? 2'b00 : insn.src2_buf;
+  assign helper_src2_off_w = (insn.opcode == OP_BUF_COPY) ? 16'h0 : insn.src2_off;
+  assign helper_dst_buf_w  = (insn.opcode == OP_BUF_COPY) ? insn.b_dst_buf : insn.dst_buf;
+  assign helper_dst_off_w  = (insn.opcode == OP_BUF_COPY) ? insn.b_dst_off : insn.dst_off;
 
   // DMA engine status
   logic       dma_busy;
@@ -197,15 +218,27 @@ module taccel_top
 
   logic       ext_fault_w;
   logic [3:0] ext_fault_code_w;
+  logic       helper_fault_w;
+  logic [3:0] helper_fault_code_w;
   logic       sys_sram_fault_now;
   logic       sys_sram_fault_latched;
 
-  // Phase 3: systolic controller active; sfu/alu still stubbed
-  logic sys_busy, sfu_busy, alu_busy;
+  // Phase 3: systolic controller active; SFU still stubbed
+  logic sys_busy, sfu_busy, helper_busy;
   assign sfu_busy = 1'b0;
-  assign alu_busy = 1'b0;
 
-  // SRAM Port A requests from DMA / Systolic
+  // SRAM Port A requests from helper / DMA / Systolic
+  logic         helper_sram_a_en,  helper_sram_a_we;
+  logic [1:0]   helper_sram_a_buf;
+  logic [15:0]  helper_sram_a_row;
+  logic [127:0] helper_sram_a_wdata, helper_sram_a_rdata;
+
+  // SRAM Port B requests from helper / Systolic
+  logic         helper_sram_b_en;
+  logic [1:0]   helper_sram_b_buf;
+  logic [15:0]  helper_sram_b_row;
+  logic [127:0] helper_sram_b_rdata;
+
   logic         dma_sram_en,  dma_sram_we;
   logic [1:0]   dma_sram_buf;
   logic [15:0]  dma_sram_row;
@@ -234,23 +267,37 @@ module taccel_top
   logic [127:0] sram_b_rdata;
   logic         sram_b_fault;
 
-  // DMA gets priority when active; systolic uses SRAM while DMA is idle.
-  assign sram_a_en    = dma_sram_en ? dma_sram_en    : sys_sram_a_en;
-  assign sram_a_we    = dma_sram_en ? dma_sram_we    : sys_sram_a_we;
-  assign sram_a_buf   = dma_sram_en ? dma_sram_buf   : sys_sram_a_buf;
-  assign sram_a_row   = dma_sram_en ? dma_sram_row   : sys_sram_a_row;
-  assign sram_a_wdata = dma_sram_en ? dma_sram_wdata : sys_sram_a_wdata;
+  // Helper gets first access, then DMA, then systolic. Phase C intentionally
+  // serializes helper work with the other engines so this priority scheme is
+  // sufficient without extra handshakes.
+  assign sram_a_en    = helper_sram_a_en ? helper_sram_a_en
+                      : dma_sram_en      ? dma_sram_en
+                                         : sys_sram_a_en;
+  assign sram_a_we    = helper_sram_a_en ? helper_sram_a_we
+                      : dma_sram_en      ? dma_sram_we
+                                         : sys_sram_a_we;
+  assign sram_a_buf   = helper_sram_a_en ? helper_sram_a_buf
+                      : dma_sram_en      ? dma_sram_buf
+                                         : sys_sram_a_buf;
+  assign sram_a_row   = helper_sram_a_en ? helper_sram_a_row
+                      : dma_sram_en      ? dma_sram_row
+                                         : sys_sram_a_row;
+  assign sram_a_wdata = helper_sram_a_en ? helper_sram_a_wdata
+                      : dma_sram_en      ? dma_sram_wdata
+                                         : sys_sram_a_wdata;
 
-  assign sram_b_en    = sys_sram_b_en;
-  assign sram_b_buf   = sys_sram_b_buf;
-  assign sram_b_row   = sys_sram_b_row;
+  assign sram_b_en    = helper_sram_b_en ? helper_sram_b_en : sys_sram_b_en;
+  assign sram_b_buf   = helper_sram_b_en ? helper_sram_b_buf : sys_sram_b_buf;
+  assign sram_b_row   = helper_sram_b_en ? helper_sram_b_row : sys_sram_b_row;
 
-  assign dma_sram_rdata   = sram_a_rdata;
-  assign sys_sram_a_rdata = sram_a_rdata;
-  assign sys_sram_b_rdata = sram_b_rdata;
+  assign helper_sram_a_rdata = sram_a_rdata;
+  assign dma_sram_rdata      = sram_a_rdata;
+  assign sys_sram_a_rdata    = sram_a_rdata;
+  assign helper_sram_b_rdata = sram_b_rdata;
+  assign sys_sram_b_rdata    = sram_b_rdata;
   assign dma_sram_fault_w = dma_sram_en & sram_a_fault;
-  assign sys_sram_fault_now = (sys_sram_b_en & sram_b_fault) |
-                              (sys_sram_a_en & ~dma_sram_en & sram_a_fault);
+  assign sys_sram_fault_now = (sys_sram_b_en & ~helper_sram_b_en & sram_b_fault) |
+                              (sys_sram_a_en & ~helper_sram_a_en & ~dma_sram_en & sram_a_fault);
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -259,13 +306,18 @@ module taccel_top
       sys_sram_fault_latched <= 1'b1;
   end
 
-  assign ext_fault_w = fetch_fault_w | dma_fault_w | sys_sram_fault_now | sys_sram_fault_latched;
+  // Merge all asynchronous or submodule-originated failures into the single
+  // external fault input consumed by the control FSM.
+  assign ext_fault_w = fetch_fault_w | dma_fault_w | helper_fault_w |
+                       sys_sram_fault_now | sys_sram_fault_latched;
 
   always_comb begin
     if (fetch_fault_w)
       ext_fault_code_w = fetch_fault_code_w;
     else if (dma_fault_w)
       ext_fault_code_w = dma_fault_code_w;
+    else if (helper_fault_w)
+      ext_fault_code_w = helper_fault_code_w;
     else if (sys_sram_fault_now || sys_sram_fault_latched)
       ext_fault_code_w = 4'(FAULT_SRAM_OOB);
     else
@@ -273,7 +325,9 @@ module taccel_top
   end
 
   // =========================================================================
-  // Instruction register
+  // Instruction register.
+  // Fetch and decode are separated by one register so the control FSM sees a
+  // stable decoded instruction for the whole ISSUE cycle.
   // =========================================================================
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -338,11 +392,11 @@ module taccel_top
     .dma_dispatch   (dma_dispatch),
     .sys_dispatch   (sys_dispatch),
     .sfu_dispatch   (sfu_dispatch),
-    .alu_dispatch   (alu_dispatch),
+    .helper_dispatch(helper_dispatch),
     .dma_busy       (dma_busy),
     .sys_busy       (sys_busy),
     .sfu_busy       (sfu_busy),
-    .alu_busy       (alu_busy),
+    .helper_busy    (helper_busy),
     .ext_fault      (ext_fault_w),
     .ext_fault_code (ext_fault_code_w),
     .done           (done),
@@ -374,6 +428,40 @@ module taccel_top
     .tile_n       (tile_n),
     .tile_k       (tile_k),
     .tile_valid   (tile_valid)
+  );
+
+  blocking_helper_engine u_helper (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .dispatch       (helper_dispatch),
+    .opcode         (insn.opcode),
+    .src1_buf       (helper_src1_buf_w),
+    .src1_off       (helper_src1_off_w),
+    .src2_buf       (helper_src2_buf_w),
+    .src2_off       (helper_src2_off_w),
+    .dst_buf        (helper_dst_buf_w),
+    .dst_off        (helper_dst_off_w),
+    .b_length       (insn.b_length),
+    .b_src_rows     (insn.b_src_rows),
+    .b_transpose    (insn.b_transpose),
+    .tile_m         (tile_m),
+    .tile_n         (tile_n),
+    .scale_data     (scale_rdata0),
+    .helper_busy       (helper_busy),
+    .helper_fault      (helper_fault_w),
+    .helper_fault_code (helper_fault_code_w),
+    .sram_a_en      (helper_sram_a_en),
+    .sram_a_we      (helper_sram_a_we),
+    .sram_a_buf     (helper_sram_a_buf),
+    .sram_a_row     (helper_sram_a_row),
+    .sram_a_wdata   (helper_sram_a_wdata),
+    .sram_a_rdata   (helper_sram_a_rdata),
+    .sram_a_fault   (helper_sram_a_en & sram_a_fault),
+    .sram_b_en      (helper_sram_b_en),
+    .sram_b_buf     (helper_sram_b_buf),
+    .sram_b_row     (helper_sram_b_row),
+    .sram_b_rdata   (helper_sram_b_rdata),
+    .sram_b_fault   (helper_sram_b_en & sram_b_fault)
   );
 
   dma_engine u_dma (

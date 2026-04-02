@@ -33,6 +33,8 @@ module sram_dp #(
   output logic [DATA_W-1:0]             b_rdata
 );
 
+  // Shared storage array. The wrapper modules above this one decide which
+  // architectural buffer is being addressed and suppress OOB accesses.
   (* ram_style = "block" *)
   logic [DATA_W-1:0] mem [0:DEPTH-1];
 

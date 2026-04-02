@@ -1,4 +1,4 @@
-// DMA Engine — LOAD (DRAM→SRAM) and STORE (SRAM→DRAM) via AXI4 master.
+// DMA Engine -- LOAD (DRAM->SRAM) and STORE (SRAM->DRAM) via AXI4 master.
 //
 // LOAD:  Issues sequential AXI4 read bursts of up to 256 beats each.
 //        Each accepted 16-byte beat is written to SRAM port A at consecutive rows.
@@ -78,7 +78,10 @@ module dma_engine
 );
 
   // -------------------------------------------------------------------------
-  // FSM
+  // FSM.
+  // LOAD walks bursts as AR -> R.
+  // STORE walks bursts as AW -> SRAM pre-read -> W -> B because port A is a
+  // synchronous single read/write port.
   // -------------------------------------------------------------------------
   typedef enum logic [2:0] {
     D_IDLE           = 3'd0,
@@ -93,7 +96,8 @@ module dma_engine
 
   dma_state_t  state;
 
-  // Latched instruction / transfer state
+  // Latched whole-transfer state. The engine reuses these registers across many
+  // AXI bursts, updating them only at burst boundaries.
   logic        is_store_q;
   logic [1:0]  buf_id_q;
   logic [15:0] curr_sram_row_q;
@@ -148,6 +152,8 @@ module dma_engine
   assign burst_last_beat_w       = (burst_beat_idx_q == (burst_beats_q - 16'h1));
   assign transfer_last_burst_w   = (beats_remaining_q == burst_beats_q);
 
+  // For LOAD, AXI protocol correctness and SRAM validity are checked per beat.
+  // The final beat of each burst must be the only beat that asserts RLAST.
   assign load_beat_fault_w =
       sram_fault |
       (dma_r_resp != 2'b00) |
@@ -170,7 +176,9 @@ module dma_engine
                            : (dispatch_sram_end_w > {1'b0, dispatch_buf_rows_w}));
 
   // -------------------------------------------------------------------------
-  // Sequential FSM
+  // Sequential FSM.
+  // Whole-transfer OOB checks happen once in D_IDLE before any side effects.
+  // Mid-transfer faults are terminal; completed beats are not rolled back.
   // -------------------------------------------------------------------------
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -293,7 +301,9 @@ module dma_engine
   end
 
   // -------------------------------------------------------------------------
-  // Combinational outputs
+  // Combinational outputs.
+  // `dma_rd_busy` is intentionally burst-scoped rather than transfer-scoped so
+  // fetch can slip in between accepted DMA read bursts.
   // -------------------------------------------------------------------------
   always_comb begin
     dma_busy       = (state != D_IDLE);
@@ -343,6 +353,8 @@ module dma_engine
       end
 
       D_STORE_SRAM_PRE: begin
+        // Prime the synchronous SRAM so its row appears on sram_rdata during
+        // the following D_STORE_W cycle.
         sram_en = 1'b1;
         sram_we = 1'b0;
       end

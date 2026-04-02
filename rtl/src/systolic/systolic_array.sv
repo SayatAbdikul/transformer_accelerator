@@ -3,6 +3,14 @@
 
 `include "taccel_pkg.sv"
 
+// 16x16 systolic mesh wrapper.
+//
+// Input rows arrive as packed 16-byte vectors. The wrapper unpacks them into
+// lane vectors, optionally applies boundary skew for chained mode, and wires
+// the PE mesh in either:
+//   - broadcast mode: each row/column sees the same lane value
+//   - chained mode: operands flow across the mesh one PE per cycle
+
 module systolic_array
   import taccel_pkg::*;
 (
@@ -23,6 +31,7 @@ module systolic_array
   logic [7:0] a_skew [0:SYS_DIM-1][0:SYS_DIM-2];
   logic [7:0] b_skew [0:SYS_DIM-1][0:SYS_DIM-2];
 
+  // PE-local state and interconnect signals.
   logic [31:0] pe_acc [0:SYS_DIM-1][0:SYS_DIM-1];
   logic [7:0] pe_a_in  [0:SYS_DIM-1][0:SYS_DIM-1];
   logic [7:0] pe_b_in  [0:SYS_DIM-1][0:SYS_DIM-1];
@@ -30,6 +39,8 @@ module systolic_array
   logic [7:0] pe_b_out [0:SYS_DIM-1][0:SYS_DIM-1];
 
   genvar i, j;
+  // Unpack the incoming 128-bit rows into 16 signed INT8 lanes and select the
+  // edge-fed values used in chained mode after skew insertion.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_A_B
       assign a_vec[i] = a_row_data[i*8 +: 8];
@@ -79,6 +90,8 @@ module systolic_array
   // - Broadcast mode (default): all PEs in row/col see same a_vec/b_vec lane.
   // - Chained mode: left/top edge injects a_vec/b_vec and interior PEs consume
   //   neighbor outputs (west/east for A, north/south for B).
+  // Route either broadcast inputs or neighbor-forwarded chained inputs into
+  // each PE. This keeps the PE itself oblivious to the global architecture.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_ROUTE_ROW
       for (j = 0; j < SYS_DIM; j++) begin : GEN_ROUTE_COL
@@ -95,6 +108,8 @@ module systolic_array
     end
   endgenerate
 
+  // Instantiate the full mesh and flatten the accumulator matrix for the
+  // controller's writeback logic.
   generate
     for (i = 0; i < SYS_DIM; i++) begin : GEN_ROW
       for (j = 0; j < SYS_DIM; j++) begin : GEN_COL

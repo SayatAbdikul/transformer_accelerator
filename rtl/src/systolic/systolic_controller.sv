@@ -3,6 +3,18 @@
 
 `include "taccel_pkg.sv"
 
+// Systolic MATMUL controller.
+//
+// Responsibilities:
+//   - latch one MATMUL instruction on dispatch
+//   - walk the logical M/N/K tile grid one 16x16 systolic tile at a time
+//   - stream src1/src2 rows into the array
+//   - drain the 16x16 INT32 accumulator tile back to SRAM
+//
+// The controller is asynchronous from the main control FSM: control emits a
+// one-cycle dispatch pulse, then later observes `sys_busy` dropping to know the
+// operation has completed.
+
 module systolic_controller
   import taccel_pkg::*;
 (
@@ -39,6 +51,9 @@ module systolic_controller
   input  logic [127:0]         sram_b_rdata
 );
 
+  // READ_REQ issues synchronous SRAM reads, READ_USE consumes the returned rows
+  // one cycle later, and DRAIN_WR writes the accumulated 16x16 tile back out as
+  // 64 rows of 4xINT32 each.
   typedef enum logic [3:0] {
     ST_IDLE       = 4'd0,
     ST_INIT_TILE  = 4'd1,
@@ -97,6 +112,8 @@ module systolic_controller
     end
   endfunction
 
+  // Base row addresses for the current logical 16x16 tile.
+  // src1/src2 advance in 16-byte row units; dst advances in 4-row INT32 chunks.
   logic [31:0] src1_tile_base, src2_tile_base, dst_tile_base;
   always_comb begin
     src1_tile_base = {16'h0, src1_off_q} + (((mtile_q * k_tiles_q) + {21'h0, ktile_q}) << 4);
@@ -104,6 +121,8 @@ module systolic_controller
     dst_tile_base  = {16'h0, dst_off_q}  + (((mtile_q * n_tiles_q) + {21'h0, ntile_q}) << 6);
   end
 
+  // Tile-walking FSM. One MATMUL dispatch can cover many logical 16x16 tiles
+  // when CONFIG_TILE programmed M/N/K larger than zero.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       state <= ST_IDLE;
@@ -204,6 +223,7 @@ module systolic_controller
     end
   end
 
+  // Drive SRAM and array control for the current state.
   always_comb begin
     sys_busy = (state != ST_IDLE);
 
@@ -234,6 +254,8 @@ module systolic_controller
 
     case (state)
       ST_READ_REQ: begin
+        // Issue both source reads together. Their rows appear one cycle later
+        // in ST_READ_USE, which then advances the systolic mesh by one step.
         if (inject_zero_data) begin
           sram_b_en = 1'b0;
           sram_a_en = 1'b0;
@@ -254,6 +276,7 @@ module systolic_controller
       end
 
       ST_DRAIN_WR: begin
+        // Pack four neighboring INT32 accumulators into one 128-bit SRAM row.
         logic [4:0] c0, c1, c2, c3;
         c0 = {1'b0, drain_grp_q, 2'b00};
         c1 = c0 + 5'd1;

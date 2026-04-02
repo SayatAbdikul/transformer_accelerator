@@ -13,6 +13,9 @@
 //   Written by CONFIG_TILE.
 //   tile_valid asserted after first CONFIG_TILE; cleared only on reset.
 //   Compute instructions must check tile_valid and fault if not set.
+//
+// This module is intentionally simple storage. Instruction legality and
+// sequencing are enforced in control, not here.
 
 `ifndef REGISTER_FILE_SV
 `define REGISTER_FILE_SV
@@ -96,7 +99,9 @@ module register_file
   assign addr_rdata = addr_regs[addr_rsel];
 
   // -------------------------------------------------------------------------
-  // Tile configuration
+  // Tile configuration.
+  // The fields store the encoded values directly; downstream logic applies the
+  // architectural +1 when it needs an actual tile count.
   // -------------------------------------------------------------------------
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin

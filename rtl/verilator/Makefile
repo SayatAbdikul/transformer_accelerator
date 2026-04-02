@@ -30,6 +30,7 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/decode_unit.sv \
                  $(SRC_DIR)/fetch_unit.sv \
                  $(SRC_DIR)/control_unit.sv \
+                 $(SRC_DIR)/blocking_helper_engine.sv \
                  $(SRC_DIR)/memory/register_file.sv \
                  $(SRC_DIR)/memory/sram_dp.sv \
                  $(SRC_DIR)/memory/sram_subsystem.sv \
@@ -39,9 +40,9 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all test_decode test_control test_dma test_systolic clean
+.PHONY: all test_decode test_control test_dma test_helpers test_systolic clean
 
-all: test_decode test_control test_dma test_systolic
+all: test_decode test_control test_dma test_helpers test_systolic
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run
@@ -96,6 +97,24 @@ $(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
 test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 	@echo "--- Running DMA tests ---"
 	$(BUILD_DIR)/test_dma/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_helpers: verilate taccel_top (with helper engine) + compile + run
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
+	mkdir -p $(BUILD_DIR)/test_helpers
+	$(VERILATOR) $(VFLAGS) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_helpers \
+	  $(CONTROL_SV) \
+	  test_helpers.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_helpers -f Vtaccel_top.mk
+
+test_helpers: $(BUILD_DIR)/test_helpers/Vtaccel_top
+	@echo "--- Running helper engine tests ---"
+	$(BUILD_DIR)/test_helpers/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_systolic: verilate taccel_top (with systolic) + compile + run

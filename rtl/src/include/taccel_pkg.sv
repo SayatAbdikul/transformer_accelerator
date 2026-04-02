@@ -1,8 +1,14 @@
-// TACCEL ISA v1 — shared types, parameters, and constants.
+// TACCEL ISA v1 -- shared types, parameters, and constants.
 //
-// All hardware must import this package.  It mirrors the Python constants in
-// software/taccel/isa/opcodes.py so that any change to either must be reflected
-// in the other.
+// This package is the single RTL-side contract for:
+//   - instruction opcodes and field layouts
+//   - architectural buffer sizes
+//   - global bus / array sizing
+//   - architectural fault codes
+//
+// All hardware imports this package. It mirrors the Python constants in
+// software/taccel/isa/opcodes.py, so changes here and in software must stay
+// synchronized.
 
 `ifndef TACCEL_PKG_SV
 `define TACCEL_PKG_SV
@@ -89,8 +95,8 @@ package taccel_pkg;
   // Decoded instruction struct
   //
   // All format fields are decoded in parallel; only those matching the current
-  // opcode's format are architecturally meaningful.  The control_unit selects
-  // the correct fields based on insn.opcode.
+  // opcode's format are architecturally meaningful. This lets decode stay
+  // purely combinational and keeps control-unit format selection simple.
   //
   // Bit positions match software/taccel/isa/encoding.py exactly.
   // -------------------------------------------------------------------------

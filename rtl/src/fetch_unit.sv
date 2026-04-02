@@ -18,8 +18,9 @@
 //   Cycle 1: ar_ready assumed; address accepted
 //   Cycle N: r_valid from slave; instruction captured, insn_valid pulsed
 //
-// The fetch unit blocks (does not issue a new request) until the control
-// unit asserts fetch_next, acknowledging consumption of the current insn.
+// The fetch unit is intentionally tiny: one request in flight, one returned
+// instruction beat, then back to idle. Faults are sticky until reset so the
+// control unit cannot miss them.
 
 `ifndef FETCH_UNIT_SV
 `define FETCH_UNIT_SV
@@ -111,7 +112,8 @@ module fetch_unit
     end
   end
 
-  // Latch pc_odd at the time of AR handshake so we select the right half
+  // Latch the lane select at AR acceptance time because PC may already have
+  // advanced by the time the R beat comes back.
   logic pc_odd_q;
   always_ff @(posedge clk) begin
     if (state == S_AR_REQ && m_axi_ar_ready && m_axi_ar_valid)

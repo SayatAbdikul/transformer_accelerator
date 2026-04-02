@@ -1,4 +1,4 @@
-// Control unit — in-order issue stage FSM.
+// Control unit -- in-order issue stage FSM.
 //
 // Orchestrates instruction fetch, decode (via external decode_unit), and
 // execution.  All issue-stage instructions execute here; long-latency
@@ -9,13 +9,13 @@
 //   FETCH       — fetch_req asserted, waiting for insn_valid pulse
 //   ISSUE       — decode + execute one instruction (1 cycle)
 //   SYNC_WAIT   — barrier: stall until selected units drain
-//   DISP_WAIT   — reserved for future blocking helper engines
+//   DISP_WAIT   -- waiting for a blocking helper op to complete
 //   HALT        — terminal: done=1
 //   FAULT       — terminal: fault=1
 //
-// Phase A: only the fetch path, DMA LOAD/STORE, and systolic MATMUL are
-// architecturally supported. Legal-but-unimplemented helper/SFU instructions
-// fault as FAULT_UNSUPPORTED_OP instead of retiring as silent no-ops.
+// Phase C: DMA LOAD/STORE, systolic MATMUL, and the blocking helper ops
+// BUF_COPY / VADD / REQUANT are supported. Remaining legal-but-unimplemented
+// helper/SFU instructions fault as FAULT_UNSUPPORTED_OP.
 
 `ifndef CONTROL_UNIT_SV
 `define CONTROL_UNIT_SV
@@ -59,13 +59,13 @@ module control_unit
   output logic          dma_dispatch,
   output logic          sys_dispatch,
   output logic          sfu_dispatch,
-  output logic          alu_dispatch,
+  output logic          helper_dispatch,
 
   // --- Execution unit status ---
   input  logic          dma_busy,
   input  logic          sys_busy,
   input  logic          sfu_busy,
-  input  logic          alu_busy,
+  input  logic          helper_busy,
 
   // --- External fault path from fetch / DMA / top-level memory plumbing ---
   input  logic          ext_fault,
@@ -101,7 +101,9 @@ module control_unit
   // -------------------------------------------------------------------------
   // Pre-computed combinational helpers
   // -------------------------------------------------------------------------
-  // Checks whether the units specified in mask are all idle
+  // Checks whether the units specified in mask are all idle. SYNC only tracks
+  // architecturally asynchronous resources; Phase C helpers stay blocking and
+  // therefore do not participate in the mask.
   logic sync_clear_q;   // for SYNC_WAIT: uses latched mask
   logic sync_clear_now; // for ISSUE: uses current insn mask
 
@@ -114,16 +116,12 @@ module control_unit
   // -------------------------------------------------------------------------
   function automatic logic unsupported_op(
     input logic [4:0]  op,
-    input logic [1:0]  s_src_mode,
-    input logic [15:0] m_xfer_len
+    input logic [1:0]  s_src_mode
   );
     begin
       case (op)
-        OP_BUF_COPY,
-        OP_REQUANT,
         OP_REQUANT_PC,
         OP_SCALE_MUL,
-        OP_VADD,
         OP_SOFTMAX,
         OP_LAYERNORM,
         OP_GELU,
@@ -141,7 +139,7 @@ module control_unit
   endfunction
 
   logic unsupported_now;
-  assign unsupported_now = unsupported_op(insn.opcode, insn.s_src_mode, insn.m_xfer_len);
+  assign unsupported_now = unsupported_op(insn.opcode, insn.s_src_mode);
 
   // -------------------------------------------------------------------------
   // Sequential FSM + registers
@@ -226,13 +224,36 @@ module control_unit
                 state  <= S_FETCH;
               end
 
-              // DMA: dispatched (non-blocking), pipeline continues
+              // Blocking helper: do not advance PC until the helper drops busy.
+              OP_BUF_COPY: begin
+                if (dma_busy || sys_busy || helper_busy) begin
+                  state <= S_ISSUE;
+                end else begin
+                  state <= S_DISP_WAIT;
+                end
+              end
+
+              // DMA is architecturally asynchronous. Once the dispatch pulse is
+              // emitted, fetch/issue may continue and SYNC(001) becomes the
+              // ordering point.
               OP_LOAD, OP_STORE: begin
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
 
-              // Systolic: dispatched (non-blocking)
+              OP_REQUANT,
+              OP_VADD: begin
+                if (!tile_valid) begin
+                  fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  state        <= S_FAULT;
+                end else if (dma_busy || sys_busy || helper_busy) begin
+                  state <= S_ISSUE;
+                end else begin
+                  state <= S_DISP_WAIT;
+                end
+              end
+
+              // Systolic matmul is also asynchronous from the control FSM.
               OP_MATMUL: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
@@ -253,6 +274,8 @@ module control_unit
 
         // ------------------------------------------------------------------
         S_SYNC_WAIT: begin
+          // A helper fault is delivered through ext_fault while the helper is
+          // still busy. A clean completion is observed when helper_busy drops.
           if (ext_fault) begin
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
@@ -267,7 +290,7 @@ module control_unit
           if (ext_fault) begin
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
-          end else if (!alu_busy) begin
+          end else if (!helper_busy) begin
             pc_reg <= pc_reg + 56'h1;
             state  <= S_FETCH;
           end
@@ -285,6 +308,12 @@ module control_unit
   // Combinational output logic
   // -------------------------------------------------------------------------
   always_comb begin
+    logic helper_ready_now;
+
+    // Phase C intentionally serializes helper work against DMA and systolic so
+    // the top-level SRAM arbitration stays simple and deterministic.
+    helper_ready_now = !dma_busy && !sys_busy && !helper_busy;
+
     // Defaults
     fetch_req    = 1'b0;
     done         = 1'b0;
@@ -307,7 +336,7 @@ module control_unit
     dma_dispatch = 1'b0;
     sys_dispatch = 1'b0;
     sfu_dispatch = 1'b0;
-    alu_dispatch = 1'b0;
+    helper_dispatch = 1'b0;
 
     case (state)
       S_FETCH: begin
@@ -334,6 +363,12 @@ module control_unit
 
             OP_MATMUL:
               sys_dispatch = tile_valid;
+
+            OP_BUF_COPY:
+              helper_dispatch = helper_ready_now;
+
+            OP_REQUANT, OP_VADD:
+              helper_dispatch = tile_valid && helper_ready_now;
 
             default: ;
           endcase

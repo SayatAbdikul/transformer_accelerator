@@ -1,11 +1,14 @@
-// Instruction decode unit — purely combinational.
+// Instruction decode unit -- purely combinational.
 //
 // Takes the raw 64-bit big-endian instruction word and extracts all
 // format-specific fields in parallel.  The control_unit selects which
 // fields to use based on insn.opcode.
 //
 // Bit positions match software/taccel/isa/encoding.py exactly.
-// R-type instructions additionally flag illegal buffer ID 0b11.
+// The single `insn.illegal` bit intentionally collapses two cases:
+//   - reserved opcode
+//   - reserved buffer ID inside a legal format
+// The control unit maps those to the architectural fault code later.
 
 `ifndef DECODE_UNIT_SV
 `define DECODE_UNIT_SV
@@ -32,7 +35,9 @@ module decode_unit
   assign illegal_opcode = (opcode_raw > 5'h13);
 
   // -------------------------------------------------------------------------
-  // Illegal buffer ID check (R-type, M-type, B-type only)
+  // Illegal buffer ID check (R-type, M-type, B-type only).
+  // Overlapping field positions are read directly from insn_data so the check
+  // remains format-local and does not depend on downstream aliases.
   // -------------------------------------------------------------------------
   logic illegal_buf;
   always_comb begin
@@ -64,7 +69,7 @@ module decode_unit
   end
 
   // -------------------------------------------------------------------------
-  // Parallel field extraction — all formats decoded simultaneously.
+  // Parallel field extraction -- all formats decoded simultaneously.
   // Fields are only architecturally valid for their matching format.
   //
   // Bit positions:

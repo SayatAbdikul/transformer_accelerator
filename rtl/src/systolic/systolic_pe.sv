@@ -1,6 +1,10 @@
 `ifndef SYSTOLIC_PE_SV
 `define SYSTOLIC_PE_SV
 
+// One processing element in the 16x16 systolic mesh.
+// Each cycle it forwards A/B to its east/south neighbors and accumulates
+// signed INT8 x INT8 products into a 32-bit accumulator.
+
 module systolic_pe (
   input  logic        clk,
   input  logic        rst_n,
@@ -21,6 +25,8 @@ module systolic_pe (
   assign b_s = b_in;
   assign prod_s = a_s * b_s;
 
+  // Forwarding and accumulation happen in the same cycle so the controller can
+  // treat the entire array as a lockstep pipeline.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       a_out <= 8'h0;

@@ -8,7 +8,7 @@
 //   - SYNC 0b000 (NOP-like): passes without stall
 //   - SYNC with all-idle units: completes immediately
 //   - Illegal opcode: fault asserted, correct fault code
-//   - Legal but unsupported ops: FAULT_UNSUPPORTED_OP
+//   - Remaining legal but unsupported ops: FAULT_UNSUPPORTED_OP
 //   - MATMUL without CONFIG_TILE: FAULT_NO_CONFIG
 //   - Fetch / DMA / systolic SRAM fault plumbing
 //   - Multi-instruction sequence
@@ -220,7 +220,7 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
-// Test: legal-but-unsupported instructions fault as FAULT_UNSUPPORTED_OP
+// Test: remaining legal-but-unsupported instructions fault as FAULT_UNSUPPORTED_OP
 // ============================================================================
 static void test_unsupported_ops() {
     struct UnsupportedCase {
@@ -228,11 +228,8 @@ static void test_unsupported_ops() {
         uint64_t insn;
     };
     const UnsupportedCase cases[] = {
-        { "unsupported_buf_copy",      insn::BUF_COPY(0, 0, 1, 0, 16, 1, 0) },
-        { "unsupported_requant",       insn::REQUANT(2, 0, 0, 0, 0) },
         { "unsupported_requant_pc",    insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0) },
         { "unsupported_scale_mul",     insn::SCALE_MUL(2, 0, 2, 0, 0) },
-        { "unsupported_vadd",          insn::VADD(0, 0, 0, 16, 0, 32, 0) },
         { "unsupported_softmax",       insn::SOFTMAX(2, 0, 0, 0, 0) },
         { "unsupported_layernorm",     insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0) },
         { "unsupported_gelu",          insn::GELU(0, 0, 0, 0, 0) },

@@ -13,7 +13,7 @@ TOPLEVEL_LANG ?= verilog
 SIM           ?= icarus     # icarus | verilator | vcs | xsim
 
 TOPLEVEL      := taccel_top
-MODULE        := test_fetch_decode,test_dma,test_systolic
+MODULE        := test_fetch_decode,test_dma,test_helpers,test_systolic
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -24,6 +24,7 @@ VERILOG_SOURCES := \
   $(SRC_DIR)/decode_unit.sv \
   $(SRC_DIR)/fetch_unit.sv \
   $(SRC_DIR)/control_unit.sv \
+  $(SRC_DIR)/blocking_helper_engine.sv \
   $(SRC_DIR)/memory/sram_dp.sv \
   $(SRC_DIR)/memory/register_file.sv \
   $(SRC_DIR)/memory/sram_subsystem.sv \
