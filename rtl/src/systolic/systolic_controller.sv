@@ -17,6 +17,9 @@
 
 module systolic_controller
   import taccel_pkg::*;
+#(
+  parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT
+)
 (
   input  logic                 clk,
   input  logic                 rst_n,
@@ -77,27 +80,23 @@ module systolic_controller
 
   logic step_en;
   logic clear_acc;
-  logic [0:0] arch_mode_q;
   logic       inject_zero_data;
   logic [15:0] lane_row_idx;
   logic [127:0] a_row_data_q, b_row_data_q;
   logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat;
 
-  localparam int CHAIN_PRELOAD_CYCLES = 1;
   localparam int CHAIN_FLUSH_CYCLES = (2 * (SYS_DIM - 1));
-  localparam int CHAIN_TOTAL_STEPS  = CHAIN_PRELOAD_CYCLES + SYS_DIM + CHAIN_FLUSH_CYCLES;
+  localparam int CHAIN_TOTAL_STEPS  = SYS_DIM + CHAIN_FLUSH_CYCLES;
 
-  // Architecture default comes from package constant (currently broadcast).
-  assign arch_mode_q = SYS_MODE_DEFAULT[0:0];
-
-  systolic_array u_array (
+  systolic_array #(
+    .SYSTOLIC_ARCH_MODE(SYSTOLIC_ARCH_MODE)
+  ) u_array (
     .clk      (clk),
     .rst_n    (rst_n),
     .step_en  (step_en),
     .clear_acc(clear_acc),
     .a_row_data(a_row_data_q),
     .b_row_data(b_row_data_q),
-    .arch_mode(arch_mode_q),
     .acc_flat (acc_flat)
   );
 
@@ -174,7 +173,7 @@ module systolic_controller
         end
 
         ST_READ_USE: begin
-          if (int'(lane_q) == ((arch_mode_q == SYS_MODE_CHAINED[0:0]) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
+          if (int'(lane_q) == ((SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) ? (CHAIN_TOTAL_STEPS - 1) : (SYS_DIM - 1))) begin
             lane_q <= 6'd0;
             if (ktile_q + 11'd1 < k_tiles_q) begin
               ktile_q <= ktile_q + 11'd1;
@@ -229,11 +228,11 @@ module systolic_controller
 
     // During chained flush cycles, inject zeros so only in-flight operands
     // continue propagating through the PE mesh.
-    inject_zero_data = (arch_mode_q == SYS_MODE_CHAINED[0:0])
-                    && ((lane_q == 6'd0) || (int'(lane_q) > SYS_DIM))
+    inject_zero_data = (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED)
+                    && (int'(lane_q) >= SYS_DIM)
                     && ((state == ST_READ_REQ) || (state == ST_READ_USE));
-    lane_row_idx = (arch_mode_q == SYS_MODE_CHAINED[0:0])
-               ? ({10'h0, lane_q[5:0]} - 16'd1)
+    lane_row_idx = (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED)
+               ? {10'h0, lane_q[5:0]}
                : {10'h0, lane_q[5:0]};
     a_row_data_q = inject_zero_data ? 128'h0 : sram_b_rdata;
     b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;

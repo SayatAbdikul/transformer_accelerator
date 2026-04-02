@@ -10,11 +10,13 @@ from utils.insn_builder import (
     LOAD, STORE, BUF_COPY, MATMUL, REQUANT, VADD,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM,
 )
+from utils.systolic_contract import prepare_logical_16x16
 
 
-async def _setup(dut, insns, dram_writes=None):
+async def _setup(dut, insns, dram_writes=None, dram=None):
     cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    dram = DramModel()
+    if dram is None:
+        dram = DramModel()
     dram.write_program(insns)
     if dram_writes:
         for addr, data in dram_writes.items():
@@ -243,28 +245,15 @@ async def test_matmul_then_requant_roundtrip(dut):
     a = [[(i * 5 + j) - 20 for j in range(16)] for i in range(16)]
     eye = [[1 if i == j else 0 for j in range(16)] for i in range(16)]
 
-    # Current systolic contract consumes ABUF tiles transposed per 16x16 tile.
-    a_layout = bytearray()
-    for r in range(16):
-        for c in range(16):
-            a_layout.append(a[c][r] & 0xFF)
-    b_layout = bytearray()
-    for r in range(16):
-        for c in range(16):
-            b_layout.append(eye[r][c] & 0xFF)
-
     expected = bytearray()
     for r in range(16):
         for c in range(16):
             expected.append(a[r][c] & 0xFF)
 
-    prog = [
-        *_set_addr(0, src_a_addr),
-        LOAD(BUF_ABUF, 128, 16, 0, 0),
-        SYNC(0b001),
-        *_set_addr(1, src_b_addr),
-        LOAD(BUF_WBUF, 0, 16, 1, 0),
-        SYNC(0b001),
+    prog = []
+    dram = DramModel()
+    prepare_logical_16x16(dram, prog, a, eye, src_a_addr, src_b_addr, abuf_off=128, wbuf_off=0)
+    prog.extend([
         CONFIG_TILE(1, 1, 1),
         MATMUL(BUF_ABUF, 128, BUF_WBUF, 0, BUF_ACCUM, 0, 0),
         SYNC(0b010),
@@ -274,8 +263,8 @@ async def test_matmul_then_requant_roundtrip(dut):
         STORE(BUF_ABUF, 256, 16, 2, 0),
         SYNC(0b001),
         HALT(),
-    ]
-    dram = await _setup(dut, prog, {src_a_addr: bytes(a_layout), src_b_addr: bytes(b_layout)})
+    ])
+    await _setup(dut, prog, dram=dram)
     await _wait_halt(dut, max_cycles=600_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)

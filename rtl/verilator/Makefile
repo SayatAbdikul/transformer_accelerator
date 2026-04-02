@@ -16,6 +16,7 @@ CXXFLAGS      := -std=c++17 -O2 -Wall -Wno-unused-variable
 VFLAGS        := --cc --exe --build --timing \
                  -Wall -Wno-UNUSED -Wno-UNDRIVEN \
                                   --x-assign fast --x-initial fast
+SYSTOLIC_ARCH_MODE ?= 1
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -40,7 +41,8 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all test_decode test_control test_dma test_helpers test_systolic clean
+.PHONY: all test_decode test_control test_dma test_helpers test_systolic \
+        test_systolic_array_chained test_systolic_chained clean
 
 all: test_decode test_control test_dma test_helpers test_systolic
 
@@ -68,6 +70,7 @@ test_decode: $(BUILD_DIR)/test_decode/Vtb_decode_unit
 $(BUILD_DIR)/test_control/Vtaccel_top: $(CONTROL_SV) test_control.cpp
 	mkdir -p $(BUILD_DIR)/test_control
 	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_control \
@@ -86,6 +89,7 @@ test_control: $(BUILD_DIR)/test_control/Vtaccel_top
 $(BUILD_DIR)/test_dma/Vtaccel_top: $(CONTROL_SV) test_dma.cpp
 	mkdir -p $(BUILD_DIR)/test_dma
 	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_dma \
@@ -104,6 +108,7 @@ test_dma: $(BUILD_DIR)/test_dma/Vtaccel_top
 $(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
 	mkdir -p $(BUILD_DIR)/test_helpers
 	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_helpers \
@@ -122,6 +127,7 @@ test_helpers: $(BUILD_DIR)/test_helpers/Vtaccel_top
 $(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp
 	mkdir -p $(BUILD_DIR)/test_systolic
 	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
 	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
 	  --top-module taccel_top \
 	  --Mdir $(BUILD_DIR)/test_systolic \
@@ -133,6 +139,48 @@ $(BUILD_DIR)/test_systolic/Vtaccel_top: $(CONTROL_SV) test_systolic.cpp
 test_systolic: $(BUILD_DIR)/test_systolic/Vtaccel_top
 	@echo "--- Running systolic tests ---"
 	$(BUILD_DIR)/test_systolic/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_systolic_array_chained: unit-test the chained mesh directly
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array: \
+		$(PKG) $(SRC_DIR)/systolic/systolic_pe.sv $(SRC_DIR)/systolic/systolic_array.sv \
+		test_systolic_array_chained.cpp
+	mkdir -p $(BUILD_DIR)/test_systolic_array_chained
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module systolic_array \
+	  --Mdir $(BUILD_DIR)/test_systolic_array_chained \
+	  $(PKG) \
+	  $(SRC_DIR)/systolic/systolic_pe.sv \
+	  $(SRC_DIR)/systolic/systolic_array.sv \
+	  test_systolic_array_chained.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_systolic_array_chained -f Vsystolic_array.mk
+
+test_systolic_array_chained: $(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array
+	@echo "--- Running chained systolic array tests ---"
+	$(BUILD_DIR)/test_systolic_array_chained/Vsystolic_array
+
+# -----------------------------------------------------------------------
+# test_systolic_chained: top-level chained MATMUL verification
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chained.cpp
+	mkdir -p $(BUILD_DIR)/test_systolic_chained
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_systolic_chained \
+	  $(CONTROL_SV) \
+	  test_systolic_chained.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_systolic_chained -f Vtaccel_top.mk
+
+test_systolic_chained: $(BUILD_DIR)/test_systolic_chained/Vtaccel_top
+	@echo "--- Running chained top-level systolic tests ---"
+	$(BUILD_DIR)/test_systolic_chained/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:

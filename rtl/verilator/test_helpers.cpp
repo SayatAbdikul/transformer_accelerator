@@ -3,6 +3,7 @@
 #include "Vtaccel_top.h"
 #include "Vtaccel_top___024root.h"
 #include "verilated.h"
+#include "include/systolic_test_utils.h"
 #include "include/testbench.h"
 
 #include <algorithm>
@@ -201,18 +202,6 @@ static void expect_fault_program(const char* name,
     TEST_PASS(name);
 }
 
-static void write_abuf_row_i8(Vtaccel_top* dut, int row, const int8_t vals[16]) {
-    uint8_t raw[16];
-    for (int i = 0; i < 16; ++i) raw[i] = uint8_t(vals[i]);
-    sram_write_row(dut, BUF_ABUF_ID, row, raw);
-}
-
-static void write_wbuf_row_i8(Vtaccel_top* dut, int row, const int8_t vals[16]) {
-    uint8_t raw[16];
-    for (int i = 0; i < 16; ++i) raw[i] = uint8_t(vals[i]);
-    sram_write_row(dut, BUF_WBUF_ID, row, raw);
-}
-
 static int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
     auto* r = dut->rootp;
     int grp = j / 4;
@@ -220,20 +209,6 @@ static int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
     int row = dst_off + i * 4 + grp;
     uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
     return int32_t(word);
-}
-
-static void load_matrix_abuf_for_systolic(Vtaccel_top* dut, int off, const int8_t m[16][16]) {
-    int8_t t[16][16] = {};
-    for (int r = 0; r < 16; ++r)
-        for (int c = 0; c < 16; ++c)
-            t[r][c] = m[c][r];
-    for (int r = 0; r < 16; ++r)
-        write_abuf_row_i8(dut, off + r, t[r]);
-}
-
-static void load_matrix_wbuf(Vtaccel_top* dut, int off, const int8_t m[16][16]) {
-    for (int r = 0; r < 16; ++r)
-        write_wbuf_row_i8(dut, off + r, m[r]);
 }
 
 static void matmul_ref(const int8_t a[16][16], const int8_t b[16][16], int32_t c[16][16]) {
@@ -513,6 +488,9 @@ static void test_matmul_then_requant() {
     int8_t eye[16][16] = {};
     int32_t exp_acc[16][16] = {};
     std::vector<uint8_t> expected(256);
+    std::vector<uint64_t> prog;
+    constexpr uint64_t src_a_addr = 0x280000ULL;
+    constexpr uint64_t src_b_addr = 0x281000ULL;
 
     for (int i = 0; i < 16; ++i) {
         for (int j = 0; j < 16; ++j) {
@@ -525,9 +503,8 @@ static void test_matmul_then_requant() {
         for (int j = 0; j < 16; ++j)
             expected[i * 16 + j] = uint8_t(requant_ref(exp_acc[i][j], 0x3C00));
 
-    load_matrix_abuf_for_systolic(s.dut.get(), 128, a);
-    load_matrix_wbuf(s.dut.get(), 0, eye);
-    s.load({
+    systolic_test::prepare_logical_16x16(s.dram, prog, a, eye, src_a_addr, src_b_addr, 128, 0);
+    prog.insert(prog.end(), {
         insn::CONFIG_TILE(1, 1, 1),
         insn::MATMUL(BUF_ABUF_ID, 128, BUF_WBUF_ID, 0, BUF_ACCUM_ID, 0, 0),
         insn::SYNC(0b010),
@@ -535,6 +512,7 @@ static void test_matmul_then_requant() {
         insn::REQUANT(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 256, 0),
         insn::HALT(),
     });
+    s.load(prog);
     s.run(200000);
 
     auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, 256 * 16, expected.size());
@@ -549,28 +527,32 @@ static void test_transpose_then_matmul() {
     int8_t k[16][16] = {};
     int8_t kt[16][16] = {};
     int32_t exp[16][16] = {};
-    std::vector<uint8_t> flat_k(256);
+    std::vector<uint64_t> prog;
+    constexpr uint64_t src_a_addr = 0x282000ULL;
+    constexpr uint64_t src_k_addr = 0x283000ULL;
 
     for (int i = 0; i < 16; ++i) {
         for (int j = 0; j < 16; ++j) {
             a[i][j] = int8_t(((i * 3 + j * 5) % 11) - 5);
             k[i][j] = int8_t(((i * 7 + j * 2 + 1) % 13) - 6);
             kt[j][i] = k[i][j];
-            flat_k[i * 16 + j] = uint8_t(k[i][j]);
         }
     }
 
-    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, flat_k);
-    load_matrix_abuf_for_systolic(s.dut.get(), 128, a);
+    s.dram.write_bytes(src_k_addr, systolic_test::flatten_16x16(k).data(), 256);
+    systolic_test::append_load_sync(prog, 0, src_k_addr, BUF_ABUF_ID, 0, 16);
+    systolic_test::append_prepare_a_tile(prog, 1, src_a_addr, 128);
     matmul_ref(a, kt, exp);
 
-    s.load({
+    s.dram.write_bytes(src_a_addr, systolic_test::flatten_16x16(a).data(), 256);
+    prog.insert(prog.end(), {
         insn::BUF_COPY(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 16, 1, 1),
         insn::CONFIG_TILE(1, 1, 1),
         insn::MATMUL(BUF_ABUF_ID, 128, BUF_WBUF_ID, 0, BUF_ACCUM_ID, 0, 0),
         insn::SYNC(0b010),
         insn::HALT(),
     });
+    s.load(prog);
     s.run(200000);
 
     for (int i = 0; i < 16; ++i) {

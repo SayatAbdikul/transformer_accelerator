@@ -25,20 +25,26 @@ module systolic_pe (
   assign b_s = b_in;
   assign prod_s = a_s * b_s;
 
-  // Forwarding and accumulation happen in the same cycle so the controller can
-  // treat the entire array as a lockstep pipeline.
+  // Forwarding and accumulation happen only on `en`, so the controller can
+  // treat the array as a lockstep pipeline that advances once per READ_USE
+  // cycle. When acc_clear asserts at a tile boundary we also clear the
+  // forwarded A/B registers; chained mode depends on those delay registers
+  // starting from zero rather than whatever stale SRAM row was last observed.
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       a_out <= 8'h0;
       b_out <= 8'h0;
       acc   <= 32'h0;
     end else begin
-      a_out <= a_in;
-      b_out <= b_in;
-      if (acc_clear)
+      if (acc_clear) begin
+        a_out <= 8'h0;
+        b_out <= 8'h0;
         acc <= 32'h0;
-      else if (en)
+      end else if (en) begin
+        a_out <= a_in;
+        b_out <= b_in;
         acc <= $signed(acc) + $signed({{16{prod_s[15]}}, prod_s});
+      end
     end
   end
 

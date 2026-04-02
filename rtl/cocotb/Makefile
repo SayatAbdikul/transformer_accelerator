@@ -11,6 +11,7 @@
 
 TOPLEVEL_LANG ?= verilog
 SIM           ?= icarus     # icarus | verilator | vcs | xsim
+SYSTOLIC_ARCH_MODE ?= 1
 
 TOPLEVEL      := taccel_top
 MODULE        := test_fetch_decode,test_dma,test_helpers,test_systolic
@@ -41,6 +42,7 @@ COMPILE_ARGS += -I$(SRC_DIR)/systolic
 # Verilator-specific flags
 ifeq ($(SIM), verilator)
   COMPILE_ARGS += --timing -Wall -Wno-UNUSED -Wno-UNDRIVEN
+  COMPILE_ARGS += -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE)
 endif
 
 # Icarus-specific: use SystemVerilog mode

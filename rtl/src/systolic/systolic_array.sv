@@ -8,11 +8,14 @@
 // Input rows arrive as packed 16-byte vectors. The wrapper unpacks them into
 // lane vectors, optionally applies boundary skew for chained mode, and wires
 // the PE mesh in either:
-//   - broadcast mode: each row/column sees the same lane value
-//   - chained mode: operands flow across the mesh one PE per cycle
+  //   - broadcast mode: each row/column sees the same lane value
+  //   - chained mode: operands flow across the mesh one PE per cycle
 
 module systolic_array
   import taccel_pkg::*;
+#(
+  parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT
+)
 (
   input  logic                         clk,
   input  logic                         rst_n,
@@ -20,7 +23,6 @@ module systolic_array
   input  logic                         clear_acc,
   input  logic [AXI_DATA_W-1:0]        a_row_data,
   input  logic [AXI_DATA_W-1:0]        b_row_data,
-  input  logic [0:0]                   arch_mode,
   output logic [SYS_DIM*SYS_DIM*32-1:0] acc_flat
 );
 
@@ -87,7 +89,7 @@ module systolic_array
   end
 
   // Dual-mode routing scaffold:
-  // - Broadcast mode (default): all PEs in row/col see same a_vec/b_vec lane.
+  // - Broadcast mode: all PEs in row/col see same a_vec/b_vec lane.
   // - Chained mode: left/top edge injects a_vec/b_vec and interior PEs consume
   //   neighbor outputs (west/east for A, north/south for B).
   // Route either broadcast inputs or neighbor-forwarded chained inputs into
@@ -96,7 +98,7 @@ module systolic_array
     for (i = 0; i < SYS_DIM; i++) begin : GEN_ROUTE_ROW
       for (j = 0; j < SYS_DIM; j++) begin : GEN_ROUTE_COL
         always_comb begin
-          if (arch_mode == SYS_MODE_CHAINED[0:0]) begin
+          if (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED) begin
             pe_a_in[i][j] = (j == 0) ? a_edge_vec[i] : pe_a_out[i][j-1];
             pe_b_in[i][j] = (i == 0) ? b_edge_vec[j] : pe_b_out[i-1][j];
           end else begin

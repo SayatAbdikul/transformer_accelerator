@@ -33,6 +33,9 @@
 
 module taccel_top
   import taccel_pkg::*;
+#(
+  parameter int SYSTOLIC_ARCH_MODE = SYS_MODE_DEFAULT
+)
 (
   input  logic        clk,
   input  logic        rst_n,
@@ -513,7 +516,9 @@ module taccel_top
     .dma_b_ready     (m_axi_b_ready)
   );
 
-  systolic_controller u_systolic (
+  systolic_controller #(
+    .SYSTOLIC_ARCH_MODE(SYSTOLIC_ARCH_MODE)
+  ) u_systolic (
     .clk             (clk),
     .rst_n           (rst_n),
     .dispatch        (sys_dispatch),
