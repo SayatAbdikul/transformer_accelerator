@@ -1,8 +1,6 @@
 """cocotb helper-engine tests for Phase C."""
 
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
 
 from utils.dram_model import DramModel
 from utils.insn_builder import (
@@ -11,42 +9,7 @@ from utils.insn_builder import (
     BUF_ABUF, BUF_WBUF, BUF_ACCUM,
 )
 from utils.systolic_contract import prepare_logical_16x16
-
-
-async def _setup(dut, insns, dram_writes=None, dram=None):
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    if dram is None:
-        dram = DramModel()
-    dram.write_program(insns)
-    if dram_writes:
-        for addr, data in dram_writes.items():
-            dram.write_bytes(addr, bytes(data))
-    cocotb.start_soon(dram.axi_slave(dut))
-    cocotb.start_soon(dram.axi_write_slave(dut))
-
-    dut.rst_n.value = 0
-    dut.start.value = 0
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await RisingEdge(dut.clk)
-
-    dut.start.value = 1
-    await RisingEdge(dut.clk)
-    dut.start.value = 0
-    return dram
-
-
-async def _wait_halt(dut, max_cycles=200_000):
-    for _ in range(max_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.done.value) or int(dut.fault.value):
-            return
-    raise TimeoutError("DUT did not halt")
-
-
-def _set_addr(reg: int, addr: int):
-    return [SET_ADDR_LO(reg, addr & 0x0FFFFFFF), SET_ADDR_HI(reg, (addr >> 28) & 0x0FFFFFFF)]
+from utils.testbench import set_addr, setup_test, wait_halt
 
 
 def _sat_add(a: int, b: int) -> int:
@@ -107,17 +70,17 @@ async def test_buf_copy_flat_roundtrip(dut):
     dst_addr = 0x12000
     src = bytes((0x20 + 7 * i) & 0xFF for i in range(48))
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ABUF, 0, 3, 0, 0),
         SYNC(0b001),
         BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 8, 3, 0, 0),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_WBUF, 8, 3, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: src})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: src})
+    await wait_halt(dut)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(src)]) == src
 
@@ -130,17 +93,17 @@ async def test_buf_copy_overlap_roundtrip(dut):
     expected = bytearray(src)
     expected[16:64] = expected[32:80]
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ABUF, 0, 6, 0, 0),
         SYNC(0b001),
         BUF_COPY(BUF_ABUF, 2, BUF_ABUF, 1, 3, 0, 0),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_ABUF, 0, 6, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: bytes(src)})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: bytes(src)})
+    await wait_halt(dut)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
 
@@ -157,17 +120,17 @@ async def test_buf_copy_transpose_unaligned_roundtrip(dut):
             src[r * cols + c] = (r * 19 + c * 7 + 3) & 0xFF
             expected[c * rows + r] = src[r * cols + c]
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ABUF, 0, 18, 0, 0),
         SYNC(0b001),
         BUF_COPY(BUF_ABUF, 0, BUF_WBUF, 0, 18, 1, 1),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_WBUF, 0, 18, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: bytes(src)})
-    await _wait_halt(dut, max_cycles=400_000)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: bytes(src)})
+    await wait_halt(dut, max_cycles=400_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
 
@@ -187,21 +150,21 @@ async def test_vadd_int8_roundtrip(dut):
         src_b[i] = b & 0xFF
         expected[i] = _sat_add(a, b) & 0xFF
     prog = [
-        *_set_addr(0, src_a_addr),
+        *set_addr(0, src_a_addr),
         LOAD(BUF_ABUF, 0, 16, 0, 0),
         SYNC(0b001),
-        *_set_addr(1, src_b_addr),
+        *set_addr(1, src_b_addr),
         LOAD(BUF_WBUF, 0, 16, 1, 0),
         SYNC(0b001),
         CONFIG_TILE(1, 1, 1),
         VADD(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ABUF, 32, 0),
-        *_set_addr(2, dst_addr),
+        *set_addr(2, dst_addr),
         STORE(BUF_ABUF, 32, 16, 2, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_a_addr: bytes(src_a), src_b_addr: bytes(src_b)})
-    await _wait_halt(dut, max_cycles=400_000)
+    dram = await setup_test(dut, prog, dram_writes={src_a_addr: bytes(src_a), src_b_addr: bytes(src_b)})
+    await wait_halt(dut, max_cycles=400_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
 
@@ -220,19 +183,19 @@ async def test_requant_roundtrip(dut):
             src.append(v)
             expected[r * 16 + c] = _requant(v, scale) & 0xFF
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ACCUM, 0, 64, 0, 0),
         SYNC(0b001),
         CONFIG_TILE(1, 1, 1),
         SET_SCALE(0, scale),
         REQUANT(BUF_ACCUM, 0, BUF_ABUF, 64, 0),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_ABUF, 64, 16, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: _pack_i32_le(src)})
-    await _wait_halt(dut, max_cycles=500_000)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: _pack_i32_le(src)})
+    await wait_halt(dut, max_cycles=500_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)
 
@@ -259,12 +222,12 @@ async def test_matmul_then_requant_roundtrip(dut):
         SYNC(0b010),
         SET_SCALE(0, 0x3C00),
         REQUANT(BUF_ACCUM, 0, BUF_ABUF, 256, 0),
-        *_set_addr(2, dst_addr),
+        *set_addr(2, dst_addr),
         STORE(BUF_ABUF, 256, 16, 2, 0),
         SYNC(0b001),
         HALT(),
     ])
-    await _setup(dut, prog, dram=dram)
-    await _wait_halt(dut, max_cycles=600_000)
+    await setup_test(dut, prog, dram=dram)
+    await wait_halt(dut, max_cycles=600_000)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     assert bytes(dram.mem[dst_addr:dst_addr + len(expected)]) == bytes(expected)

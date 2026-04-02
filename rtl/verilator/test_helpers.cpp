@@ -23,123 +23,16 @@ static int tests_pass = 0;
 #define TEST_FAIL(name, msg) do { \
     fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
 
-struct Sim {
-    std::unique_ptr<Vtaccel_top> dut;
-    AXI4SlaveModel dram;
-
-    explicit Sim() : dut(std::make_unique<Vtaccel_top>()), dram(16 * 1024 * 1024) {
-        do_reset(dut.get());
-    }
-
-    void load(const std::vector<uint64_t>& prog) {
-        dram.write_program(prog);
-    }
-
-    void run(int timeout = 200000) {
-        dut->start = 1;
-        tick(dut.get(), dram);
-        dut->start = 0;
-        run_until_halt(dut.get(), dram, timeout);
-    }
-};
-
-enum BufId : int {
-    BUF_ABUF_ID  = 0,
-    BUF_WBUF_ID  = 1,
-    BUF_ACCUM_ID = 2,
-};
-
-static VlWide<4>* row_ptr(Vtaccel_top* dut, int buf_id, int row) {
-    auto* r = dut->rootp;
-    switch (buf_id) {
-        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row];
-        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row];
-        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row];
-        default: std::abort();
-    }
-}
-
-static const VlWide<4>* row_ptr_const(Vtaccel_top* dut, int buf_id, int row) {
-    return row_ptr(dut, buf_id, row);
-}
-
-static void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
-    VlWide<4>* mem = row_ptr(dut, buf_id, row);
-    for (int w = 0; w < 4; ++w) {
-        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
-                    (uint32_t(data[w * 4 + 1]) <<  8) |
-                    (uint32_t(data[w * 4 + 2]) << 16) |
-                    (uint32_t(data[w * 4 + 3]) << 24);
-    }
-}
-
-static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
-    const VlWide<4>* mem = row_ptr_const(dut, buf_id, row);
-    for (int w = 0; w < 4; ++w) {
-        uint32_t word = (*mem)[w];
-        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
-        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
-        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
-        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
-    }
-}
-
-static void sram_write_bytes(Vtaccel_top* dut, int buf_id, size_t byte_off,
-                             const std::vector<uint8_t>& data) {
-    size_t pos = 0;
-    while (pos < data.size()) {
-        int row = int((byte_off + pos) / 16);
-        int lane = int((byte_off + pos) % 16);
-        int take = int(std::min<size_t>(16 - lane, data.size() - pos));
-        uint8_t tmp[16];
-        sram_read_row(dut, buf_id, row, tmp);
-        for (int i = 0; i < take; ++i)
-            tmp[lane + i] = data[pos + size_t(i)];
-        sram_write_row(dut, buf_id, row, tmp);
-        pos += size_t(take);
-    }
-}
-
-static std::vector<uint8_t> sram_read_bytes(Vtaccel_top* dut, int buf_id, size_t byte_off,
-                                            size_t len) {
-    std::vector<uint8_t> out(len);
-    size_t pos = 0;
-    while (pos < len) {
-        int row = int((byte_off + pos) / 16);
-        int lane = int((byte_off + pos) % 16);
-        int take = int(std::min<size_t>(16 - lane, len - pos));
-        uint8_t tmp[16];
-        sram_read_row(dut, buf_id, row, tmp);
-        for (int i = 0; i < take; ++i)
-            out[pos + size_t(i)] = tmp[lane + i];
-        pos += size_t(take);
-    }
-    return out;
-}
-
-static std::vector<uint8_t> pack_i32_le(const std::vector<int32_t>& vals) {
-    std::vector<uint8_t> out(vals.size() * 4);
-    for (size_t i = 0; i < vals.size(); ++i) {
-        uint32_t word = uint32_t(vals[i]);
-        out[i * 4 + 0] = uint8_t((word >> 0) & 0xFF);
-        out[i * 4 + 1] = uint8_t((word >> 8) & 0xFF);
-        out[i * 4 + 2] = uint8_t((word >> 16) & 0xFF);
-        out[i * 4 + 3] = uint8_t((word >> 24) & 0xFF);
-    }
-    return out;
-}
-
-static std::vector<int32_t> unpack_i32_le(const std::vector<uint8_t>& bytes) {
-    std::vector<int32_t> out(bytes.size() / 4);
-    for (size_t i = 0; i < out.size(); ++i) {
-        uint32_t word = uint32_t(bytes[i * 4 + 0]) |
-                        (uint32_t(bytes[i * 4 + 1]) << 8) |
-                        (uint32_t(bytes[i * 4 + 2]) << 16) |
-                        (uint32_t(bytes[i * 4 + 3]) << 24);
-        out[i] = int32_t(word);
-    }
-    return out;
-}
+using tbutil::SimHarness;
+using tbutil::sram_write_row;
+using tbutil::sram_read_row;
+using tbutil::sram_write_bytes;
+using tbutil::sram_read_bytes;
+using tbutil::pack_i32_le;
+using tbutil::unpack_i32_le;
+constexpr int BUF_ABUF_ID  = tbutil::BUF_ABUF_ID;
+constexpr int BUF_WBUF_ID  = tbutil::BUF_WBUF_ID;
+constexpr int BUF_ACCUM_ID = tbutil::BUF_ACCUM_ID;
 
 static int8_t sat_add_ref(int8_t a, int8_t b) {
     int sum = int(a) + int(b);
@@ -193,7 +86,7 @@ static void expect_fault_program(const char* name,
                                  const std::vector<uint64_t>& prog,
                                  uint32_t expected_fault_code,
                                  int timeout = 5000) {
-    Sim s;
+    SimHarness s;
     s.load(prog);
     s.run(timeout);
     EXPECT(s.dut->fault == 1, "fault should assert");
@@ -224,7 +117,7 @@ static void matmul_ref(const int8_t a[16][16], const int8_t b[16][16], int32_t c
 
 static void test_buf_copy_flat_interbuffer() {
     const char* name = "buf_copy_flat_interbuffer";
-    Sim s;
+    SimHarness s;
     std::vector<uint8_t> src(48);
     for (size_t i = 0; i < src.size(); ++i)
         src[i] = uint8_t((0x20 + 7 * i) & 0xFF);
@@ -244,7 +137,7 @@ static void test_buf_copy_flat_interbuffer() {
 
 static void test_buf_copy_overlap_compaction() {
     const char* name = "buf_copy_overlap_compaction";
-    Sim s;
+    SimHarness s;
     std::vector<uint8_t> bytes(6 * 16);
     for (size_t i = 0; i < bytes.size(); ++i)
         bytes[i] = uint8_t((0x51 + 11 * i) & 0xFF);
@@ -266,7 +159,7 @@ static void test_buf_copy_overlap_compaction() {
 
 static void test_buf_copy_zero_length() {
     const char* name = "buf_copy_zero_length";
-    Sim s;
+    SimHarness s;
     std::vector<uint8_t> before(64);
     for (size_t i = 0; i < before.size(); ++i)
         before[i] = uint8_t((0x91 + 13 * i) & 0xFF);
@@ -285,7 +178,7 @@ static void test_buf_copy_zero_length() {
 
 static void test_buf_copy_transpose_unaligned_source() {
     const char* name = "buf_copy_transpose_unaligned_source";
-    Sim s;
+    SimHarness s;
     constexpr int rows = 16;
     constexpr int cols = 18;
     std::vector<uint8_t> src(rows * cols);
@@ -315,7 +208,7 @@ static void test_buf_copy_transpose_same_buffer_fault() {
 
 static void test_vadd_int8_saturating() {
     const char* name = "vadd_int8_saturating";
-    Sim s;
+    SimHarness s;
     std::vector<uint8_t> src_a(256), src_b(256), expected(256);
     for (int i = 0; i < 256; ++i) {
         int8_t a = (i % 5 == 0) ? int8_t(120) :
@@ -343,7 +236,7 @@ static void test_vadd_int8_saturating() {
 
 static void test_vadd_bias_int32_wrap() {
     const char* name = "vadd_bias_int32_wrap";
-    Sim s;
+    SimHarness s;
     std::vector<int32_t> accum(16 * 16), bias(16), expected(16 * 16);
     for (int i = 0; i < 16 * 16; ++i)
         accum[i] = (i % 9 == 0) ? int32_t(0x7FFFFFF0u) :
@@ -374,7 +267,7 @@ static void test_vadd_bias_int32_wrap() {
 
 static void test_requant_rounding_and_clipping() {
     const char* name = "requant_rounding_and_clipping";
-    Sim s;
+    SimHarness s;
     constexpr uint16_t SCALE_HALF = 0x3800; // 0.5
     const int32_t pattern[16] = {
         1, 3, 5, -1, -3, -5, 255, 257,
@@ -406,7 +299,7 @@ static void test_requant_rounding_and_clipping() {
 
 static void test_requant_subnormal_negative_zero() {
     const char* name = "requant_subnormal_negative_zero";
-    Sim s;
+    SimHarness s;
     constexpr uint16_t SCALE_SUBN = 0x0001;
     constexpr uint16_t SCALE_NEG1 = 0xBC00;
     std::vector<int32_t> src(16 * 16, 0);
@@ -483,7 +376,7 @@ static void test_helper_oob_faults() {
 
 static void test_matmul_then_requant() {
     const char* name = "matmul_then_requant";
-    Sim s;
+    SimHarness s;
     int8_t a[16][16] = {};
     int8_t eye[16][16] = {};
     int32_t exp_acc[16][16] = {};
@@ -522,7 +415,7 @@ static void test_matmul_then_requant() {
 
 static void test_transpose_then_matmul() {
     const char* name = "transpose_then_matmul";
-    Sim s;
+    SimHarness s;
     int8_t a[16][16] = {};
     int8_t k[16][16] = {};
     int8_t kt[16][16] = {};

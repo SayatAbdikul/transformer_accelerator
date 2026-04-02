@@ -29,6 +29,8 @@
 #include <stdexcept>
 #include <vector>
 #include <string>
+#include <array>
+#include <algorithm>
 
 // ============================================================================
 // ISA helper: build 64-bit big-endian instruction words
@@ -436,6 +438,156 @@ inline int run_until_halt(Vtaccel_top* dut, AXI4SlaveModel& dram,
     }
     throw std::runtime_error("Simulation timeout: DUT did not halt");
 }
+
+namespace tbutil {
+
+constexpr int BUF_ABUF_ID  = 0;
+constexpr int BUF_WBUF_ID  = 1;
+constexpr int BUF_ACCUM_ID = 2;
+
+struct SimHarness {
+    std::unique_ptr<Vtaccel_top> dut;
+    AXI4SlaveModel dram;
+
+    explicit SimHarness(size_t dram_size = 16 * 1024 * 1024)
+        : dut(std::make_unique<Vtaccel_top>()), dram(dram_size) {
+        do_reset(dut.get());
+    }
+
+    void load(const std::vector<uint64_t>& prog) {
+        dram.write_program(prog);
+    }
+
+    void start_once(int latency = 2) {
+        dut->start = 1;
+        tick(dut.get(), dram, latency);
+        dut->start = 0;
+    }
+
+    void start(int latency = 2) {
+        start_once(latency);
+    }
+
+    void step(int cycles = 1, int latency = 2) {
+        for (int i = 0; i < cycles; ++i)
+            tick(dut.get(), dram, latency);
+    }
+
+    int run(int timeout = 100000, int latency = 2) {
+        start_once(latency);
+        return run_until_halt(dut.get(), dram, timeout, latency);
+    }
+};
+
+inline VlWide<4>* sram_row_ptr(Vtaccel_top* dut, int buf_id, int row) {
+    auto* r = dut->rootp;
+    switch (buf_id) {
+        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row];
+        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row];
+        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row];
+        default: std::abort();
+    }
+}
+
+inline const VlWide<4>* sram_row_ptr_const(Vtaccel_top* dut, int buf_id, int row) {
+    return sram_row_ptr(dut, buf_id, row);
+}
+
+inline void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
+    VlWide<4>* mem = sram_row_ptr(dut, buf_id, row);
+    for (int w = 0; w < 4; ++w) {
+        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
+                    (uint32_t(data[w * 4 + 1]) <<  8) |
+                    (uint32_t(data[w * 4 + 2]) << 16) |
+                    (uint32_t(data[w * 4 + 3]) << 24);
+    }
+}
+
+inline void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
+    const VlWide<4>* mem = sram_row_ptr_const(dut, buf_id, row);
+    for (int w = 0; w < 4; ++w) {
+        uint32_t word = (*mem)[w];
+        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
+        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
+        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
+        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
+    }
+}
+
+inline void sram_write_bytes(Vtaccel_top* dut, int buf_id, size_t byte_off,
+                             const std::vector<uint8_t>& data) {
+    size_t pos = 0;
+    while (pos < data.size()) {
+        int row = int((byte_off + pos) / 16);
+        int lane = int((byte_off + pos) % 16);
+        int take = int(std::min<size_t>(16 - lane, data.size() - pos));
+        uint8_t tmp[16];
+        sram_read_row(dut, buf_id, row, tmp);
+        for (int i = 0; i < take; ++i)
+            tmp[lane + i] = data[pos + size_t(i)];
+        sram_write_row(dut, buf_id, row, tmp);
+        pos += size_t(take);
+    }
+}
+
+inline std::vector<uint8_t> sram_read_bytes(Vtaccel_top* dut, int buf_id,
+                                            size_t byte_off, size_t len) {
+    std::vector<uint8_t> out(len);
+    size_t pos = 0;
+    while (pos < len) {
+        int row = int((byte_off + pos) / 16);
+        int lane = int((byte_off + pos) % 16);
+        int take = int(std::min<size_t>(16 - lane, len - pos));
+        uint8_t tmp[16];
+        sram_read_row(dut, buf_id, row, tmp);
+        for (int i = 0; i < take; ++i)
+            out[pos + size_t(i)] = tmp[lane + i];
+        pos += size_t(take);
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> make_pattern(size_t size, uint8_t seed) {
+    std::vector<uint8_t> data(size);
+    for (size_t i = 0; i < size; ++i)
+        data[i] = uint8_t((seed + (37 * i)) & 0xFF);
+    return data;
+}
+
+inline std::vector<uint8_t> pack_i32_le(const std::vector<int32_t>& vals) {
+    std::vector<uint8_t> out(vals.size() * 4);
+    for (size_t i = 0; i < vals.size(); ++i) {
+        uint32_t word = uint32_t(vals[i]);
+        out[i * 4 + 0] = uint8_t((word >> 0) & 0xFF);
+        out[i * 4 + 1] = uint8_t((word >> 8) & 0xFF);
+        out[i * 4 + 2] = uint8_t((word >> 16) & 0xFF);
+        out[i * 4 + 3] = uint8_t((word >> 24) & 0xFF);
+    }
+    return out;
+}
+
+inline std::vector<uint8_t> pack_u16_le(const std::vector<uint16_t>& vals) {
+    std::vector<uint8_t> out(vals.size() * 2);
+    for (size_t i = 0; i < vals.size(); ++i) {
+        out[i * 2 + 0] = uint8_t(vals[i] & 0xFF);
+        out[i * 2 + 1] = uint8_t((vals[i] >> 8) & 0xFF);
+    }
+    return out;
+}
+
+inline std::vector<int32_t> unpack_i32_le(const std::vector<uint8_t>& bytes) {
+    std::vector<int32_t> out(bytes.size() / 4);
+    for (size_t i = 0; i < out.size(); ++i) {
+        uint32_t word = uint32_t(bytes[i * 4 + 0]) |
+                        (uint32_t(bytes[i * 4 + 1]) << 8) |
+                        (uint32_t(bytes[i * 4 + 2]) << 16) |
+                        (uint32_t(bytes[i * 4 + 3]) << 24);
+        out[i] = int32_t(word);
+    }
+    return out;
+}
+
+} // namespace tbutil
 
 // ============================================================================
 // Test assertion macro

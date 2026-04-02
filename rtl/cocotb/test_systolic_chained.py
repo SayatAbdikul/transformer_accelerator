@@ -3,9 +3,6 @@
 import random
 
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
-
 from utils.dram_model import DramModel
 from utils.insn_builder import HALT, SYNC, CONFIG_TILE, MATMUL, BUF_ACCUM
 from utils.systolic_contract import (
@@ -13,6 +10,7 @@ from utils.systolic_contract import (
     prepare_logical_32x32,
     prepare_logical_16x64x16,
 )
+from utils.testbench import read_accum_16x16, read_accum_32x32, setup_test, wait_halt
 
 
 def _matmul_ref(a, b):
@@ -48,72 +46,6 @@ def _matmul_ref_16x64x16(a, b):
     return c
 
 
-async def _setup(dut, insns, dram=None):
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    if dram is None:
-        dram = DramModel()
-    dram.write_program(insns)
-    cocotb.start_soon(dram.axi_slave(dut))
-    cocotb.start_soon(dram.axi_write_slave(dut))
-
-    dut.rst_n.value = 0
-    dut.start.value = 0
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await RisingEdge(dut.clk)
-
-    dut.start.value = 1
-    await RisingEdge(dut.clk)
-    dut.start.value = 0
-    return dram
-
-
-async def _wait_halt(dut, max_cycles=500_000):
-    for _ in range(max_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.done.value) == 1 or int(dut.fault.value) == 1:
-            return
-    raise TimeoutError("DUT did not halt")
-
-
-def _accum_row_u32x4(dut, row):
-    v = int(dut.u_sram.u_accum.mem[row].value)
-    return [
-        (v >> 0) & 0xFFFFFFFF,
-        (v >> 32) & 0xFFFFFFFF,
-        (v >> 64) & 0xFFFFFFFF,
-        (v >> 96) & 0xFFFFFFFF,
-    ]
-
-
-def _read_accum_16x16(dut, dst_off=0):
-    out = [[0 for _ in range(16)] for _ in range(16)]
-    for i in range(16):
-        for grp in range(4):
-            row = dst_off + i * 4 + grp
-            lanes = _accum_row_u32x4(dut, row)
-            for lane in range(4):
-                j = grp * 4 + lane
-                u = lanes[lane]
-                out[i][j] = u if u < (1 << 31) else (u - (1 << 32))
-    return out
-
-
-def _read_accum_32x32(dut, dst_off=0):
-    out = [[0 for _ in range(32)] for _ in range(32)]
-    for i in range(32):
-        for j in range(32):
-            mt, nt = i // 16, j // 16
-            li, lj = i % 16, j % 16
-            tile = mt * 2 + nt
-            grp, lane = lj // 4, lj % 4
-            row = dst_off + tile * 64 + li * 4 + grp
-            lanes = _accum_row_u32x4(dut, row)
-            u = lanes[lane]
-            out[i][j] = u if u < (1 << 31) else (u - (1 << 32))
-    return out
-
 
 @cocotb.test()
 async def test_matmul_identity_chained(dut):
@@ -130,12 +62,12 @@ async def test_matmul_identity_chained(dut):
         SYNC(0b010),
         HALT(),
     ])
-    await _setup(dut, prog, dram)
-    await _wait_halt(dut, max_cycles=700_000)
+    await setup_test(dut, prog, dram=dram)
+    await wait_halt(dut, max_cycles=700_000)
 
     assert int(dut.done.value) == 1
     assert int(dut.fault.value) == 0
-    assert _read_accum_16x16(dut) == exp
+    assert read_accum_16x16(dut) == exp
 
 
 @cocotb.test()
@@ -156,12 +88,12 @@ async def test_matmul_random_regression_chained(dut):
             SYNC(0b010),
             HALT(),
         ])
-        await _setup(dut, prog, dram)
-        await _wait_halt(dut, max_cycles=700_000)
+        await setup_test(dut, prog, dram=dram)
+        await wait_halt(dut, max_cycles=700_000)
 
         assert int(dut.done.value) == 1
         assert int(dut.fault.value) == 0
-        assert _read_accum_16x16(dut) == exp, f"random chained mismatch on case {tc}"
+        assert read_accum_16x16(dut) == exp, f"random chained mismatch on case {tc}"
 
 
 @cocotb.test()
@@ -179,12 +111,12 @@ async def test_matmul_k4_boundary_stress_chained(dut):
         SYNC(0b010),
         HALT(),
     ])
-    await _setup(dut, prog, dram)
-    await _wait_halt(dut, max_cycles=1_100_000)
+    await setup_test(dut, prog, dram=dram)
+    await wait_halt(dut, max_cycles=1_100_000)
 
     assert int(dut.done.value) == 1
     assert int(dut.fault.value) == 0
-    assert _read_accum_16x16(dut) == exp
+    assert read_accum_16x16(dut) == exp
 
 
 @cocotb.test()
@@ -202,9 +134,9 @@ async def test_matmul_multitile_2x2x2_chained(dut):
         SYNC(0b010),
         HALT(),
     ])
-    await _setup(dut, prog, dram)
-    await _wait_halt(dut, max_cycles=1_200_000)
+    await setup_test(dut, prog, dram=dram)
+    await wait_halt(dut, max_cycles=1_200_000)
 
     assert int(dut.done.value) == 1
     assert int(dut.fault.value) == 0
-    assert _read_accum_32x32(dut) == exp
+    assert read_accum_32x32(dut) == exp

@@ -30,87 +30,13 @@ static int tests_pass = 0;
 #define TEST_FAIL(name, msg) do { \
     fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
 
-// ============================================================================
-// Simulation helper
-// ============================================================================
-struct Sim {
-    std::unique_ptr<Vtaccel_top> dut;
-    AXI4SlaveModel dram;
-
-    explicit Sim() : dut(std::make_unique<Vtaccel_top>()), dram(16*1024*1024) {
-        do_reset(dut.get());
-    }
-
-    void load(const std::vector<uint64_t>& prog) {
-        dram.write_program(prog);
-    }
-
-    void start() {
-        dut->start = 1;
-        tick(dut.get(), dram);
-        dut->start = 0;
-    }
-
-    void step(int cycles = 1) {
-        for (int i = 0; i < cycles; ++i)
-            tick(dut.get(), dram);
-    }
-
-    // Start execution; run until halt or fault
-    int run(int timeout = 100000) {
-        start();
-        return run_until_halt(dut.get(), dram, timeout);
-    }
-};
-
-enum BufId : int {
-    BUF_ABUF_ID  = 0,
-    BUF_WBUF_ID  = 1,
-    BUF_ACCUM_ID = 2,
-};
-
-static void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
-    auto* r = dut->rootp;
-    VlWide<4>* mem = nullptr;
-    switch (buf_id) {
-        case BUF_ABUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row]; break;
-        case BUF_WBUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row]; break;
-        case BUF_ACCUM_ID: mem = &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row]; break;
-        default: std::abort();
-    }
-    // Word packing is little-endian per 32-bit lane in Verilated VlWide.
-    for (int w = 0; w < 4; ++w) {
-        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
-                    (uint32_t(data[w * 4 + 1]) <<  8) |
-                    (uint32_t(data[w * 4 + 2]) << 16) |
-                    (uint32_t(data[w * 4 + 3]) << 24);
-    }
-}
-
-static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
-    auto* r = dut->rootp;
-    const VlWide<4>* mem = nullptr;
-    switch (buf_id) {
-        case BUF_ABUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row]; break;
-        case BUF_WBUF_ID:  mem = &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row]; break;
-        case BUF_ACCUM_ID: mem = &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row]; break;
-        default: std::abort();
-    }
-    for (int w = 0; w < 4; ++w) {
-        uint32_t word = (*mem)[w];
-        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
-        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
-        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
-        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
-    }
-}
-
-static std::vector<uint8_t> make_pattern(size_t size, uint8_t seed) {
-    std::vector<uint8_t> data(size);
-    for (size_t i = 0; i < size; ++i)
-        data[i] = uint8_t((seed + (37 * i)) & 0xFF);
-    return data;
-}
+using tbutil::SimHarness;
+using tbutil::sram_write_row;
+using tbutil::sram_read_row;
+using tbutil::make_pattern;
+constexpr int BUF_ABUF_ID  = tbutil::BUF_ABUF_ID;
+constexpr int BUF_WBUF_ID  = tbutil::BUF_WBUF_ID;
+constexpr int BUF_ACCUM_ID = tbutil::BUF_ACCUM_ID;
 
 static void expect_dram_bytes(AXI4SlaveModel& dram, uint64_t addr,
                               const std::vector<uint8_t>& expected,
@@ -132,7 +58,7 @@ static void expect_dram_bytes_16(AXI4SlaveModel& dram, uint64_t addr,
 static void run_roundtrip_case(const char* name, int buf_id, int beats,
                                uint64_t src_addr, uint64_t dst_addr,
                                uint8_t seed) {
-    Sim s;
+    SimHarness s;
     const size_t nbytes = size_t(beats) * 16;
     std::vector<uint8_t> src = make_pattern(nbytes, seed);
     s.dram.write_bytes(src_addr, src.data(), src.size());
@@ -156,7 +82,7 @@ static void run_roundtrip_case(const char* name, int buf_id, int beats,
 static void expect_dma_fault_after_injection(const char* name, int xfer_len,
                                              int beat_index, int resp,
                                              int force_last) {
-    Sim s;
+    SimHarness s;
     constexpr uint64_t SRC = 0x1D0000;
     std::vector<uint8_t> src = make_pattern(size_t(xfer_len) * 16, 0x44);
     s.dram.write_bytes(SRC, src.data(), src.size());
@@ -204,7 +130,7 @@ static void expect_dma_fault_after_injection(const char* name, int xfer_len,
 // ============================================================================
 static void test_load_16bytes_to_sram_direct() {
     const char* name = "load_16bytes_to_sram_direct";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x110000;
     uint8_t src[16];
@@ -232,7 +158,7 @@ static void test_load_16bytes_to_sram_direct() {
 // ============================================================================
 static void test_store_16bytes_from_sram_direct() {
     const char* name = "store_16bytes_from_sram_direct";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t DST = 0x210000;
     uint8_t src[16];
@@ -260,7 +186,7 @@ static void test_store_16bytes_from_sram_direct() {
 // ============================================================================
 static void test_load_single_beat() {
     const char* name = "load_single_beat";
-    Sim s;
+    SimHarness s;
 
     // Write 16 known bytes at DRAM address 0x10000 (src)
     constexpr uint64_t SRC_ADDR  = 0x10000;
@@ -306,7 +232,7 @@ static void test_load_single_beat() {
 // ============================================================================
 static void test_load_multi_beat() {
     const char* name = "load_multi_beat";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x30000;
     constexpr uint64_t DST = 0x40000;
@@ -343,7 +269,7 @@ static void test_load_multi_beat() {
 // ============================================================================
 static void test_load_to_wbuf() {
     const char* name = "load_to_wbuf";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x50000;
     constexpr uint64_t DST = 0x60000;
@@ -374,7 +300,7 @@ static void test_load_to_wbuf() {
 // ============================================================================
 static void test_load_to_accum() {
     const char* name = "load_to_accum";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x70000;
     constexpr uint64_t DST = 0x80000;
@@ -405,7 +331,7 @@ static void test_load_to_accum() {
 // ============================================================================
 static void test_addr_reg_independence() {
     const char* name = "addr_reg_independence";
-    Sim s;
+    SimHarness s;
 
     // Data at two separate DRAM regions
     constexpr uint64_t SRC_A = 0x90000;
@@ -449,7 +375,7 @@ static void test_addr_reg_independence() {
 // ============================================================================
 static void test_dram_oob_fault() {
     const char* name = "dram_oob_fault";
-    Sim s;
+    SimHarness s;
 
     // Set R0 to near end of 16 MB DRAM; xfer_len=2 → 32 bytes past end
     // DRAM_SIZE = 16 MB = 0x1000000
@@ -475,7 +401,7 @@ static void test_dram_oob_fault() {
 // ============================================================================
 static void test_store_oob_fault() {
     const char* name = "store_oob_fault";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t NEAR_END = 0xFFFFF0;
 
@@ -498,7 +424,7 @@ static void test_store_oob_fault() {
 // ============================================================================
 static void test_load_dispatch_async() {
     const char* name = "load_dispatch_async";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0xD0000;
     uint8_t src[16] = {};
@@ -525,7 +451,7 @@ static void test_load_dispatch_async() {
 // ============================================================================
 static void test_dram_offset() {
     const char* name = "dram_offset";
-    Sim s;
+    SimHarness s;
 
     // R0 = 0x50000 (base); dram_off=4 → effective = 0x50000 + 4*16 = 0x50040
     constexpr uint64_t BASE = 0x50040;   // effective address
@@ -558,7 +484,7 @@ static void test_dram_offset() {
 // ============================================================================
 static void test_zero_length_load_noop() {
     const char* name = "zero_length_load_noop";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x102000;
     constexpr uint64_t DST = 0x104000;
@@ -586,7 +512,7 @@ static void test_zero_length_load_noop() {
 // ============================================================================
 static void test_zero_length_store_noop() {
     const char* name = "zero_length_store_noop";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t DST = 0x106000;
     std::vector<uint8_t> sentinel = make_pattern(16, 0xA3);
@@ -621,7 +547,7 @@ static void test_large_roundtrip_lengths() {
 // ============================================================================
 static void test_fetch_interleave_between_dma_bursts() {
     const char* name = "fetch_interleave_between_dma_bursts";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x540000;
     std::vector<uint8_t> src = make_pattern(size_t(257) * 16, 0x77);
@@ -669,7 +595,7 @@ static void test_dma_read_faults() {
 // ============================================================================
 static void test_store_bresp_fault() {
     const char* name = "store_bresp_fault";
-    Sim s;
+    SimHarness s;
 
     constexpr uint64_t SRC = 0x580000;
     constexpr uint64_t DST = 0x5A0000;

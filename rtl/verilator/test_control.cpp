@@ -35,31 +35,13 @@ static int tests_pass = 0;
 // ============================================================================
 // Helper: create fresh DUT + DRAM, reset, load program, run
 // ============================================================================
-struct Sim {
-    std::unique_ptr<Vtaccel_top> dut;
-    AXI4SlaveModel dram;
-
-    explicit Sim() : dut(std::make_unique<Vtaccel_top>()), dram(16*1024*1024) {
-        do_reset(dut.get());
-    }
-
-    void load(const std::vector<uint64_t>& prog) {
-        dram.write_program(prog);
-    }
-
-    int run(int timeout = 5000) {
-        dut->start = 1;
-        tick(dut.get(), dram);
-        dut->start = 0;
-        return run_until_halt(dut.get(), dram, timeout);
-    }
-};
+using tbutil::SimHarness;
 
 static void expect_fault_program(const char* name,
                                  const std::vector<uint64_t>& prog,
                                  uint32_t expected_fault_code,
                                  int timeout = 5000) {
-    Sim s;
+    SimHarness s;
     s.load(prog);
     s.run(timeout);
     EXPECT(s.dut->fault == 1, "fault should assert");
@@ -73,7 +55,7 @@ static void expect_fault_program(const char* name,
 // ============================================================================
 static void test_nop_halt() {
     const char* name = "nop_then_halt";
-    Sim s;
+    SimHarness s;
     s.load({ insn::NOP(), insn::HALT() });
     s.run();
     EXPECT(s.dut->done  == 1, "done should be 1 after HALT");
@@ -86,7 +68,7 @@ static void test_nop_halt() {
 // ============================================================================
 static void test_multi_nop_halt() {
     const char* name = "multi_nop_halt";
-    Sim s;
+    SimHarness s;
     s.load({ insn::NOP(), insn::NOP(), insn::NOP(), insn::HALT() });
     s.run();
     EXPECT(s.dut->done  == 1, "done after 3 NOPs + HALT");
@@ -99,7 +81,7 @@ static void test_multi_nop_halt() {
 // ============================================================================
 static void test_immediate_halt() {
     const char* name = "immediate_halt";
-    Sim s;
+    SimHarness s;
     s.load({ insn::HALT() });
     s.run();
     EXPECT(s.dut->done  == 1, "done on first HALT");
@@ -112,7 +94,7 @@ static void test_immediate_halt() {
 // ============================================================================
 static void test_config_tile() {
     const char* name = "config_tile_registers";
-    Sim s;
+    SimHarness s;
     // CONFIG_TILE M=3, N=7, K=5; then HALT
     s.load({ insn::CONFIG_TILE(3, 7, 5), insn::HALT() });
     s.run();
@@ -129,7 +111,7 @@ static void test_config_tile() {
 // ============================================================================
 static void test_config_tile_then_matmul() {
     const char* name = "config_tile_then_matmul_no_fault";
-    Sim s;
+    SimHarness s;
     s.load({
         insn::CONFIG_TILE(1, 1, 1),
         insn::MATMUL(/*src1*/0, 0, /*src2*/1, 0, /*dst*/2, 0, /*sreg*/0),
@@ -147,7 +129,7 @@ static void test_config_tile_then_matmul() {
 // ============================================================================
 static void test_set_scale() {
     const char* name = "set_scale_immediate";
-    Sim s;
+    SimHarness s;
     // SET_SCALE S0 = 0x3C00 (1.0 FP16), then HALT
     s.load({ insn::SET_SCALE(0, 0x3C00), insn::HALT() });
     s.run();
@@ -161,7 +143,7 @@ static void test_set_scale() {
 // ============================================================================
 static void test_set_addr() {
     const char* name = "set_addr_lo_hi";
-    Sim s;
+    SimHarness s;
     constexpr uint32_t LO = 0x0100000;
     constexpr uint32_t HI = 0x0000123;
     s.load({
@@ -185,7 +167,7 @@ static void test_set_addr() {
 // ============================================================================
 static void test_sync_nop() {
     const char* name = "sync_mask_zero";
-    Sim s;
+    SimHarness s;
     s.load({ insn::SYNC(0b000), insn::HALT() });
     s.run();
     EXPECT(s.dut->done  == 1, "done after SYNC(0) + HALT");
@@ -198,7 +180,7 @@ static void test_sync_nop() {
 // ============================================================================
 static void test_sync_all_idle() {
     const char* name = "sync_all_units_idle";
-    Sim s;
+    SimHarness s;
     s.load({ insn::SYNC(0b111), insn::HALT() });
     s.run(500);
     EXPECT(s.dut->done  == 1, "done after SYNC(7) when all units idle");
@@ -211,7 +193,7 @@ static void test_sync_all_idle() {
 // ============================================================================
 static void test_illegal_opcode() {
     const char* name = "illegal_opcode_fault";
-    Sim s;
+    SimHarness s;
     s.load({ insn::ILLEGAL_OP() });
     s.run(500);
     EXPECT(s.dut->fault == 1, "fault asserted for illegal opcode");
@@ -256,7 +238,7 @@ static void test_sfu_no_config_faults() {
 // ============================================================================
 static void test_sfu_dispatch_paths() {
     {
-        Sim s;
+        SimHarness s;
         s.load({
             insn::CONFIG_TILE(1, 1, 1),
             insn::SET_SCALE(0, 0x3800),
@@ -272,7 +254,7 @@ static void test_sfu_dispatch_paths() {
     }
 
     {
-        Sim s;
+        SimHarness s;
         s.load({
             insn::CONFIG_TILE(1, 1, 1),
             insn::SET_SCALE(0, 0x3800),
@@ -288,7 +270,7 @@ static void test_sfu_dispatch_paths() {
     }
 
     {
-        Sim s;
+        SimHarness s;
         s.load({
             insn::CONFIG_TILE(1, 1, 1),
             insn::SET_SCALE(0, 0x3800),
@@ -321,7 +303,7 @@ static void test_set_scale_from_buffer_unsupported() {
 // ============================================================================
 static void test_multiburst_dma_supported() {
     const char* name = "multiburst_dma_supported";
-    Sim s;
+    SimHarness s;
     s.load({
         insn::SET_ADDR_LO(0, 0),
         insn::SET_ADDR_HI(0, 0),
@@ -342,7 +324,7 @@ static void test_multiburst_dma_supported() {
 // ============================================================================
 static void test_matmul_no_config() {
     const char* name = "matmul_without_config_tile";
-    Sim s;
+    SimHarness s;
     s.load({ insn::MATMUL(0, 0, 1, 0, 2, 0, 0) });
     s.run(500);
     EXPECT(s.dut->fault == 1, "fault for missing CONFIG_TILE");
@@ -355,7 +337,7 @@ static void test_matmul_no_config() {
 // ============================================================================
 static void test_fetch_rresp_fault() {
     const char* name = "fetch_rresp_fault";
-    Sim s;
+    SimHarness s;
     s.load({ insn::NOP(), insn::HALT() });
     s.dram.inject_next_read(/*resp=*/2);
     s.run(500);
@@ -369,7 +351,7 @@ static void test_fetch_rresp_fault() {
 // ============================================================================
 static void test_fetch_missing_rlast_fault() {
     const char* name = "fetch_missing_rlast_fault";
-    Sim s;
+    SimHarness s;
     s.load({ insn::NOP(), insn::HALT() });
     s.dram.inject_next_read(/*resp=*/0, /*force_last=*/0);
     s.run(500);
@@ -383,7 +365,7 @@ static void test_fetch_missing_rlast_fault() {
 // ============================================================================
 static void test_dma_sram_oob_fault() {
     const char* name = "dma_sram_oob_fault";
-    Sim s;
+    SimHarness s;
     s.load({
         insn::SET_ADDR_LO(0, 0),
         insn::SET_ADDR_HI(0, 0),
@@ -402,7 +384,7 @@ static void test_dma_sram_oob_fault() {
 // ============================================================================
 static void test_systolic_sram_oob_fault() {
     const char* name = "systolic_sram_oob_fault";
-    Sim s;
+    SimHarness s;
     s.load({
         insn::CONFIG_TILE(1, 1, 1),
         insn::MATMUL(0/*ABUF*/, 8192, 1/*WBUF*/, 0, 2/*ACCUM*/, 0, 0),
@@ -420,7 +402,7 @@ static void test_systolic_sram_oob_fault() {
 // ============================================================================
 static void test_long_nop_sequence() {
     const char* name = "ten_nops_then_halt";
-    Sim s;
+    SimHarness s;
     std::vector<uint64_t> prog(10, insn::NOP());
     prog.push_back(insn::HALT());
     s.load(prog);
@@ -435,7 +417,7 @@ static void test_long_nop_sequence() {
 // ============================================================================
 static void test_load_dispatch() {
     const char* name = "load_dispatch_no_stall";
-    Sim s;
+    SimHarness s;
     s.load({
         insn::SET_ADDR_LO(0, 0),
         insn::SET_ADDR_HI(0, 0),

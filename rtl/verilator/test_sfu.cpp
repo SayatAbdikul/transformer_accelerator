@@ -22,120 +22,16 @@ static int tests_pass = 0;
 #define TEST_FAIL(name, msg) do { \
     fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
 
-struct Sim {
-    std::unique_ptr<Vtaccel_top> dut;
-    AXI4SlaveModel dram;
-
-    explicit Sim() : dut(std::make_unique<Vtaccel_top>()), dram(16 * 1024 * 1024) {
-        do_reset(dut.get());
-    }
-
-    void load(const std::vector<uint64_t>& prog) {
-        dram.write_program(prog);
-    }
-
-    void run(int timeout = 500000) {
-        dut->start = 1;
-        tick(dut.get(), dram);
-        dut->start = 0;
-        run_until_halt(dut.get(), dram, timeout);
-    }
-};
-
-enum BufId : int {
-    BUF_ABUF_ID  = 0,
-    BUF_WBUF_ID  = 1,
-    BUF_ACCUM_ID = 2,
-};
-
-static VlWide<4>* row_ptr(Vtaccel_top* dut, int buf_id, int row) {
-    auto* r = dut->rootp;
-    switch (buf_id) {
-        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row];
-        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row];
-        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row];
-        default: std::abort();
-    }
-}
-
-static const VlWide<4>* row_ptr_const(Vtaccel_top* dut, int buf_id, int row) {
-    return row_ptr(dut, buf_id, row);
-}
-
-static void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
-    VlWide<4>* mem = row_ptr(dut, buf_id, row);
-    for (int w = 0; w < 4; ++w) {
-        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
-                    (uint32_t(data[w * 4 + 1]) <<  8) |
-                    (uint32_t(data[w * 4 + 2]) << 16) |
-                    (uint32_t(data[w * 4 + 3]) << 24);
-    }
-}
-
-static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
-    const VlWide<4>* mem = row_ptr_const(dut, buf_id, row);
-    for (int w = 0; w < 4; ++w) {
-        uint32_t word = (*mem)[w];
-        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
-        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
-        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
-        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
-    }
-}
-
-static void sram_write_bytes(Vtaccel_top* dut, int buf_id, size_t byte_off,
-                             const std::vector<uint8_t>& data) {
-    size_t pos = 0;
-    while (pos < data.size()) {
-        int row = int((byte_off + pos) / 16);
-        int lane = int((byte_off + pos) % 16);
-        int take = int(std::min<size_t>(16 - lane, data.size() - pos));
-        uint8_t tmp[16];
-        sram_read_row(dut, buf_id, row, tmp);
-        for (int i = 0; i < take; ++i)
-            tmp[lane + i] = data[pos + size_t(i)];
-        sram_write_row(dut, buf_id, row, tmp);
-        pos += size_t(take);
-    }
-}
-
-static std::vector<uint8_t> sram_read_bytes(Vtaccel_top* dut, int buf_id,
-                                            size_t byte_off, size_t len) {
-    std::vector<uint8_t> out(len);
-    size_t pos = 0;
-    while (pos < len) {
-        int row = int((byte_off + pos) / 16);
-        int lane = int((byte_off + pos) % 16);
-        int take = int(std::min<size_t>(16 - lane, len - pos));
-        uint8_t tmp[16];
-        sram_read_row(dut, buf_id, row, tmp);
-        for (int i = 0; i < take; ++i)
-            out[pos + size_t(i)] = tmp[lane + i];
-        pos += size_t(take);
-    }
-    return out;
-}
-
-static std::vector<uint8_t> pack_i32_le(const std::vector<int32_t>& vals) {
-    std::vector<uint8_t> out(vals.size() * 4);
-    for (size_t i = 0; i < vals.size(); ++i) {
-        uint32_t word = uint32_t(vals[i]);
-        out[i * 4 + 0] = uint8_t((word >> 0) & 0xFF);
-        out[i * 4 + 1] = uint8_t((word >> 8) & 0xFF);
-        out[i * 4 + 2] = uint8_t((word >> 16) & 0xFF);
-        out[i * 4 + 3] = uint8_t((word >> 24) & 0xFF);
-    }
-    return out;
-}
-
-static std::vector<uint8_t> pack_u16_le(const std::vector<uint16_t>& vals) {
-    std::vector<uint8_t> out(vals.size() * 2);
-    for (size_t i = 0; i < vals.size(); ++i) {
-        out[i * 2 + 0] = uint8_t(vals[i] & 0xFF);
-        out[i * 2 + 1] = uint8_t((vals[i] >> 8) & 0xFF);
-    }
-    return out;
-}
+using tbutil::SimHarness;
+using tbutil::sram_write_row;
+using tbutil::sram_read_row;
+using tbutil::sram_write_bytes;
+using tbutil::sram_read_bytes;
+using tbutil::pack_i32_le;
+using tbutil::pack_u16_le;
+constexpr int BUF_ABUF_ID  = tbutil::BUF_ABUF_ID;
+constexpr int BUF_WBUF_ID  = tbutil::BUF_WBUF_ID;
+constexpr int BUF_ACCUM_ID = tbutil::BUF_ACCUM_ID;
 
 static double fp16_to_double(uint16_t bits) {
     bool sign = (bits >> 15) & 1;
@@ -287,7 +183,7 @@ static void test_softmax_accum_large_row() {
     for (size_t i = 0; i < expected.size(); ++i)
         expected[i] = uint8_t(expected_i8[i]);
 
-    Sim s;
+    SimHarness s;
     sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
     s.load({
         insn::CONFIG_TILE(1, 13, 1),
@@ -333,7 +229,7 @@ static void test_layernorm_identity() {
     auto beta_bytes = pack_u16_le(beta);
     gb_bytes.insert(gb_bytes.end(), beta_bytes.begin(), beta_bytes.end());
 
-    Sim s;
+    SimHarness s;
     sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src_bytes);
     sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, gb_bytes);
     s.load({
@@ -372,7 +268,7 @@ static void test_gelu_abuf_roundtrip() {
         expected[i] = uint8_t(expected_i8[i]);
     }
 
-    Sim s;
+    SimHarness s;
     sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src_bytes);
     s.load({
         insn::CONFIG_TILE(1, 1, 1),
@@ -408,7 +304,7 @@ static void test_gelu_accum_roundtrip() {
     for (size_t i = 0; i < expected.size(); ++i)
         expected[i] = uint8_t(expected_i8[i]);
 
-    Sim s;
+    SimHarness s;
     sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
     s.load({
         insn::CONFIG_TILE(1, 1, 1),

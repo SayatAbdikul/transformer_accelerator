@@ -1,55 +1,16 @@
 """cocotb tests for the Stage D SFU engine."""
 
 import math
-import struct
 
 import cocotb
-from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge
 import numpy as np
 
-from utils.dram_model import DramModel
 from utils.insn_builder import (
     HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
     LOAD, STORE, SOFTMAX, LAYERNORM, GELU,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM,
 )
-
-
-async def _setup(dut, insns, dram_writes=None, dram=None):
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    if dram is None:
-        dram = DramModel()
-    dram.write_program(insns)
-    if dram_writes:
-        for addr, data in dram_writes.items():
-            dram.write_bytes(addr, bytes(data))
-    cocotb.start_soon(dram.axi_slave(dut))
-    cocotb.start_soon(dram.axi_write_slave(dut))
-
-    dut.rst_n.value = 0
-    dut.start.value = 0
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await RisingEdge(dut.clk)
-
-    dut.start.value = 1
-    await RisingEdge(dut.clk)
-    dut.start.value = 0
-    return dram
-
-
-async def _wait_halt(dut, max_cycles=800_000):
-    for _ in range(max_cycles):
-        await RisingEdge(dut.clk)
-        if int(dut.done.value) or int(dut.fault.value):
-            return
-    raise TimeoutError("DUT did not halt")
-
-
-def _set_addr(reg: int, addr: int):
-    return [SET_ADDR_LO(reg, addr & 0x0FFFFFFF), SET_ADDR_HI(reg, (addr >> 28) & 0x0FFFFFFF)]
+from utils.testbench import set_addr, setup_test, wait_halt
 
 
 def _fp16_to_float(bits: int) -> float:
@@ -132,7 +93,7 @@ async def test_softmax_accum_large_row(dut):
     expected = _softmax_ref(inp, in_scale, out_scale).astype(np.int8).tobytes()
 
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ACCUM, 0, (M * N * 4) // 16, 0, 0),
         SYNC(0b001),
         CONFIG_TILE(m_tiles, n_tiles, 1),
@@ -140,13 +101,13 @@ async def test_softmax_accum_large_row(dut):
         SET_SCALE(3, 0x3400),
         SOFTMAX(BUF_ACCUM, 0, BUF_ABUF, dst_off, 2),
         SYNC(0b100),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_ABUF, dst_off, (M * N) // 16, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: inp.astype("<i4").tobytes()})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: inp.astype("<i4").tobytes()})
+    await wait_halt(dut)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     got = bytes(dram.mem[dst_addr:dst_addr + len(expected)])
     assert got == expected
@@ -174,10 +135,10 @@ async def test_layernorm_identity(dut):
     expected = _layernorm_ref(inp, gamma, beta, in_scale, out_scale).astype(np.int8).tobytes()
 
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ABUF, 0, (M * N) // 16, 0, 0),
         SYNC(0b001),
-        *_set_addr(1, gb_addr),
+        *set_addr(1, gb_addr),
         LOAD(BUF_WBUF, 0, len(gb) // 16, 1, 0),
         SYNC(0b001),
         CONFIG_TILE(m_tiles, n_tiles, 1),
@@ -185,13 +146,13 @@ async def test_layernorm_identity(dut):
         SET_SCALE(4, 0x3400),
         LAYERNORM(BUF_ABUF, 0, BUF_WBUF, 0, BUF_ABUF, dst_off, 3),
         SYNC(0b100),
-        *_set_addr(2, dst_addr),
+        *set_addr(2, dst_addr),
         STORE(BUF_ABUF, dst_off, (M * N) // 16, 2, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: inp.tobytes(), gb_addr: gb})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: inp.tobytes(), gb_addr: gb})
+    await wait_halt(dut)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     got = bytes(dram.mem[dst_addr:dst_addr + len(expected)])
     assert got == expected
@@ -213,7 +174,7 @@ async def test_gelu_accum_roundtrip(dut):
     expected = _gelu_ref_i32(inp, in_scale, out_scale).astype(np.int8).tobytes()
 
     prog = [
-        *_set_addr(0, src_addr),
+        *set_addr(0, src_addr),
         LOAD(BUF_ACCUM, 0, (M * N * 4) // 16, 0, 0),
         SYNC(0b001),
         CONFIG_TILE(1, 1, 1),
@@ -221,13 +182,13 @@ async def test_gelu_accum_roundtrip(dut):
         SET_SCALE(9, 0x3400),
         GELU(BUF_ACCUM, 0, BUF_ABUF, dst_off, 8),
         SYNC(0b100),
-        *_set_addr(1, dst_addr),
+        *set_addr(1, dst_addr),
         STORE(BUF_ABUF, dst_off, (M * N) // 16, 1, 0),
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src_addr: inp.astype("<i4").tobytes()})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={src_addr: inp.astype("<i4").tobytes()})
+    await wait_halt(dut)
     assert int(dut.done.value) == 1 and int(dut.fault.value) == 0
     got = bytes(dram.mem[dst_addr:dst_addr + len(expected)])
     assert got == expected

@@ -5,8 +5,10 @@
 #   iverilog >= 11  OR  verilator >= 5.0  OR  cadence/synopsys VCS
 #
 # Usage:
-#   make                  — run all Phase 1 cocotb tests (Icarus Verilog)
-#   make SIM=verilator    — run with Verilator
+#   make                  — run the default stable top-level cocotb suite
+#   make SIM=verilator    — run with Verilator (sign-off path)
+#   make test_dma SIM=verilator
+#   make test_systolic_chained SIM=verilator
 #   make clean
 
 TOPLEVEL_LANG ?= verilog
@@ -54,7 +56,29 @@ endif
 # cocotb makefile magic
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
-.PHONY: clean
+.PHONY: clean test_all test_fetch_decode test_dma test_helpers test_sfu test_systolic test_systolic_chained
+
+test_all:
+	$(MAKE) SIM=$(SIM) MODULE=test_fetch_decode,test_dma,test_helpers,test_sfu,test_systolic sim
+
+test_fetch_decode:
+	$(MAKE) SIM=$(SIM) MODULE=test_fetch_decode sim
+
+test_dma:
+	$(MAKE) SIM=$(SIM) MODULE=test_dma sim
+
+test_helpers:
+	$(MAKE) SIM=$(SIM) MODULE=test_helpers sim
+
+test_sfu:
+	$(MAKE) SIM=$(SIM) MODULE=test_sfu sim
+
+test_systolic:
+	$(MAKE) SIM=$(SIM) MODULE=test_systolic sim
+
+test_systolic_chained:
+	$(MAKE) SIM=$(SIM) MODULE=test_systolic_chained sim
+
 clean::
 	rm -rf sim_build __pycache__ results.xml *.vcd dump.* \
 	       $(TOPLEVEL).vvp iverilog_dump.v

@@ -13,54 +13,11 @@ from utils.insn_builder import (
     BUF_ABUF, BUF_WBUF, BUF_ACCUM,
 )
 from utils.dram_model import DramModel
-
-
-# ---------------------------------------------------------------------------
-# Common setup helper
-# ---------------------------------------------------------------------------
-
-async def _setup(
-    dut,
-    insns,
-    dram_writes=None,
-    write_slave_kwargs=None,
-):
-    """Clock, reset, load program+data, start, return dram model."""
-    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
-    dram = DramModel()
-    dram.write_program(insns)
-    if dram_writes:
-        for addr, data in dram_writes.items():
-            dram.write_bytes(addr, bytes(data))
-    cocotb.start_soon(dram.axi_slave(dut))
-    cocotb.start_soon(dram.axi_write_slave(dut, **(write_slave_kwargs or {})))
-
-    dut.rst_n.value = 0
-    for _ in range(10):
-        await RisingEdge(dut.clk)
-    dut.rst_n.value = 1
-    await RisingEdge(dut.clk)
-
-    dut.start.value = 1
-    await RisingEdge(dut.clk)
-    dut.start.value = 0
-    return dram
-
-
-async def _wait_halt(dut, max_cycles=100_000):
-    for _ in range(max_cycles):
-        await RisingEdge(dut.clk)
-        if dut.done.value == 1 or dut.fault.value == 1:
-            return
-    raise TimeoutError("DUT did not halt")
-
-
-def _pattern(nbytes: int, seed: int) -> bytes:
-    return bytes((seed + 37 * i) & 0xFF for i in range(nbytes))
+from utils.testbench import pattern, setup_test, wait_halt
 
 
 async def _roundtrip_case(dut, name: str, buf_id: int, beats: int, src: int, dst: int, seed: int):
-    src_data = _pattern(beats * 16, seed)
+    src_data = pattern(beats * 16, seed)
     prog = [
         SET_ADDR_LO(0, src), SET_ADDR_HI(0, 0),
         LOAD(buf_id, 0, beats, 0, 0),
@@ -70,8 +27,8 @@ async def _roundtrip_case(dut, name: str, buf_id: int, beats: int, src: int, dst
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src: src_data})
-    await _wait_halt(dut, max_cycles=2_000_000)
+    dram = await setup_test(dut, prog, dram_writes={src: src_data})
+    await wait_halt(dut, max_cycles=2_000_000)
 
     assert dut.done.value == 1, f"{name}: expected done"
     assert dut.fault.value == 0, f"{name}: unexpected fault"
@@ -94,7 +51,7 @@ async def _expect_dma_read_fault(
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {src: _pattern(xfer_len * 16, 0x44)})
+    dram = await setup_test(dut, prog, dram_writes={src: pattern(xfer_len * 16, 0x44)})
 
     dma_ar_seen = False
     dma_read_base = 0
@@ -181,8 +138,8 @@ async def test_load_store_roundtrip(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut)
 
     assert dut.done.value == 1,  "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -205,8 +162,8 @@ async def test_load_multi_beat(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut)
 
     assert dut.done.value == 1,  "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -230,8 +187,8 @@ async def test_load_to_wbuf(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut)
 
     assert dut.done.value == 1 and dut.fault.value == 0
     assert bytes(dram.mem[DST:DST+16]) == src_data
@@ -253,8 +210,8 @@ async def test_load_to_accum(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut)
 
     assert dut.done.value == 1 and dut.fault.value == 0
     assert bytes(dram.mem[DST:DST+16]) == src_data
@@ -286,8 +243,8 @@ async def test_addr_reg_independence(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC_A: data_a, SRC_B: data_b})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC_A: data_a, SRC_B: data_b})
+    await wait_halt(dut)
 
     assert dut.done.value == 1 and dut.fault.value == 0
     assert bytes(dram.mem[DST_A:DST_A+16]) == data_a, "A mismatch"
@@ -307,8 +264,8 @@ async def test_dram_oob_fault(dut):
         SYNC(0b001),                   # detects fault in SYNC_WAIT
         HALT(),                        # unreachable
     ]
-    await _setup(dut, prog)
-    await _wait_halt(dut)
+    await setup_test(dut, prog)
+    await wait_halt(dut)
 
     assert dut.fault.value == 1, "expected fault"
     assert int(dut.fault_code.value) == 2, \
@@ -327,8 +284,8 @@ async def test_load_dispatch_async(dut):
         SYNC(0b001),    # stalls until DMA done
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: bytes(16)})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: bytes(16)})
+    await wait_halt(dut)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -353,8 +310,8 @@ async def test_dram_offset_field(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut)
 
     assert dut.done.value == 1 and dut.fault.value == 0
     assert bytes(dram.mem[DST:DST+16]) == src_data, "data mismatch"
@@ -371,8 +328,8 @@ async def test_store_oob_fault(dut):
         SYNC(0b001),
         HALT(),
     ]
-    await _setup(dut, prog)
-    await _wait_halt(dut)
+    await setup_test(dut, prog)
+    await wait_halt(dut)
 
     assert dut.fault.value == 1, "expected fault"
     assert int(dut.fault_code.value) == 2, (
@@ -397,8 +354,8 @@ async def test_load_store_max_len_256(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: src_data})
-    await _wait_halt(dut, max_cycles=300_000)
+    dram = await setup_test(dut, prog, dram_writes={SRC: src_data})
+    await wait_halt(dut, max_cycles=300_000)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -416,8 +373,8 @@ async def test_zero_length_load_noop(dut):
         NOP(),
         HALT(),
     ]
-    dram = await _setup(dut, prog)
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog)
+    await wait_halt(dut)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -429,14 +386,14 @@ async def test_zero_length_load_noop(dut):
 async def test_zero_length_store_noop(dut):
     """xfer_len=0 STORE is a legal no-op and leaves DRAM untouched."""
     DST = 0x152000
-    sentinel = _pattern(16, 0xA3)
+    sentinel = pattern(16, 0xA3)
     prog = [
         SET_ADDR_LO(0, DST), SET_ADDR_HI(0, 0),
         STORE(BUF_ABUF, 0, 0, 0, 0),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {DST: sentinel})
-    await _wait_halt(dut)
+    dram = await setup_test(dut, prog, dram_writes={DST: sentinel})
+    await wait_halt(dut)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -485,8 +442,8 @@ async def test_fetch_interleave_between_dma_bursts(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(dut, prog, {SRC: _pattern(257 * 16, 0x77)})
-    await _wait_halt(dut, max_cycles=200_000)
+    dram = await setup_test(dut, prog, dram_writes={SRC: pattern(257 * 16, 0x77)})
+    await wait_halt(dut, max_cycles=200_000)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -514,16 +471,16 @@ async def test_store_backpressure_aw_w(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(
+    dram = await setup_test(
         dut,
         prog,
-        {SRC: src_data},
+        dram_writes={SRC: src_data},
         write_slave_kwargs={
             "w_stall_cycles": 2,
             "b_valid_delay_cycles": 2,
         },
     )
-    await _wait_halt(dut)
+    await wait_halt(dut)
 
     assert dut.done.value == 1, "expected done"
     assert dut.fault.value == 0, "unexpected fault"
@@ -546,13 +503,13 @@ async def test_store_bresp_non_okay_path(dut):
         SYNC(0b001),
         HALT(),
     ]
-    dram = await _setup(
+    dram = await setup_test(
         dut,
         prog,
-        {SRC: src_data},
+        dram_writes={SRC: src_data},
         write_slave_kwargs={"b_resp": 2},
     )
-    await _wait_halt(dut)
+    await wait_halt(dut)
 
     assert dut.done.value == 0, "unexpected done on BRESP fault"
     assert dut.fault.value == 1, "expected fault"
