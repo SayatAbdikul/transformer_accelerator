@@ -203,22 +203,52 @@ static void test_illegal_opcode() {
 }
 
 // ============================================================================
-// Test: remaining legal-but-unsupported instructions fault as FAULT_UNSUPPORTED_OP
+// Test: Stage E helper/SFU paths are now legal and complete cleanly
 // ============================================================================
-static void test_unsupported_ops() {
-    struct UnsupportedCase {
+static void test_stage_e_paths() {
+    struct StageECase {
         const char* name;
-        uint64_t insn;
+        std::vector<uint64_t> prog;
     };
-    const UnsupportedCase cases[] = {
-        { "unsupported_requant_pc",    insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0) },
-        { "unsupported_scale_mul",     insn::SCALE_MUL(2, 0, 2, 0, 0) },
-        { "unsupported_softmax_attnv", insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 0) },
-        { "unsupported_dequant_add",   insn::DEQUANT_ADD(2, 0, 0, 0, 0, 0, 0) },
+    const StageECase cases[] = {
+        { "requant_pc_dispatch", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0),
+            insn::HALT()
+        }},
+        { "scale_mul_dispatch", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(2, 0x3800),
+            insn::SCALE_MUL(0, 0, 1, 0, 2),
+            insn::HALT()
+        }},
+        { "dequant_add_dispatch", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(4, 0x2C00),
+            insn::SET_SCALE(5, 0x3400),
+            insn::DEQUANT_ADD(2, 0, 0, 0, 1, 0, 4),
+            insn::HALT()
+        }},
+        { "softmax_attnv_dispatch_sync", {
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(8, 0x3400),
+            insn::SET_SCALE(9, 0x3400),
+            insn::SET_SCALE(10, 0x3400),
+            insn::SET_SCALE(11, 0x3000),
+            insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 8),
+            insn::SYNC(0b100),
+            insn::HALT()
+        }},
     };
 
-    for (const auto& tc : cases)
-        expect_fault_program(tc.name, {tc.insn}, 6, 500);
+    for (const auto& tc : cases) {
+        SimHarness s;
+        s.load(tc.prog);
+        s.run(100000);
+        EXPECT(s.dut->done == 1, "stage E path should halt cleanly");
+        EXPECT(s.dut->fault == 0, "stage E path should not fault");
+        TEST_PASS(tc.name);
+    }
 }
 
 // ============================================================================
@@ -447,7 +477,7 @@ int main(int argc, char** argv) {
     test_sync_nop();
     test_sync_all_idle();
     test_illegal_opcode();
-    test_unsupported_ops();
+    test_stage_e_paths();
     test_sfu_no_config_faults();
     test_sfu_dispatch_paths();
     test_set_scale_from_buffer_unsupported();

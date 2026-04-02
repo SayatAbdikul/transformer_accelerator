@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,7 @@ using tbutil::sram_read_row;
 using tbutil::sram_write_bytes;
 using tbutil::sram_read_bytes;
 using tbutil::pack_i32_le;
+using tbutil::pack_u16_le;
 using tbutil::unpack_i32_le;
 constexpr int BUF_ABUF_ID  = tbutil::BUF_ABUF_ID;
 constexpr int BUF_WBUF_ID  = tbutil::BUF_WBUF_ID;
@@ -75,11 +77,56 @@ static int64_t fp16_mul_round_even_ref(int32_t src, uint16_t fp16_val) {
     return prod < 0 ? -q : q;
 }
 
+static double fp16_to_double_ref(uint16_t bits) {
+    bool sign = (bits >> 15) & 1;
+    int exp = (bits >> 10) & 0x1F;
+    int frac = bits & 0x3FF;
+    double sign_v = sign ? -1.0 : 1.0;
+    if (exp == 0 && frac == 0)
+        return 0.0;
+    if (exp == 0)
+        return sign_v * (double(frac) / 1024.0) * std::ldexp(1.0, -14);
+    if (exp == 31)
+        return sign_v * 65504.0;
+    return sign_v * (1.0 + double(frac) / 1024.0) * std::ldexp(1.0, exp - 15);
+}
+
+static int round_half_even_ref(double x) {
+    long long floor_i = static_cast<long long>(std::floor(x));
+    double frac = x - static_cast<double>(floor_i);
+    if (frac > 0.5)
+        return int(floor_i + 1);
+    if (frac < 0.5)
+        return int(floor_i);
+    return (floor_i & 1LL) ? int(floor_i + 1) : int(floor_i);
+}
+
 static int8_t requant_ref(int32_t src, uint16_t scale) {
     int64_t scaled = fp16_mul_round_even_ref(src, scale);
     if (scaled > 127) return int8_t(127);
     if (scaled < -128) return int8_t(-128);
     return int8_t(scaled);
+}
+
+static int8_t scale_mul_i8_ref(int8_t src, uint16_t scale) {
+    return requant_ref(int32_t(src), scale);
+}
+
+static int32_t scale_mul_i32_ref(int32_t src, uint16_t scale) {
+    int64_t scaled = fp16_mul_round_even_ref(src, scale);
+    if (scaled > int64_t(INT32_MAX)) return INT32_MAX;
+    if (scaled < int64_t(INT32_MIN)) return INT32_MIN;
+    return int32_t(scaled);
+}
+
+static int8_t dequant_add_ref(int32_t accum, int8_t skip,
+                              uint16_t accum_scale, uint16_t skip_scale) {
+    double x = double(accum) * fp16_to_double_ref(accum_scale) +
+               double(skip) * fp16_to_double_ref(skip_scale);
+    int q = round_half_even_ref(x);
+    if (q > 127) return int8_t(127);
+    if (q < -128) return int8_t(-128);
+    return int8_t(q);
 }
 
 static void expect_fault_program(const char* name,
@@ -363,6 +410,129 @@ static void test_requant_subnormal_negative_zero() {
     TEST_PASS(name);
 }
 
+static void test_requant_pc_per_column() {
+    const char* name = "requant_pc_per_column";
+    SimHarness s;
+    constexpr int SCALE_OFF = 320;
+    constexpr int DST_OFF = 512;
+    std::vector<int32_t> src(16 * 16);
+    std::vector<uint16_t> scales(16);
+    std::vector<uint8_t> expected(16 * 16);
+
+    for (int c = 0; c < 16; ++c)
+        scales[c] = (c % 4 == 0) ? 0x3C00 :
+                    (c % 4 == 1) ? 0x3800 :
+                    (c % 4 == 2) ? 0xBC00 : 0x0000;
+    for (int r = 0; r < 16; ++r) {
+        for (int c = 0; c < 16; ++c) {
+            int32_t v = (c - 6) * 37 + r * 5;
+            src[r * 16 + c] = v;
+            expected[r * 16 + c] = uint8_t(requant_ref(v, scales[c]));
+        }
+    }
+
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, size_t(SCALE_OFF) * 16, pack_u16_le(scales));
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::REQUANT_PC(BUF_ACCUM_ID, 0, BUF_WBUF_ID, SCALE_OFF, BUF_ABUF_ID, DST_OFF, 0),
+        insn::HALT(),
+    });
+    s.run(100000);
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(DST_OFF) * 16, expected.size());
+    if (got != expected) TEST_FAIL(name, "REQUANT_PC mismatch");
+    TEST_PASS(name);
+}
+
+static void test_scale_mul_int8_roundtrip() {
+    const char* name = "scale_mul_int8_roundtrip";
+    SimHarness s;
+    constexpr int DST_OFF = 640;
+    constexpr uint16_t SCALE = 0xB800;  // -0.5
+    std::vector<uint8_t> src(16 * 16);
+    std::vector<uint8_t> expected(16 * 16);
+    for (int i = 0; i < 256; ++i) {
+        int8_t v = int8_t(((i * 9) % 61) - 30);
+        src[i] = uint8_t(v);
+        expected[i] = uint8_t(scale_mul_i8_ref(v, SCALE));
+    }
+
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(2, SCALE),
+        insn::SCALE_MUL(BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 2),
+        insn::HALT(),
+    });
+    s.run(100000);
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
+    if (got != expected) TEST_FAIL(name, "SCALE_MUL INT8 mismatch");
+    TEST_PASS(name);
+}
+
+static void test_scale_mul_accum_roundtrip() {
+    const char* name = "scale_mul_accum_roundtrip";
+    SimHarness s;
+    constexpr int DST_OFF = 256;
+    constexpr uint16_t SCALE = 0x4200;  // 3.0
+    std::vector<int32_t> src(16 * 16);
+    std::vector<int32_t> expected(16 * 16);
+    for (int i = 0; i < 256; ++i) {
+        src[i] = (i % 13 == 0) ? (INT32_MAX / 2) :
+                 (i % 17 == 0) ? (INT32_MIN / 2) :
+                 int32_t(i * 1234 - 150000);
+        expected[i] = scale_mul_i32_ref(src[i], SCALE);
+    }
+
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(3, SCALE),
+        insn::SCALE_MUL(BUF_ACCUM_ID, 0, BUF_ACCUM_ID, DST_OFF, 3),
+        insn::HALT(),
+    });
+    s.run(100000);
+
+    auto got = unpack_i32_le(sram_read_bytes(s.dut.get(), BUF_ACCUM_ID, size_t(DST_OFF) * 16, 16 * 16 * 4ULL));
+    if (got != expected) TEST_FAIL(name, "SCALE_MUL ACCUM mismatch");
+    TEST_PASS(name);
+}
+
+static void test_dequant_add_roundtrip() {
+    const char* name = "dequant_add_roundtrip";
+    SimHarness s;
+    constexpr int DST_OFF = 768;
+    constexpr uint16_t ACC_SCALE = 0x2C00;   // 0.0625
+    constexpr uint16_t SKIP_SCALE = 0x3400;  // 0.25
+    std::vector<int32_t> accum(16 * 16);
+    std::vector<uint8_t> skip(16 * 16);
+    std::vector<uint8_t> expected(16 * 16);
+
+    for (int i = 0; i < 256; ++i) {
+        accum[i] = (i - 120) * 11;
+        int8_t skip_i8 = int8_t(((i * 5) % 29) - 14);
+        skip[i] = uint8_t(skip_i8);
+        expected[i] = uint8_t(dequant_add_ref(accum[i], skip_i8, ACC_SCALE, SKIP_SCALE));
+    }
+
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(accum));
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, skip);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(4, ACC_SCALE),
+        insn::SET_SCALE(5, SKIP_SCALE),
+        insn::DEQUANT_ADD(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 4),
+        insn::HALT(),
+    });
+    s.run(100000);
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
+    if (got != expected) TEST_FAIL(name, "DEQUANT_ADD mismatch");
+    TEST_PASS(name);
+}
+
 static void test_helper_oob_faults() {
     expect_fault_program("helper_buf_copy_oob_fault",
                          { insn::BUF_COPY(BUF_ABUF_ID, 8191, BUF_WBUF_ID, 0, 2, 0, 0) }, 3, 5000);
@@ -372,6 +542,9 @@ static void test_helper_oob_faults() {
     expect_fault_program("helper_requant_bad_mode_fault",
                          { insn::CONFIG_TILE(1, 1, 1),
                            insn::REQUANT(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 0) }, 6, 5000);
+    expect_fault_program("helper_dequant_add_bad_sreg_fault",
+                         { insn::CONFIG_TILE(1, 1, 1),
+                           insn::DEQUANT_ADD(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, 15) }, 6, 5000);
 }
 
 static void test_matmul_then_requant() {
@@ -473,6 +646,10 @@ int main(int argc, char** argv) {
     test_vadd_bias_int32_wrap();
     test_requant_rounding_and_clipping();
     test_requant_subnormal_negative_zero();
+    test_requant_pc_per_column();
+    test_scale_mul_int8_roundtrip();
+    test_scale_mul_accum_roundtrip();
+    test_dequant_add_roundtrip();
     test_helper_oob_faults();
     test_matmul_then_requant();
     test_transpose_then_matmul();

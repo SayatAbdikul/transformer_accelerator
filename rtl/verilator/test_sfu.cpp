@@ -93,6 +93,39 @@ static std::vector<int8_t> softmax_ref(const std::vector<int32_t>& src,
     return out;
 }
 
+static std::vector<int8_t> softmax_attnv_ref(const std::vector<int32_t>& qkt_i32,
+                                             const std::vector<int8_t>& v_i8,
+                                             int M, int K, int N,
+                                             double qkt_scale, double v_scale, double out_scale) {
+    std::vector<int8_t> out(size_t(M) * size_t(N), 0);
+    for (int r = 0; r < M; ++r) {
+        double row_max = double(qkt_i32[size_t(r) * size_t(K)]) * qkt_scale;
+        for (int k = 1; k < K; ++k) {
+            double q = double(qkt_i32[size_t(r) * size_t(K) + size_t(k)]) * qkt_scale;
+            row_max = std::max(row_max, q);
+        }
+
+        std::vector<double> weights(K, 0.0);
+        double exp_sum = 0.0;
+        for (int k = 0; k < K; ++k) {
+            double q = double(qkt_i32[size_t(r) * size_t(K) + size_t(k)]) * qkt_scale;
+            weights[size_t(k)] = std::exp(q - row_max);
+            exp_sum += weights[size_t(k)];
+        }
+
+        for (int n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int k = 0; k < K; ++k) {
+                double prob = weights[size_t(k)] / exp_sum;
+                double v = double(v_i8[size_t(k) * size_t(N) + size_t(n)]) * v_scale;
+                acc += prob * v;
+            }
+            out[size_t(r) * size_t(N) + size_t(n)] = quantize_ref(acc, out_scale);
+        }
+    }
+    return out;
+}
+
 static std::vector<int8_t> layernorm_ref(const std::vector<int8_t>& src,
                                          const std::vector<uint16_t>& gamma_bits,
                                          const std::vector<uint16_t>& beta_bits,
@@ -322,6 +355,84 @@ static void test_gelu_accum_roundtrip() {
     TEST_PASS(name);
 }
 
+static void test_softmax_attnv_roundtrip() {
+    const char* name = "softmax_attnv_roundtrip";
+    constexpr int M = 16;
+    constexpr int K = 16;
+    constexpr int N = 16;
+    constexpr int DST_OFF = 1536;
+    constexpr uint16_t QKT_SCALE_BITS = 0x2C00;   // 0.0625
+    constexpr uint16_t V_SCALE_BITS   = 0x3400;   // 0.25
+    constexpr uint16_t OUT_SCALE_BITS = 0x3400;   // 0.25
+    constexpr uint16_t TRACE_BITS     = 0x3000;   // trace-only
+    const double qkt_scale = fp16_to_double(QKT_SCALE_BITS);
+    const double v_scale = fp16_to_double(V_SCALE_BITS);
+    const double out_scale = fp16_to_double(OUT_SCALE_BITS);
+
+    std::vector<int32_t> qkt(size_t(M) * size_t(K));
+    std::vector<int8_t> v(size_t(K) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int k = 0; k < K; ++k)
+            qkt[size_t(r) * size_t(K) + size_t(k)] = ((r * 3 + k * 5) % 19) - 9;
+    for (int k = 0; k < K; ++k)
+        for (int n = 0; n < N; ++n)
+            v[size_t(k) * size_t(N) + size_t(n)] = int8_t(((k * 7 + n * 11) % 23) - 11);
+
+    auto expected_i8 = softmax_attnv_ref(qkt, v, M, K, N, qkt_scale, v_scale, out_scale);
+    std::vector<uint8_t> v_bytes(v.size()), expected(expected_i8.size());
+    for (size_t i = 0; i < v.size(); ++i)
+        v_bytes[i] = uint8_t(v[i]);
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = uint8_t(expected_i8[i]);
+
+    SimHarness s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(qkt));
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, v_bytes);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(4, QKT_SCALE_BITS),
+        insn::SET_SCALE(5, V_SCALE_BITS),
+        insn::SET_SCALE(6, OUT_SCALE_BITS),
+        insn::SET_SCALE(7, TRACE_BITS),
+        insn::SOFTMAX_ATTNV(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 4),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_softmax_attnv_zero_out_scale() {
+    const char* name = "softmax_attnv_zero_out_scale";
+    constexpr int DST_OFF = 1664;
+    SimHarness s;
+    std::vector<int32_t> qkt(16 * 16, 0);
+    std::vector<uint8_t> v(16 * 16, 0x7F);
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(qkt));
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, v);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(8, 0x3400),
+        insn::SET_SCALE(9, 0x3400),
+        insn::SET_SCALE(10, 0x0000),
+        insn::SET_SCALE(11, 0x3000),
+        insn::SOFTMAX_ATTNV(BUF_ACCUM_ID, 0, BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 8),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, 256);
+    if (!std::all_of(got.begin(), got.end(), [](uint8_t vbyte) { return vbyte == 0; }))
+        TEST_FAIL(name, "zero out-scale should zero destination");
+    TEST_PASS(name);
+}
+
 int main(int argc, char** argv) {
     Verilated::commandArgs(argc, argv);
 
@@ -329,6 +440,8 @@ int main(int argc, char** argv) {
     test_layernorm_identity();
     test_gelu_abuf_roundtrip();
     test_gelu_accum_roundtrip();
+    test_softmax_attnv_roundtrip();
+    test_softmax_attnv_zero_out_scale();
 
     std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     if (tests_pass != tests_run) std::exit(1);

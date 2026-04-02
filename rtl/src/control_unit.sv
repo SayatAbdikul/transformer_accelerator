@@ -121,12 +121,6 @@ module control_unit
   );
     begin
       case (op)
-        OP_REQUANT_PC,
-        OP_SCALE_MUL,
-        OP_SOFTMAX_ATTNV,
-        OP_DEQUANT_ADD:
-          unsupported_op = 1'b1;
-
         OP_SET_SCALE:
           unsupported_op = (s_src_mode != 2'b00);
 
@@ -244,7 +238,10 @@ module control_unit
               end
 
               OP_REQUANT,
-              OP_VADD: begin
+              OP_REQUANT_PC,
+              OP_SCALE_MUL,
+              OP_VADD,
+              OP_DEQUANT_ADD: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   state        <= S_FAULT;
@@ -272,6 +269,7 @@ module control_unit
               // the serialized Stage D resource slot is clear, then advance PC
               // immediately and rely on SYNC(100) for ordering.
               OP_SOFTMAX,
+              OP_SOFTMAX_ATTNV,
               OP_LAYERNORM,
               OP_GELU: begin
                 if (!tile_valid) begin
@@ -390,10 +388,10 @@ module control_unit
             OP_BUF_COPY:
               helper_dispatch = helper_ready_now;
 
-            OP_REQUANT, OP_VADD:
+            OP_REQUANT, OP_REQUANT_PC, OP_SCALE_MUL, OP_VADD, OP_DEQUANT_ADD:
               helper_dispatch = tile_valid && helper_ready_now;
 
-            OP_SOFTMAX, OP_LAYERNORM, OP_GELU:
+            OP_SOFTMAX, OP_SOFTMAX_ATTNV, OP_LAYERNORM, OP_GELU:
               sfu_dispatch = tile_valid && sfu_ready_now;
 
             default: ;

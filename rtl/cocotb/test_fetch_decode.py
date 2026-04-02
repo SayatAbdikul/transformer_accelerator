@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from utils.dram_model import DramModel
 from utils.insn_builder import (
     NOP, HALT, SYNC, CONFIG_TILE, SET_SCALE, SET_ADDR_LO, SET_ADDR_HI,
-    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC,
+    LOAD, MATMUL, ILLEGAL_OP, BUF_COPY, REQUANT_PC, SCALE_MUL, DEQUANT_ADD, SOFTMAX_ATTNV,
     BUF_ABUF, BUF_WBUF, BUF_ACCUM
 )
 
@@ -213,16 +213,28 @@ async def test_buf_copy_same_buffer_transpose_fault(dut):
 
 
 @cocotb.test()
-async def test_unsupported_requant_pc_fault(dut):
-    """New legal opcodes decode, then fault as unsupported until implemented."""
+async def test_stage_e_ops_dispatch_no_fault(dut):
+    """Stage E helper/SFU instructions now execute instead of faulting unsupported."""
     dram, _ = await init_dut(dut)
-    done, fault, fault_code, _ = await run_program(
-        dut, dram,
-        [REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, sreg=0, flags=0)]
-    )
-    assert done == 0
-    assert fault == 1
-    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+    prog = [
+        CONFIG_TILE(1, 1, 1),
+        REQUANT_PC(BUF_ACCUM, 0, BUF_WBUF, 0, BUF_ABUF, 0, sreg=0, flags=0),
+        SET_SCALE(2, 0x3800),
+        SCALE_MUL(BUF_ABUF, 0, BUF_WBUF, 32, sreg=2, flags=0),
+        SET_SCALE(4, 0x2C00),
+        SET_SCALE(5, 0x3400),
+        DEQUANT_ADD(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 64, sreg=4, flags=0),
+        SET_SCALE(8, 0x3400),
+        SET_SCALE(9, 0x3400),
+        SET_SCALE(10, 0x3400),
+        SET_SCALE(11, 0x3000),
+        SOFTMAX_ATTNV(BUF_ACCUM, 0, BUF_ABUF, 0, BUF_WBUF, 96, sreg=8, flags=0),
+        SYNC(0b100),
+        HALT(),
+    ]
+    done, fault, _, _ = await run_program(dut, dram, prog, timeout_cycles=20000)
+    assert done == 1
+    assert fault == 0
 
 
 @cocotb.test()

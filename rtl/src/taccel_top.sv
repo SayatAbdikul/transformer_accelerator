@@ -197,7 +197,7 @@ module taccel_top
   logic [9:0]  tile_m_in, tile_n_in, tile_k_in;
   logic [9:0]  tile_m, tile_n, tile_k;
   logic        tile_valid;
-  logic [15:0] scale_rdata0, scale_rdata1;
+  logic [15:0] scale_rdata0, scale_rdata1, scale_rdata2, scale_rdata3;
   logic [55:0] addr_rdata;
   logic [1:0]  helper_src1_buf_w, helper_src2_buf_w, helper_dst_buf_w;
   logic [15:0] helper_src1_off_w, helper_src2_off_w, helper_dst_off_w;
@@ -446,6 +446,10 @@ module taccel_top
     .scale_rdata0 (scale_rdata0),
     .scale_raddr1 (insn.sreg + 4'd1),
     .scale_rdata1 (scale_rdata1),
+    .scale_raddr2 (insn.sreg + 4'd2),
+    .scale_rdata2 (scale_rdata2),
+    .scale_raddr3 (insn.sreg + 4'd3),
+    .scale_rdata3 (scale_rdata3),
     .addr_lo_we   (addr_lo_we),
     .addr_hi_we   (addr_hi_we),
     .addr_wsel    (addr_wsel),
@@ -473,12 +477,14 @@ module taccel_top
     .src2_off       (helper_src2_off_w),
     .dst_buf        (helper_dst_buf_w),
     .dst_off        (helper_dst_off_w),
+    .sreg           (insn.sreg),
     .b_length       (insn.b_length),
     .b_src_rows     (insn.b_src_rows),
     .b_transpose    (insn.b_transpose),
     .tile_m         (tile_m),
     .tile_n         (tile_n),
-    .scale_data     (scale_rdata0),
+    .scale0_data    (scale_rdata0),
+    .scale1_data    (scale_rdata1),
     .helper_busy       (helper_busy),
     .helper_fault      (helper_fault_w),
     .helper_fault_code (helper_fault_code_w),
@@ -510,8 +516,11 @@ module taccel_top
     .sreg           (insn.sreg),
     .tile_m         (tile_m),
     .tile_n         (tile_n),
+    .tile_k         (tile_k),
     .scale0_data    (scale_rdata0),
     .scale1_data    (scale_rdata1),
+    .scale2_data    (scale_rdata2),
+    .scale3_data    (scale_rdata3),
     .sfu_busy       (sfu_busy),
     .sfu_fault      (sfu_fault_w),
     .sfu_fault_code (sfu_fault_code_w),

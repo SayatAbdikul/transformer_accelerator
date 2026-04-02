@@ -1,9 +1,12 @@
 // Blocking helper engine for Phase C baseline helper instructions.
 //
 // Supported operations:
-//   - BUF_COPY   : flat copy + distinct-buffer transpose
-//   - VADD       : INT8 saturating add and ACCUM+WBUF bias add
-//   - REQUANT    : ACCUM INT32 -> ABUF/WBUF INT8 via exact FP16 scale
+//   - BUF_COPY     : flat copy + distinct-buffer transpose
+//   - VADD         : INT8 saturating add and ACCUM+WBUF bias add
+//   - REQUANT      : ACCUM INT32 -> ABUF/WBUF INT8 via exact FP16 scale
+//   - REQUANT_PC   : ACCUM INT32 -> ABUF/WBUF INT8 via per-column FP16 scales
+//   - SCALE_MUL    : width-preserving tile-scale multiply for INT8 / INT32
+//   - DEQUANT_ADD  : ACCUM + INT8 skip path fused back to INT8
 //
 // The helper engine is architecturally blocking. Control dispatches it through
 // helper_dispatch and waits in S_DISP_WAIT until helper_busy drops.
@@ -35,12 +38,14 @@ module blocking_helper_engine
   input  logic [15:0]  src2_off,
   input  logic [1:0]   dst_buf,
   input  logic [15:0]  dst_off,
+  input  logic [3:0]   sreg,
   input  logic [15:0]  b_length,
   input  logic [5:0]   b_src_rows,
   input  logic         b_transpose,
   input  logic [9:0]   tile_m,
   input  logic [9:0]   tile_n,
-  input  logic [15:0]  scale_data,
+  input  logic [15:0]  scale0_data,
+  input  logic [15:0]  scale1_data,
 
   output logic         helper_busy,
   output logic         helper_fault,
@@ -68,27 +73,44 @@ module blocking_helper_engine
   //   H_V8_*     : INT8 residual VADD
   //   H_VB_*     : load and reuse one INT32 bias row chunk
   //   H_VACC_*   : INT32 ACCUM bias add
-  //   H_RQ_*     : REQUANT four ACCUM rows into one INT8 row
-  typedef enum logic [4:0] {
-    H_IDLE       = 5'd0,
-    H_FLAT_READ  = 5'd1,
-    H_FLAT_WRITE = 5'd2,
-    H_TSRC_REQ1  = 5'd3,
-    H_TSRC_CAP1  = 5'd4,
-    H_TSRC_REQ2  = 5'd5,
-    H_TSRC_CAP2  = 5'd6,
-    H_TDST_REQ   = 5'd7,
-    H_TDST_WRITE = 5'd8,
-    H_V8_READ    = 5'd9,
-    H_V8_WRITE   = 5'd10,
-    H_VB_REQ     = 5'd11,
-    H_VB_LATCH   = 5'd12,
-    H_VACC_READ  = 5'd13,
-    H_VACC_WRITE = 5'd14,
-    H_RQ_REQ     = 5'd15,
-    H_RQ_LATCH   = 5'd16,
-    H_RQ_WRITE   = 5'd17,
-    H_FAULT      = 5'd18
+  //   H_RQ_*       : REQUANT four ACCUM rows into one INT8 row
+  //   H_SM_*       : SCALE_MUL row-wise read / write
+  //   H_RQPC_*     : REQUANT_PC scale-table load + ACCUM gather + write
+  //   H_DQ_*       : DEQUANT_ADD skip read + ACCUM gather + write
+  typedef enum logic [5:0] {
+    H_IDLE            = 6'd0,
+    H_FLAT_READ       = 6'd1,
+    H_FLAT_WRITE      = 6'd2,
+    H_TSRC_REQ1       = 6'd3,
+    H_TSRC_CAP1       = 6'd4,
+    H_TSRC_REQ2       = 6'd5,
+    H_TSRC_CAP2       = 6'd6,
+    H_TDST_REQ        = 6'd7,
+    H_TDST_WRITE      = 6'd8,
+    H_V8_READ         = 6'd9,
+    H_V8_WRITE        = 6'd10,
+    H_VB_REQ          = 6'd11,
+    H_VB_LATCH        = 6'd12,
+    H_VACC_READ       = 6'd13,
+    H_VACC_WRITE      = 6'd14,
+    H_RQ_REQ          = 6'd15,
+    H_RQ_LATCH        = 6'd16,
+    H_RQ_WRITE        = 6'd17,
+    H_SM_REQ          = 6'd18,
+    H_SM_WRITE        = 6'd19,
+    H_RQPC_SCALE0_REQ = 6'd20,
+    H_RQPC_SCALE0_LATCH = 6'd21,
+    H_RQPC_SCALE1_REQ = 6'd22,
+    H_RQPC_SCALE1_LATCH = 6'd23,
+    H_RQPC_REQ        = 6'd24,
+    H_RQPC_LATCH      = 6'd25,
+    H_RQPC_WRITE      = 6'd26,
+    H_DQ_SKIP_REQ     = 6'd27,
+    H_DQ_SKIP_LATCH   = 6'd28,
+    H_DQ_REQ          = 6'd29,
+    H_DQ_LATCH        = 6'd30,
+    H_DQ_WRITE        = 6'd31,
+    H_FAULT           = 6'd32
   } helper_state_t;
 
   helper_state_t state;
@@ -97,10 +119,11 @@ module blocking_helper_engine
   logic [4:0]   opcode_q;
   logic [1:0]   src1_buf_q, src2_buf_q, dst_buf_q;
   logic [15:0]  src1_off_q, src2_off_q, dst_off_q;
+  logic [3:0]   sreg_q;
   logic [15:0]  b_length_q;
   logic [5:0]   b_src_rows_q;
   logic         b_transpose_q;
-  logic [15:0]  scale_q;
+  logic [15:0]  scale0_q, scale1_q;
   logic [14:0]  m_rows_q;
   logic [10:0]  n_tiles_q;
   logic [12:0]  n_chunks_i32_q;
@@ -128,6 +151,8 @@ module blocking_helper_engine
   logic [10:0]  rq_col_chunk_q;
   logic [1:0]   rq_part_q;
   logic [127:0] rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q;
+  logic [127:0] skip_row_q;
+  logic [15:0]  pc_scale_chunk_q [0:15];
 
   // Small helpers used by multiple helper ops.
   function automatic logic [15:0] buf_rows(input logic [1:0] bid);
@@ -161,6 +186,15 @@ module blocking_helper_engine
   );
     begin
       get_byte = row[(idx * 8) +: 8];
+    end
+  endfunction
+
+  function automatic logic [15:0] get_u16(
+    input logic [127:0] row,
+    input integer       idx
+  );
+    begin
+      get_u16 = row[(idx * 16) +: 16];
     end
   endfunction
 
@@ -261,6 +295,154 @@ module blocking_helper_engine
     end
   endfunction
 
+  function automatic real pow2_int(input integer exp_i);
+    real v;
+    integer j;
+    begin
+      v = 1.0;
+      if (exp_i >= 0) begin
+        for (j = 0; j < exp_i; j++)
+          v = v * 2.0;
+      end else begin
+        for (j = 0; j < -exp_i; j++)
+          v = v * 0.5;
+      end
+      pow2_int = v;
+    end
+  endfunction
+
+  function automatic real fp16_to_real(input logic [15:0] bits);
+    logic sign_bit;
+    logic [4:0] exp_bits;
+    logic [9:0] frac_bits;
+    real sign_r;
+    begin
+      sign_bit = bits[15];
+      exp_bits = bits[14:10];
+      frac_bits = bits[9:0];
+      sign_r = sign_bit ? -1.0 : 1.0;
+
+      if ((exp_bits == 5'h0) && (frac_bits == 10'h0)) begin
+        fp16_to_real = 0.0;
+      end else if (exp_bits == 5'h0) begin
+        fp16_to_real = sign_r * (real'(frac_bits) / 1024.0) * pow2_int(-14);
+      end else if (exp_bits == 5'h1F) begin
+        fp16_to_real = sign_r * 65504.0;
+      end else begin
+        fp16_to_real = sign_r *
+                       (1.0 + (real'(frac_bits) / 1024.0)) *
+                       pow2_int(integer'(exp_bits) - 15);
+      end
+    end
+  endfunction
+
+  function automatic integer round_half_even(input real value_r);
+    integer floor_i;
+    real frac_r;
+    begin
+      floor_i = integer'($floor(value_r));
+      frac_r = value_r - real'(floor_i);
+      if (frac_r > 0.5)
+        round_half_even = floor_i + 1;
+      else if (frac_r < 0.5)
+        round_half_even = floor_i;
+      else if (floor_i[0])
+        round_half_even = floor_i + 1;
+      else
+        round_half_even = floor_i;
+    end
+  endfunction
+
+  function automatic logic [127:0] scale_mul_i8_row(
+    input logic [127:0] row,
+    input logic [15:0]  scale_val
+  );
+    logic signed [7:0] src_i8;
+    logic signed [63:0] scaled;
+    logic [127:0] out_row;
+    integer i;
+    begin
+      out_row = 128'h0;
+      for (i = 0; i < 16; i++) begin
+        src_i8 = row[(i * 8) +: 8];
+        scaled = fp16_mul_round_even({{24{src_i8[7]}}, src_i8}, scale_val);
+        if (scaled > 64'sd127)
+          out_row[(i * 8) +: 8] = 8'h7F;
+        else if (scaled < -64'sd128)
+          out_row[(i * 8) +: 8] = 8'h80;
+        else
+          out_row[(i * 8) +: 8] = scaled[7:0];
+      end
+      scale_mul_i8_row = out_row;
+    end
+  endfunction
+
+  function automatic logic [127:0] scale_mul_i32_row(
+    input logic [127:0] row,
+    input logic [15:0]  scale_val
+  );
+    logic signed [31:0] src_i32;
+    logic signed [63:0] scaled;
+    logic [127:0] out_row;
+    integer i;
+    begin
+      out_row = 128'h0;
+      for (i = 0; i < 4; i++) begin
+        src_i32 = row[(i * 32) +: 32];
+        scaled = fp16_mul_round_even(src_i32, scale_val);
+        if (scaled > 64'sd2147483647)
+          out_row[(i * 32) +: 32] = 32'h7FFF_FFFF;
+        else if (scaled < -64'sd2147483648)
+          out_row[(i * 32) +: 32] = 32'h8000_0000;
+        else
+          out_row[(i * 32) +: 32] = scaled[31:0];
+      end
+      scale_mul_i32_row = out_row;
+    end
+  endfunction
+
+  function automatic logic [127:0] dequant_add_pack(
+    input logic [127:0] row0,
+    input logic [127:0] row1,
+    input logic [127:0] row2,
+    input logic [127:0] row3,
+    input logic [127:0] skip_row,
+    input logic [15:0]  scale0_val,
+    input logic [15:0]  scale1_val
+  );
+    logic signed [31:0] src_i32;
+    logic signed [7:0]  skip_i8;
+    logic [127:0] out_row;
+    real accum_scale_r;
+    real skip_scale_r;
+    real sum_r;
+    integer q_i;
+    integer idx;
+    begin
+      accum_scale_r = fp16_to_real(scale0_val);
+      skip_scale_r  = fp16_to_real(scale1_val);
+      out_row = 128'h0;
+      for (idx = 0; idx < 16; idx++) begin
+        case (idx[3:2])
+          2'd0: src_i32 = row0[(idx[1:0] * 32) +: 32];
+          2'd1: src_i32 = row1[(idx[1:0] * 32) +: 32];
+          2'd2: src_i32 = row2[(idx[1:0] * 32) +: 32];
+          default: src_i32 = row3[(idx[1:0] * 32) +: 32];
+        endcase
+        skip_i8 = skip_row[(idx * 8) +: 8];
+        sum_r = real'(src_i32) * accum_scale_r + real'(skip_i8) * skip_scale_r;
+        q_i = round_half_even(sum_r);
+        if (q_i > 127)
+          out_row[(idx * 8) +: 8] = 8'h7F;
+        else if (q_i < -128)
+          out_row[(idx * 8) +: 8] = 8'h80;
+        else
+          out_row[(idx * 8) +: 8] = q_i[7:0];
+      end
+      dequant_add_pack = out_row;
+    end
+  endfunction
+
   // Pack four ACCUM rows (4 x 4 x INT32) into one INT8 destination row.
   function automatic logic [127:0] requant_pack(
     input logic [127:0] row0,
@@ -348,6 +530,7 @@ module blocking_helper_engine
   logic [12:0] dispatch_n_chunks_i32_w;
   logic [31:0] dispatch_int8_units_w;
   logic [31:0] dispatch_int32_units_w;
+  logic [31:0] dispatch_scale_rows_w;
   logic [31:0] dispatch_copy_units_w;
   logic [15:0] dispatch_src_rows_w;
   logic [15:0] dispatch_trans_cols_w;
@@ -358,6 +541,10 @@ module blocking_helper_engine
   logic        dispatch_sram_oob_w;
   logic        dispatch_is_vadd_int8_w;
   logic        dispatch_is_vadd_bias_w;
+  logic        dispatch_is_scale_mul_int8_w;
+  logic        dispatch_is_scale_mul_int32_w;
+  logic        dispatch_is_requant_pc_w;
+  logic        dispatch_is_dequant_add_w;
   logic        dispatch_same_buf_overlap_w;
 
   logic [15:0] flat_src_row_w;
@@ -381,17 +568,23 @@ module blocking_helper_engine
 
   logic [15:0] rq_src_row_w;
   logic [15:0] rq_dst_row_w;
+  logic [15:0] rqpc_scale_row_w;
+  logic [15:0] dq_skip_row_w;
 
   logic [127:0] trans_col_data_w;
   logic [127:0] trans_partial_row_w;
   logic [31:0] rq_src_row_full_w;
   logic [31:0] rq_dst_row_full_w;
+  logic [127:0] rqpc_write_data_w;
+  logic [127:0] dq_write_data_w;
+  logic [127:0] scale_mul_write_data_w;
 
   assign dispatch_m_rows_w      = ({5'h0, tile_m} + 15'd1) << 4;
   assign dispatch_n_tiles_w     = {1'b0, tile_n} + 11'd1;
   assign dispatch_n_chunks_i32_w = dispatch_n_tiles_w << 2;
   assign dispatch_int8_units_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
   assign dispatch_int32_units_w = dispatch_m_rows_w * dispatch_n_chunks_i32_w;
+  assign dispatch_scale_rows_w  = {20'h0, dispatch_n_tiles_w, 1'b0};
   assign dispatch_copy_units_w  = {16'h0, b_length};
   assign dispatch_src_rows_w    = {6'h0, b_src_rows, 4'h0};
   assign dispatch_trans_cols_w  = (b_src_rows == 6'h0) ? 16'h0 : (b_length / {10'h0, b_src_rows});
@@ -404,6 +597,14 @@ module blocking_helper_engine
   assign dispatch_is_vadd_bias_w = (src1_buf == BUF_ACCUM) &&
                                    (src2_buf == BUF_WBUF) &&
                                    (dst_buf == BUF_ACCUM);
+  assign dispatch_is_scale_mul_int8_w = (src1_buf != BUF_ACCUM) && (dst_buf != BUF_ACCUM);
+  assign dispatch_is_scale_mul_int32_w = (src1_buf == BUF_ACCUM) && (dst_buf == BUF_ACCUM);
+  assign dispatch_is_requant_pc_w = (src1_buf == BUF_ACCUM) &&
+                                    (src2_buf != BUF_ACCUM) &&
+                                    (dst_buf != BUF_ACCUM);
+  assign dispatch_is_dequant_add_w = (src1_buf == BUF_ACCUM) &&
+                                     (src2_buf != BUF_ACCUM) &&
+                                     (dst_buf != BUF_ACCUM);
   assign dispatch_same_buf_overlap_w =
       (src1_buf == dst_buf) &&
       ({16'h0, src1_off} < ({16'h0, dst_off} + dispatch_copy_units_w)) &&
@@ -454,6 +655,40 @@ module blocking_helper_engine
               ({16'h0, dst_off}  + dispatch_int8_units_w  > {16'h0, dispatch_dst_buf_rows_w});
       end
 
+      OP_REQUANT_PC: begin
+        if (!dispatch_is_requant_pc_w)
+          dispatch_unsupported_w = 1'b1;
+        else
+          dispatch_sram_oob_w =
+              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, src2_off} + dispatch_scale_rows_w > {16'h0, dispatch_src2_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
+      end
+
+      OP_SCALE_MUL: begin
+        if (dispatch_is_scale_mul_int32_w) begin
+          dispatch_sram_oob_w =
+              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_int32_units_w > {16'h0, dispatch_dst_buf_rows_w});
+        end else if (dispatch_is_scale_mul_int8_w) begin
+          dispatch_sram_oob_w =
+              ({16'h0, src1_off} + dispatch_int8_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
+        end else begin
+          dispatch_unsupported_w = 1'b1;
+        end
+      end
+
+      OP_DEQUANT_ADD: begin
+        if (!dispatch_is_dequant_add_w || (sreg == 4'hF))
+          dispatch_unsupported_w = 1'b1;
+        else
+          dispatch_sram_oob_w =
+              ({16'h0, src1_off} + dispatch_int32_units_w > {16'h0, dispatch_src_buf_rows_w}) ||
+              ({16'h0, src2_off} + dispatch_int8_units_w > {16'h0, dispatch_src2_buf_rows_w}) ||
+              ({16'h0, dst_off}  + dispatch_int8_units_w > {16'h0, dispatch_dst_buf_rows_w});
+      end
+
       default:
         dispatch_unsupported_w = 1'b1;
     endcase
@@ -495,6 +730,8 @@ module blocking_helper_engine
                              {21'h0, rq_col_chunk_q};
   assign rq_src_row_w = rq_src_row_full_w[15:0];
   assign rq_dst_row_w = rq_dst_row_full_w[15:0];
+  assign rqpc_scale_row_w = src2_off_q + ({4'h0, rq_col_chunk_q} << 1) + {15'h0, rq_part_q[0]};
+  assign dq_skip_row_w = src2_off_q + (rq_row_idx_q * n_tiles_q) + {5'h0, rq_col_chunk_q};
 
   // Assemble one transposed destination column from the scratch tile and merge
   // it with a partially covered destination row when the transpose edge is not
@@ -517,6 +754,38 @@ module blocking_helper_engine
   assign trans_dst_data_w  = trans_col_data_w;
   assign trans_dst_merge_w = trans_partial_row_w;
 
+  always_comb begin
+    rqpc_write_data_w = 128'h0;
+    dq_write_data_w = 128'h0;
+    scale_mul_write_data_w = 128'h0;
+
+    for (int lane = 0; lane < 16; lane++) begin
+      logic signed [31:0] src_i32;
+      logic signed [63:0] scaled;
+      case (lane[3:2])
+        2'd0: src_i32 = rq_row0_q[(lane[1:0] * 32) +: 32];
+        2'd1: src_i32 = rq_row1_q[(lane[1:0] * 32) +: 32];
+        2'd2: src_i32 = rq_row2_q[(lane[1:0] * 32) +: 32];
+        default: src_i32 = rq_row3_q[(lane[1:0] * 32) +: 32];
+      endcase
+      scaled = fp16_mul_round_even(src_i32, pc_scale_chunk_q[lane]);
+      if (scaled > 64'sd127)
+        rqpc_write_data_w[(lane * 8) +: 8] = 8'h7F;
+      else if (scaled < -64'sd128)
+        rqpc_write_data_w[(lane * 8) +: 8] = 8'h80;
+      else
+        rqpc_write_data_w[(lane * 8) +: 8] = scaled[7:0];
+    end
+
+    dq_write_data_w = dequant_add_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q,
+                                       skip_row_q, scale0_q, scale1_q);
+
+    if (src1_buf_q == BUF_ACCUM)
+      scale_mul_write_data_w = scale_mul_i32_row(sram_b_rdata, scale0_q);
+    else
+      scale_mul_write_data_w = scale_mul_i8_row(sram_b_rdata, scale0_q);
+  end
+
   // Main helper FSM. SRAM is synchronous, so read states issue a request and
   // the following state consumes the returned row.
   always_ff @(posedge clk or negedge rst_n) begin
@@ -529,10 +798,12 @@ module blocking_helper_engine
       src1_off_q        <= 16'h0;
       src2_off_q        <= 16'h0;
       dst_off_q         <= 16'h0;
+      sreg_q            <= 4'h0;
       b_length_q        <= 16'h0;
       b_src_rows_q      <= 6'h0;
       b_transpose_q     <= 1'b0;
-      scale_q           <= 16'h0;
+      scale0_q          <= 16'h0;
+      scale1_q          <= 16'h0;
       m_rows_q          <= 15'h0;
       n_tiles_q         <= 11'h0;
       n_chunks_i32_q    <= 13'h0;
@@ -558,6 +829,9 @@ module blocking_helper_engine
       rq_row1_q         <= 128'h0;
       rq_row2_q         <= 128'h0;
       rq_row3_q         <= 128'h0;
+      skip_row_q        <= 128'h0;
+      for (int i = 0; i < 16; i++)
+        pc_scale_chunk_q[i] <= 16'h0;
       for (int j = 0; j < 16; j++)
         trans_scratch_q[j] <= 128'h0;
     end else begin
@@ -571,10 +845,12 @@ module blocking_helper_engine
             src1_off_q     <= src1_off;
             src2_off_q     <= src2_off;
             dst_off_q      <= dst_off;
+            sreg_q         <= sreg;
             b_length_q     <= b_length;
             b_src_rows_q   <= b_src_rows;
             b_transpose_q  <= b_transpose;
-            scale_q        <= scale_data;
+            scale0_q       <= scale0_data;
+            scale1_q       <= scale1_data;
             m_rows_q       <= dispatch_m_rows_w;
             n_tiles_q      <= dispatch_n_tiles_w;
             n_chunks_i32_q <= dispatch_n_chunks_i32_w;
@@ -623,6 +899,25 @@ module blocking_helper_engine
                   rq_col_chunk_q <= 11'h0;
                   rq_part_q      <= 2'h0;
                   state          <= H_RQ_REQ;
+                end
+
+                OP_REQUANT_PC: begin
+                  rq_row_idx_q   <= 15'h0;
+                  rq_col_chunk_q <= 11'h0;
+                  rq_part_q      <= 2'h0;
+                  state          <= H_RQPC_SCALE0_REQ;
+                end
+
+                OP_SCALE_MUL: begin
+                  step_idx_q <= 32'h0;
+                  state      <= H_SM_REQ;
+                end
+
+                OP_DEQUANT_ADD: begin
+                  rq_row_idx_q   <= 15'h0;
+                  rq_col_chunk_q <= 11'h0;
+                  rq_part_q      <= 2'h0;
+                  state          <= H_DQ_SKIP_REQ;
                 end
 
                 default: begin
@@ -853,6 +1148,161 @@ module blocking_helper_engine
           end
         end
 
+        H_SM_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_SM_WRITE;
+          end
+        end
+
+        H_SM_WRITE: begin
+          logic [31:0] total_rows_w;
+          total_rows_w = (src1_buf_q == BUF_ACCUM) ? (m_rows_q * n_chunks_i32_q)
+                                                   : (m_rows_q * n_tiles_q);
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else if (step_idx_q + 32'd1 >= total_rows_w) begin
+            state <= H_IDLE;
+          end else begin
+            step_idx_q <= step_idx_q + 32'd1;
+            state      <= H_SM_REQ;
+          end
+        end
+
+        H_RQPC_SCALE0_REQ: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_RQPC_SCALE0_LATCH;
+          end
+        end
+
+        H_RQPC_SCALE0_LATCH: begin
+          for (int lane = 0; lane < 8; lane++)
+            pc_scale_chunk_q[lane] <= get_u16(sram_a_rdata, lane);
+          rq_part_q <= 2'd1;
+          state     <= H_RQPC_SCALE1_REQ;
+        end
+
+        H_RQPC_SCALE1_REQ: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_RQPC_SCALE1_LATCH;
+          end
+        end
+
+        H_RQPC_SCALE1_LATCH: begin
+          for (int lane = 0; lane < 8; lane++)
+            pc_scale_chunk_q[lane + 8] <= get_u16(sram_a_rdata, lane);
+          rq_row_idx_q <= 15'h0;
+          rq_part_q    <= 2'd0;
+          state        <= H_RQPC_REQ;
+        end
+
+        H_RQPC_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_RQPC_LATCH;
+          end
+        end
+
+        H_RQPC_LATCH: begin
+          case (rq_part_q)
+            2'd0: rq_row0_q <= sram_b_rdata;
+            2'd1: rq_row1_q <= sram_b_rdata;
+            2'd2: rq_row2_q <= sram_b_rdata;
+            default: rq_row3_q <= sram_b_rdata;
+          endcase
+
+          if (rq_part_q == 2'd3) begin
+            state <= H_RQPC_WRITE;
+          end else begin
+            rq_part_q <= rq_part_q + 2'd1;
+            state     <= H_RQPC_REQ;
+          end
+        end
+
+        H_RQPC_WRITE: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else if (rq_row_idx_q + 15'd1 < m_rows_q) begin
+            rq_row_idx_q <= rq_row_idx_q + 15'd1;
+            rq_part_q    <= 2'd0;
+            state        <= H_RQPC_REQ;
+          end else if (rq_col_chunk_q + 11'd1 < n_tiles_q) begin
+            rq_col_chunk_q <= rq_col_chunk_q + 11'd1;
+            rq_part_q      <= 2'd0;
+            state          <= H_RQPC_SCALE0_REQ;
+          end else begin
+            state <= H_IDLE;
+          end
+        end
+
+        H_DQ_SKIP_REQ: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_DQ_SKIP_LATCH;
+          end
+        end
+
+        H_DQ_SKIP_LATCH: begin
+          skip_row_q <= sram_a_rdata;
+          rq_part_q  <= 2'd0;
+          state      <= H_DQ_REQ;
+        end
+
+        H_DQ_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else begin
+            state <= H_DQ_LATCH;
+          end
+        end
+
+        H_DQ_LATCH: begin
+          case (rq_part_q)
+            2'd0: rq_row0_q <= sram_b_rdata;
+            2'd1: rq_row1_q <= sram_b_rdata;
+            2'd2: rq_row2_q <= sram_b_rdata;
+            default: rq_row3_q <= sram_b_rdata;
+          endcase
+
+          if (rq_part_q == 2'd3) begin
+            state <= H_DQ_WRITE;
+          end else begin
+            rq_part_q <= rq_part_q + 2'd1;
+            state     <= H_DQ_REQ;
+          end
+        end
+
+        H_DQ_WRITE: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= H_FAULT;
+          end else if (rq_col_chunk_q + 11'd1 < n_tiles_q) begin
+            rq_col_chunk_q <= rq_col_chunk_q + 11'd1;
+            state          <= H_DQ_SKIP_REQ;
+          end else if (rq_row_idx_q + 15'd1 < m_rows_q) begin
+            rq_row_idx_q   <= rq_row_idx_q + 15'd1;
+            rq_col_chunk_q <= 11'd0;
+            state          <= H_DQ_SKIP_REQ;
+          end else begin
+            state <= H_IDLE;
+          end
+        end
+
         H_FAULT: ;
 
         default:
@@ -977,7 +1427,70 @@ module blocking_helper_engine
         sram_a_we    = 1'b1;
         sram_a_buf   = dst_buf_q;
         sram_a_row   = rq_dst_row_w;
-        sram_a_wdata = requant_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q, scale_q);
+        sram_a_wdata = requant_pack(rq_row0_q, rq_row1_q, rq_row2_q, rq_row3_q, scale0_q);
+      end
+
+      H_SM_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = src1_off_q + 16'(step_idx_q);
+      end
+
+      H_SM_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = dst_off_q + 16'(step_idx_q);
+        sram_a_wdata = scale_mul_write_data_w;
+      end
+
+      H_RQPC_SCALE0_REQ: begin
+        sram_a_en  = 1'b1;
+        sram_a_we  = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = rqpc_scale_row_w;
+      end
+
+      H_RQPC_SCALE1_REQ: begin
+        sram_a_en  = 1'b1;
+        sram_a_we  = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = rqpc_scale_row_w;
+      end
+
+      H_RQPC_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = rq_src_row_w;
+      end
+
+      H_RQPC_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = rq_dst_row_w;
+        sram_a_wdata = rqpc_write_data_w;
+      end
+
+      H_DQ_SKIP_REQ: begin
+        sram_a_en  = 1'b1;
+        sram_a_we  = 1'b0;
+        sram_a_buf = src2_buf_q;
+        sram_a_row = dq_skip_row_w;
+      end
+
+      H_DQ_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = rq_src_row_w;
+      end
+
+      H_DQ_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = rq_dst_row_w;
+        sram_a_wdata = dq_write_data_w;
       end
 
       default: ;

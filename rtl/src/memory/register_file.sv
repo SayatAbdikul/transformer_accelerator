@@ -33,11 +33,15 @@ module register_file
   input  logic [3:0]  scale_waddr,    // S0–S15
   input  logic [15:0] scale_wdata,    // FP16
 
-  // --- Scale register read (up to 2 simultaneous, for SFU dual-scale) ---
+  // --- Scale register read (up to 4 simultaneous, for SFU quad-scale) ---
   input  logic [3:0]  scale_raddr0,
   output logic [15:0] scale_rdata0,
   input  logic [3:0]  scale_raddr1,
   output logic [15:0] scale_rdata1,
+  input  logic [3:0]  scale_raddr2,
+  output logic [15:0] scale_rdata2,
+  input  logic [3:0]  scale_raddr3,
+  output logic [15:0] scale_rdata3,
 
   // --- DRAM address register write ---
   input  logic        addr_lo_we,     // SET_ADDR_LO: write bits [27:0]
@@ -78,6 +82,8 @@ module register_file
 
   assign scale_rdata0 = scale_regs[scale_raddr0];
   assign scale_rdata1 = scale_regs[scale_raddr1];
+  assign scale_rdata2 = scale_regs[scale_raddr2];
+  assign scale_rdata3 = scale_regs[scale_raddr3];
 
   // -------------------------------------------------------------------------
   // DRAM address registers: 4 × 56-bit

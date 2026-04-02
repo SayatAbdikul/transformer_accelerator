@@ -4,6 +4,7 @@
 //   - SOFTMAX   : INT8/INT32 input, INT8 output, row-wise across full logical N
 //   - LAYERNORM : ABUF INT8 input, WBUF FP16 gamma/beta, INT8 output
 //   - GELU      : ABUF INT8 or ACCUM INT32 input, INT8 output
+//   - SOFTMAX_ATTNV : fused softmax(QK^T) @ V with INT8 output
 //
 // Architectural contract:
 //   - dispatched asynchronously through sfu_dispatch / sfu_busy
@@ -38,8 +39,11 @@ module sfu_engine
   input  logic [3:0]   sreg,
   input  logic [9:0]   tile_m,
   input  logic [9:0]   tile_n,
+  input  logic [9:0]   tile_k,
   input  logic [15:0]  scale0_data,
   input  logic [15:0]  scale1_data,
+  input  logic [15:0]  scale2_data,
+  input  logic [15:0]  scale3_data,
 
   output logic         sfu_busy,
   output logic         sfu_fault,
@@ -79,7 +83,13 @@ module sfu_engine
     F_GELU_I32_REQ  = 5'd12,
     F_GELU_I32_LATCH= 5'd13,
     F_GELU_I32_WRITE= 5'd14,
-    F_FAULT         = 5'd15
+    F_ATTN_QKT_REQ  = 5'd15,
+    F_ATTN_QKT_LATCH= 5'd16,
+    F_ATTN_PREP     = 5'd17,
+    F_ATTN_V_REQ    = 5'd18,
+    F_ATTN_V_LATCH  = 5'd19,
+    F_ATTN_WRITE    = 5'd20,
+    F_FAULT         = 5'd21
   } sfu_state_t;
 
   sfu_state_t state;
@@ -90,8 +100,11 @@ module sfu_engine
   logic [3:0]   sreg_q;
   logic [14:0]  m_rows_q;
   logic [10:0]  n_tiles_q;
+  logic [10:0]  k_tiles_q;
   logic [12:0]  n_chunks_i32_q;
+  logic [12:0]  k_chunks_i32_q;
   logic [15:0]  n_elems_q;
+  logic [15:0]  k_elems_q;
   logic [15:0]  ln_gamma_rows_q;
   logic [15:0]  ln_param_rows_q;
   logic [3:0]   fault_code_r;
@@ -100,20 +113,27 @@ module sfu_engine
   logic [12:0]  read_idx_q;
   logic [10:0]  write_chunk_q;
   logic [1:0]   gelu_part_q;
+  logic [15:0]  attn_k_idx_q;
 
   logic [127:0] gelu_i8_row_q;
   logic [127:0] gelu_row0_q, gelu_row1_q, gelu_row2_q, gelu_row3_q;
 
-  real scale0_q, scale1_q;
+  real scale0_q, scale1_q, scale2_q, scale3_q;
   real row_data_q [0:SFU_MAX_ROW_ELEMS-1];
+  real attn_accum_q [0:SFU_MAX_ROW_ELEMS-1];
   real gamma_q    [0:SFU_MAX_ROW_ELEMS-1];
   real beta_q     [0:SFU_MAX_ROW_ELEMS-1];
   logic [7:0] out_bytes_q [0:SFU_MAX_ROW_ELEMS-1];
+  real attn_row_max_q;
+  real attn_exp_sum_q;
 
   logic [14:0] dispatch_m_rows_w;
   logic [10:0] dispatch_n_tiles_w;
+  logic [10:0] dispatch_k_tiles_w;
   logic [12:0] dispatch_n_chunks_i32_w;
+  logic [12:0] dispatch_k_chunks_i32_w;
   logic [15:0] dispatch_n_elems_w;
+  logic [15:0] dispatch_k_elems_w;
   logic [15:0] dispatch_ln_gamma_rows_w;
   logic [15:0] dispatch_ln_param_rows_w;
   logic [15:0] dispatch_src1_rows_w;
@@ -124,6 +144,7 @@ module sfu_engine
   logic        dispatch_layernorm_w;
   logic        dispatch_gelu_accum_w;
   logic        dispatch_gelu_int8_w;
+  logic        dispatch_softmax_attnv_w;
   logic        dispatch_unsupported_w;
   logic        dispatch_sram_oob_w;
 
@@ -138,10 +159,13 @@ module sfu_engine
   logic [31:0] gelu_i8_addr_w;
   logic [31:0] gelu_acc_addr_w;
   logic [31:0] gelu_dst_addr_w;
+  logic [31:0] attn_qkt_addr_w;
+  logic [31:0] attn_v_addr_w;
 
   logic [127:0] row_write_data_w;
   logic [127:0] gelu_i8_write_data_w;
   logic [127:0] gelu_i32_write_data_w;
+  logic [127:0] attn_write_data_w;
 
   function automatic logic [15:0] buf_rows(input logic [1:0] bid);
     begin
@@ -282,8 +306,11 @@ module sfu_engine
 
   assign dispatch_m_rows_w        = ({5'h0, tile_m} + 15'd1) << 4;
   assign dispatch_n_tiles_w       = {1'b0, tile_n} + 11'd1;
+  assign dispatch_k_tiles_w       = {1'b0, tile_k} + 11'd1;
   assign dispatch_n_chunks_i32_w  = dispatch_n_tiles_w << 2;
+  assign dispatch_k_chunks_i32_w  = dispatch_k_tiles_w << 2;
   assign dispatch_n_elems_w       = {1'b0, dispatch_n_tiles_w, 4'h0};
+  assign dispatch_k_elems_w       = {1'b0, dispatch_k_tiles_w, 4'h0};
   assign dispatch_ln_gamma_rows_w = ({5'h0, dispatch_n_tiles_w}) << 1;
   assign dispatch_ln_param_rows_w = ({5'h0, dispatch_n_tiles_w}) << 2;
   assign dispatch_src1_rows_w     = buf_rows(src1_buf);
@@ -306,6 +333,10 @@ module sfu_engine
   assign dispatch_gelu_int8_w     = (opcode == OP_GELU) &&
                                     (src1_buf == BUF_ABUF) &&
                                     (dst_buf != BUF_ACCUM);
+  assign dispatch_softmax_attnv_w = (opcode == OP_SOFTMAX_ATTNV) &&
+                                    (src1_buf == BUF_ACCUM) &&
+                                    (src2_buf != BUF_ACCUM) &&
+                                    (dst_buf != BUF_ACCUM);
 
   always_comb begin
     dispatch_unsupported_w = 1'b0;
@@ -314,11 +345,10 @@ module sfu_engine
     dispatch_src2_need_rows_w = 32'd0;
     dispatch_dst_need_rows_w  = 32'd0;
 
-    if (sreg == 4'hF)
-      dispatch_unsupported_w = 1'b1;
-
     case (opcode)
       OP_SOFTMAX: begin
+        if (sreg == 4'hF)
+          dispatch_unsupported_w = 1'b1;
         if (!(dispatch_softmax_accum_w || dispatch_softmax_int8_w))
           dispatch_unsupported_w = 1'b1;
         if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
@@ -332,6 +362,8 @@ module sfu_engine
       end
 
       OP_LAYERNORM: begin
+        if (sreg == 4'hF)
+          dispatch_unsupported_w = 1'b1;
         if (!dispatch_layernorm_w)
           dispatch_unsupported_w = 1'b1;
         if (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS)
@@ -343,6 +375,8 @@ module sfu_engine
       end
 
       OP_GELU: begin
+        if (sreg == 4'hF)
+          dispatch_unsupported_w = 1'b1;
         if (!(dispatch_gelu_accum_w || dispatch_gelu_int8_w))
           dispatch_unsupported_w = 1'b1;
 
@@ -351,6 +385,20 @@ module sfu_engine
         else if (dispatch_gelu_int8_w)
           dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
         dispatch_dst_need_rows_w = dispatch_m_rows_w * dispatch_n_tiles_w;
+      end
+
+      OP_SOFTMAX_ATTNV: begin
+        if (sreg > 4'd12)
+          dispatch_unsupported_w = 1'b1;
+        if (!dispatch_softmax_attnv_w)
+          dispatch_unsupported_w = 1'b1;
+        if ((integer'(dispatch_k_elems_w) > SFU_MAX_ROW_ELEMS) ||
+            (integer'(dispatch_n_elems_w) > SFU_MAX_ROW_ELEMS))
+          dispatch_unsupported_w = 1'b1;
+
+        dispatch_src1_need_rows_w = dispatch_m_rows_w * dispatch_k_chunks_i32_w;
+        dispatch_src2_need_rows_w = dispatch_k_elems_w * dispatch_n_tiles_w;
+        dispatch_dst_need_rows_w  = dispatch_m_rows_w * dispatch_n_tiles_w;
       end
 
       default:
@@ -383,11 +431,18 @@ module sfu_engine
   assign gelu_dst_addr_w = {16'h0, dst_off_q} +
                            ({17'h0, row_idx_q} * {21'h0, n_tiles_q}) +
                            {21'h0, write_chunk_q};
+  assign attn_qkt_addr_w = {16'h0, src1_off_q} +
+                           ({17'h0, row_idx_q} * {19'h0, k_chunks_i32_q}) +
+                           {19'h0, read_idx_q};
+  assign attn_v_addr_w = {16'h0, src2_off_q} +
+                         ({16'h0, attn_k_idx_q} * {21'h0, n_tiles_q}) +
+                         {19'h0, read_idx_q};
 
   always_comb begin
     row_write_data_w = 128'h0;
     gelu_i8_write_data_w = 128'h0;
     gelu_i32_write_data_w = 128'h0;
+    attn_write_data_w = 128'h0;
 
     for (int lane = 0; lane < 16; lane++) begin
       int idx;
@@ -409,6 +464,10 @@ module sfu_engine
         x_r = real'(get_i32(gelu_row3_q, lane)) * scale0_q;
         gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
       end
+
+      idx = integer'(write_chunk_q) * 16 + lane;
+      if (idx < integer'(n_elems_q))
+        attn_write_data_w[(lane * 8) +: 8] = quantize_to_i8(attn_accum_q[idx], scale2_q);
     end
   end
 
@@ -425,8 +484,11 @@ module sfu_engine
       sreg_q         <= 4'h0;
       m_rows_q       <= 15'h0;
       n_tiles_q      <= 11'h0;
+      k_tiles_q      <= 11'h0;
       n_chunks_i32_q <= 13'h0;
+      k_chunks_i32_q <= 13'h0;
       n_elems_q      <= 16'h0;
+      k_elems_q      <= 16'h0;
       ln_gamma_rows_q<= 16'h0;
       ln_param_rows_q<= 16'h0;
       fault_code_r   <= 4'(FAULT_NONE);
@@ -434,6 +496,7 @@ module sfu_engine
       read_idx_q     <= 13'h0;
       write_chunk_q  <= 11'h0;
       gelu_part_q    <= 2'h0;
+      attn_k_idx_q   <= 16'h0;
       gelu_i8_row_q  <= 128'h0;
       gelu_row0_q    <= 128'h0;
       gelu_row1_q    <= 128'h0;
@@ -441,8 +504,13 @@ module sfu_engine
       gelu_row3_q    <= 128'h0;
       scale0_q       <= 0.0;
       scale1_q       <= 0.0;
+      scale2_q       <= 0.0;
+      scale3_q       <= 0.0;
+      attn_row_max_q <= 0.0;
+      attn_exp_sum_q <= 0.0;
       for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
         row_data_q[i] <= 0.0;
+        attn_accum_q[i] <= 0.0;
         gamma_q[i]    <= 0.0;
         beta_q[i]     <= 0.0;
         out_bytes_q[i] <= 8'h00;
@@ -461,16 +529,22 @@ module sfu_engine
             sreg_q          <= sreg;
             m_rows_q        <= dispatch_m_rows_w;
             n_tiles_q       <= dispatch_n_tiles_w;
+            k_tiles_q       <= dispatch_k_tiles_w;
             n_chunks_i32_q  <= dispatch_n_chunks_i32_w;
+            k_chunks_i32_q  <= dispatch_k_chunks_i32_w;
             n_elems_q       <= dispatch_n_elems_w;
+            k_elems_q       <= dispatch_k_elems_w;
             ln_gamma_rows_q <= dispatch_ln_gamma_rows_w;
             ln_param_rows_q <= dispatch_ln_param_rows_w;
             scale0_q        <= fp16_to_real(scale0_data);
             scale1_q        <= fp16_to_real(scale1_data);
+            scale2_q        <= fp16_to_real(scale2_data);
+            scale3_q        <= fp16_to_real(scale3_data);
             row_idx_q       <= 15'h0;
             read_idx_q      <= 13'h0;
             write_chunk_q   <= 11'h0;
             gelu_part_q     <= 2'h0;
+            attn_k_idx_q    <= 16'h0;
 
             if (dispatch_unsupported_w) begin
               fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
@@ -496,6 +570,9 @@ module sfu_engine
                   else
                     state <= F_GELU_I8_REQ;
                 end
+
+                OP_SOFTMAX_ATTNV:
+                  state <= F_ATTN_QKT_REQ;
 
                 default: begin
                   fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
@@ -739,6 +816,106 @@ module sfu_engine
           end
         end
 
+        F_ATTN_QKT_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else begin
+            state <= F_ATTN_QKT_LATCH;
+          end
+        end
+
+        F_ATTN_QKT_LATCH: begin
+          integer base_idx;
+          base_idx = integer'(read_idx_q) * 4;
+          for (int lane = 0; lane < 4; lane++) begin
+            if ((base_idx + lane) < integer'(k_elems_q))
+              row_data_q[base_idx + lane] <= real'(get_i32(sram_b_rdata, lane)) * scale0_q;
+          end
+
+          if (read_idx_q + 13'd1 < k_chunks_i32_q) begin
+            read_idx_q <= read_idx_q + 13'd1;
+            state      <= F_ATTN_QKT_REQ;
+          end else begin
+            state <= F_ATTN_PREP;
+          end
+        end
+
+        F_ATTN_PREP: begin
+          real row_max_r;
+          real exp_sum_r;
+          row_max_r = row_data_q[0];
+          for (int i = 1; i < SFU_MAX_ROW_ELEMS; i++) begin
+            if ((i < integer'(k_elems_q)) && (row_data_q[i] > row_max_r))
+              row_max_r = row_data_q[i];
+          end
+
+          exp_sum_r = 0.0;
+          for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
+            if (i < integer'(k_elems_q))
+              exp_sum_r = exp_sum_r + $exp(row_data_q[i] - row_max_r);
+            if (i < integer'(n_elems_q))
+              attn_accum_q[i] <= 0.0;
+          end
+
+          attn_row_max_q <= row_max_r;
+          attn_exp_sum_q <= exp_sum_r;
+          attn_k_idx_q   <= 16'h0;
+          read_idx_q     <= 13'h0;
+          write_chunk_q  <= 11'h0;
+          state          <= F_ATTN_V_REQ;
+        end
+
+        F_ATTN_V_REQ: begin
+          if (sram_b_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else begin
+            state <= F_ATTN_V_LATCH;
+          end
+        end
+
+        F_ATTN_V_LATCH: begin
+          real weight_r;
+          weight_r = $exp(row_data_q[integer'(attn_k_idx_q)] - attn_row_max_q) / attn_exp_sum_q;
+          for (int lane = 0; lane < 16; lane++) begin
+            integer idx;
+            idx = integer'(read_idx_q) * 16 + lane;
+            if (idx < integer'(n_elems_q))
+              attn_accum_q[idx] <= attn_accum_q[idx] +
+                                   (weight_r * real'(get_i8(sram_b_rdata, lane)) * scale1_q);
+          end
+
+          if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
+            read_idx_q <= read_idx_q + 13'd1;
+            state      <= F_ATTN_V_REQ;
+          end else if (attn_k_idx_q + 16'd1 < k_elems_q) begin
+            attn_k_idx_q <= attn_k_idx_q + 16'd1;
+            read_idx_q   <= 13'h0;
+            state        <= F_ATTN_V_REQ;
+          end else begin
+            write_chunk_q <= 11'h0;
+            state         <= F_ATTN_WRITE;
+          end
+        end
+
+        F_ATTN_WRITE: begin
+          if (sram_a_fault) begin
+            fault_code_r <= 4'(FAULT_SRAM_OOB);
+            state        <= F_FAULT;
+          end else if (write_chunk_q + 11'd1 < n_tiles_q) begin
+            write_chunk_q <= write_chunk_q + 11'd1;
+            state         <= F_ATTN_WRITE;
+          end else if (row_idx_q + 15'd1 < m_rows_q) begin
+            row_idx_q     <= row_idx_q + 15'd1;
+            read_idx_q    <= 13'h0;
+            write_chunk_q <= 11'h0;
+            state         <= F_ATTN_QKT_REQ;
+          end else begin
+            state <= F_IDLE;
+          end
+        end
+
         F_FAULT: ;
 
         default:
@@ -815,6 +992,26 @@ module sfu_engine
         sram_a_buf   = dst_buf_q;
         sram_a_row   = gelu_dst_addr_w[15:0];
         sram_a_wdata = gelu_i32_write_data_w;
+      end
+
+      F_ATTN_QKT_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = attn_qkt_addr_w[15:0];
+      end
+
+      F_ATTN_V_REQ: begin
+        sram_b_en  = 1'b1;
+        sram_b_buf = src2_buf_q;
+        sram_b_row = attn_v_addr_w[15:0];
+      end
+
+      F_ATTN_WRITE: begin
+        sram_a_en    = 1'b1;
+        sram_a_we    = 1'b1;
+        sram_a_buf   = dst_buf_q;
+        sram_a_row   = row_dst_addr_w[15:0];
+        sram_a_wdata = attn_write_data_w;
       end
 
       default: ;
