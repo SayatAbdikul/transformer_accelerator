@@ -1,0 +1,440 @@
+// Verilator tests for the Stage D SFU engine.
+
+#include "Vtaccel_top.h"
+#include "Vtaccel_top___024root.h"
+#include "verilated.h"
+#include "include/testbench.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <vector>
+
+static int tests_run  = 0;
+static int tests_pass = 0;
+
+#define TEST_PASS(name) do { \
+    printf("PASS: %s\n", name); tests_pass++; tests_run++; } while(0)
+#define TEST_FAIL(name, msg) do { \
+    fprintf(stderr, "FAIL: %s — %s\n", name, msg); std::exit(1); } while(0)
+
+struct Sim {
+    std::unique_ptr<Vtaccel_top> dut;
+    AXI4SlaveModel dram;
+
+    explicit Sim() : dut(std::make_unique<Vtaccel_top>()), dram(16 * 1024 * 1024) {
+        do_reset(dut.get());
+    }
+
+    void load(const std::vector<uint64_t>& prog) {
+        dram.write_program(prog);
+    }
+
+    void run(int timeout = 500000) {
+        dut->start = 1;
+        tick(dut.get(), dram);
+        dut->start = 0;
+        run_until_halt(dut.get(), dram, timeout);
+    }
+};
+
+enum BufId : int {
+    BUF_ABUF_ID  = 0,
+    BUF_WBUF_ID  = 1,
+    BUF_ACCUM_ID = 2,
+};
+
+static VlWide<4>* row_ptr(Vtaccel_top* dut, int buf_id, int row) {
+    auto* r = dut->rootp;
+    switch (buf_id) {
+        case BUF_ABUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_abuf__DOT__mem[row];
+        case BUF_WBUF_ID:  return &r->taccel_top__DOT__u_sram__DOT__u_wbuf__DOT__mem[row];
+        case BUF_ACCUM_ID: return &r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row];
+        default: std::abort();
+    }
+}
+
+static const VlWide<4>* row_ptr_const(Vtaccel_top* dut, int buf_id, int row) {
+    return row_ptr(dut, buf_id, row);
+}
+
+static void sram_write_row(Vtaccel_top* dut, int buf_id, int row, const uint8_t data[16]) {
+    VlWide<4>* mem = row_ptr(dut, buf_id, row);
+    for (int w = 0; w < 4; ++w) {
+        (*mem)[w] = (uint32_t(data[w * 4 + 0])      ) |
+                    (uint32_t(data[w * 4 + 1]) <<  8) |
+                    (uint32_t(data[w * 4 + 2]) << 16) |
+                    (uint32_t(data[w * 4 + 3]) << 24);
+    }
+}
+
+static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]) {
+    const VlWide<4>* mem = row_ptr_const(dut, buf_id, row);
+    for (int w = 0; w < 4; ++w) {
+        uint32_t word = (*mem)[w];
+        out[w * 4 + 0] = uint8_t((word >> 0) & 0xFF);
+        out[w * 4 + 1] = uint8_t((word >> 8) & 0xFF);
+        out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
+        out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
+    }
+}
+
+static void sram_write_bytes(Vtaccel_top* dut, int buf_id, size_t byte_off,
+                             const std::vector<uint8_t>& data) {
+    size_t pos = 0;
+    while (pos < data.size()) {
+        int row = int((byte_off + pos) / 16);
+        int lane = int((byte_off + pos) % 16);
+        int take = int(std::min<size_t>(16 - lane, data.size() - pos));
+        uint8_t tmp[16];
+        sram_read_row(dut, buf_id, row, tmp);
+        for (int i = 0; i < take; ++i)
+            tmp[lane + i] = data[pos + size_t(i)];
+        sram_write_row(dut, buf_id, row, tmp);
+        pos += size_t(take);
+    }
+}
+
+static std::vector<uint8_t> sram_read_bytes(Vtaccel_top* dut, int buf_id,
+                                            size_t byte_off, size_t len) {
+    std::vector<uint8_t> out(len);
+    size_t pos = 0;
+    while (pos < len) {
+        int row = int((byte_off + pos) / 16);
+        int lane = int((byte_off + pos) % 16);
+        int take = int(std::min<size_t>(16 - lane, len - pos));
+        uint8_t tmp[16];
+        sram_read_row(dut, buf_id, row, tmp);
+        for (int i = 0; i < take; ++i)
+            out[pos + size_t(i)] = tmp[lane + i];
+        pos += size_t(take);
+    }
+    return out;
+}
+
+static std::vector<uint8_t> pack_i32_le(const std::vector<int32_t>& vals) {
+    std::vector<uint8_t> out(vals.size() * 4);
+    for (size_t i = 0; i < vals.size(); ++i) {
+        uint32_t word = uint32_t(vals[i]);
+        out[i * 4 + 0] = uint8_t((word >> 0) & 0xFF);
+        out[i * 4 + 1] = uint8_t((word >> 8) & 0xFF);
+        out[i * 4 + 2] = uint8_t((word >> 16) & 0xFF);
+        out[i * 4 + 3] = uint8_t((word >> 24) & 0xFF);
+    }
+    return out;
+}
+
+static std::vector<uint8_t> pack_u16_le(const std::vector<uint16_t>& vals) {
+    std::vector<uint8_t> out(vals.size() * 2);
+    for (size_t i = 0; i < vals.size(); ++i) {
+        out[i * 2 + 0] = uint8_t(vals[i] & 0xFF);
+        out[i * 2 + 1] = uint8_t((vals[i] >> 8) & 0xFF);
+    }
+    return out;
+}
+
+static double fp16_to_double(uint16_t bits) {
+    bool sign = (bits >> 15) & 1;
+    int exp = (bits >> 10) & 0x1F;
+    int frac = bits & 0x3FF;
+    double sign_v = sign ? -1.0 : 1.0;
+    if (exp == 0 && frac == 0)
+        return 0.0;
+    if (exp == 0)
+        return sign_v * (double(frac) / 1024.0) * std::ldexp(1.0, -14);
+    if (exp == 31)
+        return sign_v * 65504.0;
+    return sign_v * (1.0 + double(frac) / 1024.0) * std::ldexp(1.0, exp - 15);
+}
+
+static int round_half_even(double x) {
+    long long floor_i = static_cast<long long>(std::floor(x));
+    double frac = x - static_cast<double>(floor_i);
+    if (frac > 0.5)
+        return int(floor_i + 1);
+    if (frac < 0.5)
+        return int(floor_i);
+    if (floor_i & 1LL)
+        return int(floor_i + 1);
+    return int(floor_i);
+}
+
+static int8_t quantize_ref(double value, double out_scale) {
+    if (out_scale == 0.0)
+        return 0;
+    int q = round_half_even(value / out_scale);
+    if (q > 127) return int8_t(127);
+    if (q < -128) return int8_t(-128);
+    return int8_t(q);
+}
+
+static std::vector<int8_t> softmax_ref(const std::vector<int32_t>& src,
+                                       int M, int N, double in_scale, double out_scale) {
+    std::vector<int8_t> out(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r) {
+        double row_max = double(src[size_t(r) * size_t(N)]) * in_scale;
+        for (int c = 1; c < N; ++c) {
+            double x = double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            row_max = std::max(row_max, x);
+        }
+
+        double exp_sum = 0.0;
+        for (int c = 0; c < N; ++c) {
+            double x = double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            exp_sum += std::exp(x - row_max);
+        }
+
+        for (int c = 0; c < N; ++c) {
+            double x = double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            out[size_t(r) * size_t(N) + size_t(c)] =
+                quantize_ref(std::exp(x - row_max) / exp_sum, out_scale);
+        }
+    }
+    return out;
+}
+
+static std::vector<int8_t> layernorm_ref(const std::vector<int8_t>& src,
+                                         const std::vector<uint16_t>& gamma_bits,
+                                         const std::vector<uint16_t>& beta_bits,
+                                         int M, int N, double in_scale, double out_scale) {
+    std::vector<double> gamma(N), beta(N);
+    for (int i = 0; i < N; ++i) {
+        gamma[i] = fp16_to_double(gamma_bits[size_t(i)]);
+        beta[i] = fp16_to_double(beta_bits[size_t(i)]);
+    }
+
+    std::vector<int8_t> out(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r) {
+        double sum = 0.0;
+        for (int c = 0; c < N; ++c)
+            sum += double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+        double mean = sum / double(N);
+
+        double var = 0.0;
+        for (int c = 0; c < N; ++c) {
+            double x = double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            double d = x - mean;
+            var += d * d;
+        }
+        var /= double(N);
+        double denom = std::sqrt(var + 1.0e-6);
+
+        for (int c = 0; c < N; ++c) {
+            double x = double(src[size_t(r) * size_t(N) + size_t(c)]) * in_scale;
+            double y = ((x - mean) / denom) * gamma[c] + beta[c];
+            out[size_t(r) * size_t(N) + size_t(c)] = quantize_ref(y, out_scale);
+        }
+    }
+    return out;
+}
+
+static std::vector<int8_t> gelu_ref_i8(const std::vector<int8_t>& src,
+                                       double in_scale, double out_scale) {
+    std::vector<int8_t> out(src.size());
+    const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+    for (size_t i = 0; i < src.size(); ++i) {
+        double x = double(src[i]) * in_scale;
+        double y = x * 0.5 * (1.0 + std::erf(x * inv_sqrt2));
+        out[i] = quantize_ref(y, out_scale);
+    }
+    return out;
+}
+
+static std::vector<int8_t> gelu_ref_i32(const std::vector<int32_t>& src,
+                                        double in_scale, double out_scale) {
+    std::vector<int8_t> out(src.size());
+    const double inv_sqrt2 = 1.0 / std::sqrt(2.0);
+    for (size_t i = 0; i < src.size(); ++i) {
+        double x = double(src[i]) * in_scale;
+        double y = x * 0.5 * (1.0 + std::erf(x * inv_sqrt2));
+        out[i] = quantize_ref(y, out_scale);
+    }
+    return out;
+}
+
+static void expect_equal_bytes(const char* name,
+                               const std::vector<uint8_t>& got,
+                               const std::vector<uint8_t>& exp) {
+    if (got.size() != exp.size())
+        TEST_FAIL(name, "length mismatch");
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != exp[i]) {
+            std::fprintf(stderr, "%s mismatch at byte %zu: got=%d exp=%d\n",
+                         name, i, int(got[i]), int(exp[i]));
+            TEST_FAIL(name, "byte mismatch");
+        }
+    }
+}
+
+static void test_softmax_accum_large_row() {
+    const char* name = "softmax_accum_large_row";
+    constexpr int M = 16;
+    constexpr int N = 208;
+    constexpr int DST_OFF = 256;
+    const double in_scale = fp16_to_double(0x3400);
+    const double out_scale = fp16_to_double(0x3400);
+
+    std::vector<int32_t> src(size_t(M) * size_t(N), 0);
+    for (int r = 0; r < M; ++r)
+        src[size_t(r) * size_t(N) + size_t(N - 1)] = 32;
+
+    auto expected_i8 = softmax_ref(src, M, N, in_scale, out_scale);
+    std::vector<uint8_t> expected(expected_i8.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = uint8_t(expected_i8[i]);
+
+    Sim s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    s.load({
+        insn::CONFIG_TILE(1, 13, 1),
+        insn::SET_SCALE(2, 0x3400),
+        insn::SET_SCALE(3, 0x3400),
+        insn::SOFTMAX(BUF_ACCUM_ID, 0, BUF_ABUF_ID, DST_OFF, 2),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(200000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(DST_OFF) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_layernorm_identity() {
+    const char* name = "layernorm_identity";
+    constexpr int M = 16;
+    constexpr int N = 192;
+    constexpr int DST_OFF = 512;
+    const double in_scale = fp16_to_double(0x3400);
+    const double out_scale = fp16_to_double(0x3400);
+
+    std::vector<int8_t> src(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            src[size_t(r) * size_t(N) + size_t(c)] = int8_t(((r * 17 + c * 5) % 41) - 20);
+
+    std::vector<uint16_t> gamma(N, 0x3C00);
+    std::vector<uint16_t> beta(N, 0x0000);
+    auto expected_i8 = layernorm_ref(src, gamma, beta, M, N, in_scale, out_scale);
+
+    std::vector<uint8_t> src_bytes(src.size());
+    std::vector<uint8_t> expected(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        src_bytes[i] = uint8_t(src[i]);
+        expected[i] = uint8_t(expected_i8[i]);
+    }
+
+    std::vector<uint8_t> gb_bytes = pack_u16_le(gamma);
+    auto beta_bytes = pack_u16_le(beta);
+    gb_bytes.insert(gb_bytes.end(), beta_bytes.begin(), beta_bytes.end());
+
+    Sim s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src_bytes);
+    sram_write_bytes(s.dut.get(), BUF_WBUF_ID, 0, gb_bytes);
+    s.load({
+        insn::CONFIG_TILE(1, 12, 1),
+        insn::SET_SCALE(3, 0x3400),
+        insn::SET_SCALE(4, 0x3400),
+        insn::LAYERNORM(BUF_ABUF_ID, 0, BUF_WBUF_ID, 0, BUF_ABUF_ID, DST_OFF, 3),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(250000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(DST_OFF) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_gelu_abuf_roundtrip() {
+    const char* name = "gelu_abuf_roundtrip";
+    constexpr int M = 16;
+    constexpr int N = 16;
+    constexpr int DST_OFF = 1024;
+    const double in_scale = fp16_to_double(0x3400);
+    const double out_scale = fp16_to_double(0x3400);
+
+    std::vector<int8_t> src(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            src[size_t(r) * size_t(N) + size_t(c)] = int8_t((c - 8) + r);
+
+    auto expected_i8 = gelu_ref_i8(src, in_scale, out_scale);
+    std::vector<uint8_t> src_bytes(src.size()), expected(src.size());
+    for (size_t i = 0; i < src.size(); ++i) {
+        src_bytes[i] = uint8_t(src[i]);
+        expected[i] = uint8_t(expected_i8[i]);
+    }
+
+    Sim s;
+    sram_write_bytes(s.dut.get(), BUF_ABUF_ID, 0, src_bytes);
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(5, 0x3400),
+        insn::SET_SCALE(6, 0x3400),
+        insn::GELU(BUF_ABUF_ID, 0, BUF_WBUF_ID, DST_OFF, 5),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(100000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_WBUF_ID, size_t(DST_OFF) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+static void test_gelu_accum_roundtrip() {
+    const char* name = "gelu_accum_roundtrip";
+    constexpr int M = 16;
+    constexpr int N = 16;
+    constexpr int DST_OFF = 1280;
+    const double in_scale = fp16_to_double(0x3400);
+    const double out_scale = fp16_to_double(0x3400);
+
+    std::vector<int32_t> src(size_t(M) * size_t(N));
+    for (int r = 0; r < M; ++r)
+        for (int c = 0; c < N; ++c)
+            src[size_t(r) * size_t(N) + size_t(c)] = (c - 8) * 2 + r;
+
+    auto expected_i8 = gelu_ref_i32(src, in_scale, out_scale);
+    std::vector<uint8_t> expected(expected_i8.size());
+    for (size_t i = 0; i < expected.size(); ++i)
+        expected[i] = uint8_t(expected_i8[i]);
+
+    Sim s;
+    sram_write_bytes(s.dut.get(), BUF_ACCUM_ID, 0, pack_i32_le(src));
+    s.load({
+        insn::CONFIG_TILE(1, 1, 1),
+        insn::SET_SCALE(8, 0x3400),
+        insn::SET_SCALE(9, 0x3400),
+        insn::GELU(BUF_ACCUM_ID, 0, BUF_ABUF_ID, DST_OFF, 8),
+        insn::SYNC(0b100),
+        insn::HALT(),
+    });
+    s.run(100000);
+    if (s.dut->fault) TEST_FAIL(name, "unexpected fault");
+
+    auto got = sram_read_bytes(s.dut.get(), BUF_ABUF_ID, size_t(DST_OFF) * 16, expected.size());
+    expect_equal_bytes(name, got, expected);
+    TEST_PASS(name);
+}
+
+int main(int argc, char** argv) {
+    Verilated::commandArgs(argc, argv);
+
+    test_softmax_accum_large_row();
+    test_layernorm_identity();
+    test_gelu_abuf_roundtrip();
+    test_gelu_accum_roundtrip();
+
+    std::printf("\n%d / %d tests passed\n", tests_pass, tests_run);
+    if (tests_pass != tests_run) std::exit(1);
+    return 0;
+}

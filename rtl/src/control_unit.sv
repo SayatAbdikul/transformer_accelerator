@@ -13,9 +13,10 @@
 //   HALT        — terminal: done=1
 //   FAULT       — terminal: fault=1
 //
-// Phase C: DMA LOAD/STORE, systolic MATMUL, and the blocking helper ops
-// BUF_COPY / VADD / REQUANT are supported. Remaining legal-but-unimplemented
-// helper/SFU instructions fault as FAULT_UNSUPPORTED_OP.
+// Stage D: DMA LOAD/STORE, systolic MATMUL, blocking helper ops, and the first
+// asynchronous SFU ops (SOFTMAX / LAYERNORM / GELU) are supported.
+// Remaining legal-but-unimplemented helper/SFU instructions fault as
+// FAULT_UNSUPPORTED_OP.
 
 `ifndef CONTROL_UNIT_SV
 `define CONTROL_UNIT_SV
@@ -122,9 +123,6 @@ module control_unit
       case (op)
         OP_REQUANT_PC,
         OP_SCALE_MUL,
-        OP_SOFTMAX,
-        OP_LAYERNORM,
-        OP_GELU,
         OP_SOFTMAX_ATTNV,
         OP_DEQUANT_ADD:
           unsupported_op = 1'b1;
@@ -226,7 +224,7 @@ module control_unit
 
               // Blocking helper: do not advance PC until the helper drops busy.
               OP_BUF_COPY: begin
-                if (dma_busy || sys_busy || helper_busy) begin
+                if (dma_busy || sys_busy || helper_busy || sfu_busy) begin
                   state <= S_ISSUE;
                 end else begin
                   state <= S_DISP_WAIT;
@@ -237,8 +235,12 @@ module control_unit
               // emitted, fetch/issue may continue and SYNC(001) becomes the
               // ordering point.
               OP_LOAD, OP_STORE: begin
-                pc_reg <= pc_reg + 56'h1;
-                state  <= S_FETCH;
+                if (sfu_busy) begin
+                  state <= S_ISSUE;
+                end else begin
+                  pc_reg <= pc_reg + 56'h1;
+                  state  <= S_FETCH;
+                end
               end
 
               OP_REQUANT,
@@ -246,7 +248,7 @@ module control_unit
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   state        <= S_FAULT;
-                end else if (dma_busy || sys_busy || helper_busy) begin
+                end else if (dma_busy || sys_busy || helper_busy || sfu_busy) begin
                   state <= S_ISSUE;
                 end else begin
                   state <= S_DISP_WAIT;
@@ -258,6 +260,25 @@ module control_unit
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
                   state        <= S_FAULT;
+                end else if (sfu_busy) begin
+                  state <= S_ISSUE;
+                end else begin
+                  pc_reg <= pc_reg + 56'h1;
+                  state  <= S_FETCH;
+                end
+              end
+
+              // Stage D SFU ops are architecturally asynchronous. Dispatch once
+              // the serialized Stage D resource slot is clear, then advance PC
+              // immediately and rely on SYNC(100) for ordering.
+              OP_SOFTMAX,
+              OP_LAYERNORM,
+              OP_GELU: begin
+                if (!tile_valid) begin
+                  fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  state        <= S_FAULT;
+                end else if (dma_busy || sys_busy || helper_busy || sfu_busy) begin
+                  state <= S_ISSUE;
                 end else begin
                   pc_reg <= pc_reg + 56'h1;
                   state  <= S_FETCH;
@@ -309,10 +330,12 @@ module control_unit
   // -------------------------------------------------------------------------
   always_comb begin
     logic helper_ready_now;
+    logic sfu_ready_now;
 
-    // Phase C intentionally serializes helper work against DMA and systolic so
-    // the top-level SRAM arbitration stays simple and deterministic.
-    helper_ready_now = !dma_busy && !sys_busy && !helper_busy;
+    // Stage D keeps the SFU serialized against the SRAM-using helper, DMA, and
+    // systolic paths. Helper dispatch is also blocked while an SFU op is active.
+    helper_ready_now = !dma_busy && !sys_busy && !helper_busy && !sfu_busy;
+    sfu_ready_now    = !dma_busy && !sys_busy && !helper_busy && !sfu_busy;
 
     // Defaults
     fetch_req    = 1'b0;
@@ -359,16 +382,19 @@ module control_unit
               addr_hi_we = 1'b1;
 
             OP_LOAD, OP_STORE:
-              dma_dispatch = 1'b1;
+              dma_dispatch = !sfu_busy;
 
             OP_MATMUL:
-              sys_dispatch = tile_valid;
+              sys_dispatch = tile_valid && !sfu_busy;
 
             OP_BUF_COPY:
               helper_dispatch = helper_ready_now;
 
             OP_REQUANT, OP_VADD:
               helper_dispatch = tile_valid && helper_ready_now;
+
+            OP_SOFTMAX, OP_LAYERNORM, OP_GELU:
+              sfu_dispatch = tile_valid && sfu_ready_now;
 
             default: ;
           endcase

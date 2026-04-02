@@ -14,7 +14,7 @@ SIM           ?= icarus     # icarus | verilator | vcs | xsim
 SYSTOLIC_ARCH_MODE ?= 1
 
 TOPLEVEL      := taccel_top
-MODULE        := test_fetch_decode,test_dma,test_helpers,test_systolic
+MODULE        := test_fetch_decode,test_dma,test_helpers,test_sfu,test_systolic
 
 SRC_DIR       := ../src
 INCLUDE_DIR   := $(SRC_DIR)/include
@@ -26,6 +26,7 @@ VERILOG_SOURCES := \
   $(SRC_DIR)/fetch_unit.sv \
   $(SRC_DIR)/control_unit.sv \
   $(SRC_DIR)/blocking_helper_engine.sv \
+  $(SRC_DIR)/sfu_engine.sv \
   $(SRC_DIR)/memory/sram_dp.sv \
   $(SRC_DIR)/memory/register_file.sv \
   $(SRC_DIR)/memory/sram_subsystem.sv \

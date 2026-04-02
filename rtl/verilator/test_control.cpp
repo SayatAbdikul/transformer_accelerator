@@ -9,6 +9,7 @@
 //   - SYNC with all-idle units: completes immediately
 //   - Illegal opcode: fault asserted, correct fault code
 //   - Remaining legal but unsupported ops: FAULT_UNSUPPORTED_OP
+//   - Stage D SFU dispatch / no-config behavior
 //   - MATMUL without CONFIG_TILE: FAULT_NO_CONFIG
 //   - Fetch / DMA / systolic SRAM fault plumbing
 //   - Multi-instruction sequence
@@ -230,15 +231,77 @@ static void test_unsupported_ops() {
     const UnsupportedCase cases[] = {
         { "unsupported_requant_pc",    insn::REQUANT_PC(2, 0, 1, 0, 0, 0, 0) },
         { "unsupported_scale_mul",     insn::SCALE_MUL(2, 0, 2, 0, 0) },
-        { "unsupported_softmax",       insn::SOFTMAX(2, 0, 0, 0, 0) },
-        { "unsupported_layernorm",     insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0) },
-        { "unsupported_gelu",          insn::GELU(0, 0, 0, 0, 0) },
         { "unsupported_softmax_attnv", insn::SOFTMAX_ATTNV(2, 0, 0, 0, 1, 0, 0) },
         { "unsupported_dequant_add",   insn::DEQUANT_ADD(2, 0, 0, 0, 0, 0, 0) },
     };
 
     for (const auto& tc : cases)
         expect_fault_program(tc.name, {tc.insn}, 6, 500);
+}
+
+// ============================================================================
+// Test: Stage D SFU ops require CONFIG_TILE
+// ============================================================================
+static void test_sfu_no_config_faults() {
+    expect_fault_program("softmax_without_config_tile",
+                         { insn::SOFTMAX(2, 0, 0, 0, 0) }, 4, 1000);
+    expect_fault_program("layernorm_without_config_tile",
+                         { insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0) }, 4, 1000);
+    expect_fault_program("gelu_without_config_tile",
+                         { insn::GELU(0, 0, 0, 0, 0) }, 4, 1000);
+}
+
+// ============================================================================
+// Test: Stage D SFU ops dispatch and complete through SYNC(100)
+// ============================================================================
+static void test_sfu_dispatch_paths() {
+    {
+        Sim s;
+        s.load({
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(0, 0x3800),
+            insn::SET_SCALE(1, 0x3400),
+            insn::SOFTMAX(0, 0, 1, 0, 0),
+            insn::SYNC(0b100),
+            insn::HALT()
+        });
+        s.run(50000);
+        EXPECT(s.dut->done == 1, "softmax dispatch path should halt cleanly");
+        EXPECT(s.dut->fault == 0, "softmax dispatch path should not fault");
+        TEST_PASS("softmax_dispatch_sync");
+    }
+
+    {
+        Sim s;
+        s.load({
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(0, 0x3800),
+            insn::SET_SCALE(1, 0x3400),
+            insn::LAYERNORM(0, 0, 1, 0, 0, 0, 0),
+            insn::SYNC(0b100),
+            insn::HALT()
+        });
+        s.run(50000);
+        EXPECT(s.dut->done == 1, "layernorm dispatch path should halt cleanly");
+        EXPECT(s.dut->fault == 0, "layernorm dispatch path should not fault");
+        TEST_PASS("layernorm_dispatch_sync");
+    }
+
+    {
+        Sim s;
+        s.load({
+            insn::CONFIG_TILE(1, 1, 1),
+            insn::SET_SCALE(0, 0x3800),
+            insn::SET_SCALE(1, 0x3400),
+            insn::GELU(0, 0, 0, 16, 0),
+            insn::SYNC(0b100),
+            insn::HALT()
+        });
+        s.run(50000);
+        EXPECT(s.dut->done == 1, "gelu dispatch path should halt cleanly");
+        EXPECT(s.dut->fault == 0, "gelu dispatch path should not fault");
+        TEST_PASS("gelu_dispatch_sync");
+    }
 }
 
 // ============================================================================
@@ -403,6 +466,8 @@ int main(int argc, char** argv) {
     test_sync_all_idle();
     test_illegal_opcode();
     test_unsupported_ops();
+    test_sfu_no_config_faults();
+    test_sfu_dispatch_paths();
     test_set_scale_from_buffer_unsupported();
     test_multiburst_dma_supported();
     test_matmul_no_config();

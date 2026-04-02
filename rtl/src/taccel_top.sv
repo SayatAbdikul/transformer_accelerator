@@ -20,6 +20,11 @@
 //   - blocking SRAM-local helper path for BUF_COPY / VADD / REQUANT
 //   - helper owns SRAM ahead of DMA / systolic while active
 //
+// Stage D SFU engine:
+//   - asynchronous SOFTMAX / LAYERNORM / GELU path
+//   - serialized against helper / DMA / systolic at dispatch time
+//   - SFU owns SRAM ahead of DMA / systolic while active
+//
 // This module is mostly glue:
 //   - arbitrate shared AXI read access between fetch and DMA
 //   - arbitrate shared SRAM ports between helper, DMA, and systolic
@@ -223,24 +228,34 @@ module taccel_top
   logic [3:0] ext_fault_code_w;
   logic       helper_fault_w;
   logic [3:0] helper_fault_code_w;
+  logic       sfu_fault_w;
+  logic [3:0] sfu_fault_code_w;
   logic       sys_sram_fault_now;
   logic       sys_sram_fault_latched;
 
-  // Phase 3: systolic controller active; SFU still stubbed
   logic sys_busy, sfu_busy, helper_busy;
-  assign sfu_busy = 1'b0;
 
-  // SRAM Port A requests from helper / DMA / Systolic
+  // SRAM Port A requests from helper / SFU / DMA / Systolic
   logic         helper_sram_a_en,  helper_sram_a_we;
   logic [1:0]   helper_sram_a_buf;
   logic [15:0]  helper_sram_a_row;
   logic [127:0] helper_sram_a_wdata, helper_sram_a_rdata;
 
-  // SRAM Port B requests from helper / Systolic
+  // SRAM Port B requests from helper / SFU / Systolic
   logic         helper_sram_b_en;
   logic [1:0]   helper_sram_b_buf;
   logic [15:0]  helper_sram_b_row;
   logic [127:0] helper_sram_b_rdata;
+
+  logic         sfu_sram_a_en,  sfu_sram_a_we;
+  logic [1:0]   sfu_sram_a_buf;
+  logic [15:0]  sfu_sram_a_row;
+  logic [127:0] sfu_sram_a_wdata;
+
+  logic         sfu_sram_b_en;
+  logic [1:0]   sfu_sram_b_buf;
+  logic [15:0]  sfu_sram_b_row;
+  logic [127:0] sfu_sram_b_rdata;
 
   logic         dma_sram_en,  dma_sram_we;
   logic [1:0]   dma_sram_buf;
@@ -270,37 +285,48 @@ module taccel_top
   logic [127:0] sram_b_rdata;
   logic         sram_b_fault;
 
-  // Helper gets first access, then DMA, then systolic. Phase C intentionally
-  // serializes helper work with the other engines so this priority scheme is
-  // sufficient without extra handshakes.
+  // Helper gets first access, then SFU, then DMA, then systolic. Stage D keeps
+  // enough serialization at control level that fixed priority is sufficient.
   assign sram_a_en    = helper_sram_a_en ? helper_sram_a_en
+                      : sfu_sram_a_en    ? sfu_sram_a_en
                       : dma_sram_en      ? dma_sram_en
                                          : sys_sram_a_en;
   assign sram_a_we    = helper_sram_a_en ? helper_sram_a_we
+                      : sfu_sram_a_en    ? sfu_sram_a_we
                       : dma_sram_en      ? dma_sram_we
                                          : sys_sram_a_we;
   assign sram_a_buf   = helper_sram_a_en ? helper_sram_a_buf
+                      : sfu_sram_a_en    ? sfu_sram_a_buf
                       : dma_sram_en      ? dma_sram_buf
                                          : sys_sram_a_buf;
   assign sram_a_row   = helper_sram_a_en ? helper_sram_a_row
+                      : sfu_sram_a_en    ? sfu_sram_a_row
                       : dma_sram_en      ? dma_sram_row
                                          : sys_sram_a_row;
   assign sram_a_wdata = helper_sram_a_en ? helper_sram_a_wdata
+                      : sfu_sram_a_en    ? sfu_sram_a_wdata
                       : dma_sram_en      ? dma_sram_wdata
                                          : sys_sram_a_wdata;
 
-  assign sram_b_en    = helper_sram_b_en ? helper_sram_b_en : sys_sram_b_en;
-  assign sram_b_buf   = helper_sram_b_en ? helper_sram_b_buf : sys_sram_b_buf;
-  assign sram_b_row   = helper_sram_b_en ? helper_sram_b_row : sys_sram_b_row;
+  assign sram_b_en    = helper_sram_b_en ? helper_sram_b_en
+                      : sfu_sram_b_en    ? sfu_sram_b_en
+                                         : sys_sram_b_en;
+  assign sram_b_buf   = helper_sram_b_en ? helper_sram_b_buf
+                      : sfu_sram_b_en    ? sfu_sram_b_buf
+                                         : sys_sram_b_buf;
+  assign sram_b_row   = helper_sram_b_en ? helper_sram_b_row
+                      : sfu_sram_b_en    ? sfu_sram_b_row
+                                         : sys_sram_b_row;
 
   assign helper_sram_a_rdata = sram_a_rdata;
   assign dma_sram_rdata      = sram_a_rdata;
   assign sys_sram_a_rdata    = sram_a_rdata;
   assign helper_sram_b_rdata = sram_b_rdata;
+  assign sfu_sram_b_rdata    = sram_b_rdata;
   assign sys_sram_b_rdata    = sram_b_rdata;
   assign dma_sram_fault_w = dma_sram_en & sram_a_fault;
   assign sys_sram_fault_now = (sys_sram_b_en & ~helper_sram_b_en & sram_b_fault) |
-                              (sys_sram_a_en & ~helper_sram_a_en & ~dma_sram_en & sram_a_fault);
+                              (sys_sram_a_en & ~helper_sram_a_en & ~sfu_sram_a_en & ~dma_sram_en & sram_a_fault);
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)
@@ -312,6 +338,7 @@ module taccel_top
   // Merge all asynchronous or submodule-originated failures into the single
   // external fault input consumed by the control FSM.
   assign ext_fault_w = fetch_fault_w | dma_fault_w | helper_fault_w |
+                       sfu_fault_w |
                        sys_sram_fault_now | sys_sram_fault_latched;
 
   always_comb begin
@@ -321,6 +348,8 @@ module taccel_top
       ext_fault_code_w = dma_fault_code_w;
     else if (helper_fault_w)
       ext_fault_code_w = helper_fault_code_w;
+    else if (sfu_fault_w)
+      ext_fault_code_w = sfu_fault_code_w;
     else if (sys_sram_fault_now || sys_sram_fault_latched)
       ext_fault_code_w = 4'(FAULT_SRAM_OOB);
     else
@@ -415,7 +444,7 @@ module taccel_top
     .scale_wdata  (scale_wdata),
     .scale_raddr0 (insn.sreg),
     .scale_rdata0 (scale_rdata0),
-    .scale_raddr1 ({insn.sreg[3:1], 1'b1}),
+    .scale_raddr1 (insn.sreg + 4'd1),
     .scale_rdata1 (scale_rdata1),
     .addr_lo_we   (addr_lo_we),
     .addr_hi_we   (addr_hi_we),
@@ -465,6 +494,38 @@ module taccel_top
     .sram_b_row     (helper_sram_b_row),
     .sram_b_rdata   (helper_sram_b_rdata),
     .sram_b_fault   (helper_sram_b_en & sram_b_fault)
+  );
+
+  sfu_engine u_sfu (
+    .clk            (clk),
+    .rst_n          (rst_n),
+    .dispatch       (sfu_dispatch),
+    .opcode         (insn.opcode),
+    .src1_buf       (insn.src1_buf),
+    .src1_off       (insn.src1_off),
+    .src2_buf       (insn.src2_buf),
+    .src2_off       (insn.src2_off),
+    .dst_buf        (insn.dst_buf),
+    .dst_off        (insn.dst_off),
+    .sreg           (insn.sreg),
+    .tile_m         (tile_m),
+    .tile_n         (tile_n),
+    .scale0_data    (scale_rdata0),
+    .scale1_data    (scale_rdata1),
+    .sfu_busy       (sfu_busy),
+    .sfu_fault      (sfu_fault_w),
+    .sfu_fault_code (sfu_fault_code_w),
+    .sram_a_en      (sfu_sram_a_en),
+    .sram_a_we      (sfu_sram_a_we),
+    .sram_a_buf     (sfu_sram_a_buf),
+    .sram_a_row     (sfu_sram_a_row),
+    .sram_a_wdata   (sfu_sram_a_wdata),
+    .sram_a_fault   (sfu_sram_a_en & sram_a_fault),
+    .sram_b_en      (sfu_sram_b_en),
+    .sram_b_buf     (sfu_sram_b_buf),
+    .sram_b_row     (sfu_sram_b_row),
+    .sram_b_rdata   (sfu_sram_b_rdata),
+    .sram_b_fault   (sfu_sram_b_en & sram_b_fault)
   );
 
   dma_engine u_dma (
