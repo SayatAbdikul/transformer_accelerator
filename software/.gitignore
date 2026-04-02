@@ -4,6 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
 
 # Virtual environment
 venv/

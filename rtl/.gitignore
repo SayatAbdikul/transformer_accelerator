@@ -1,8 +1,10 @@
 # Verilator build artifacts
 verilator/build/
+verilator/obj_dir/
 
 # cocotb simulation artifacts
 cocotb/sim_build/
+cocotb/.pytest_cache/
 cocotb/__pycache__/
 cocotb/results.xml
 cocotb/*.vcd
@@ -29,6 +31,10 @@ cocotb/iverilog_dump.v
 # Simulation logs
 *.log
 sim.log
+
+# Coverage / Python test output
+.coverage
+coverage.xml
 
 # Synthesis artifacts
 synth/*.bit

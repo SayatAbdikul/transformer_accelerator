@@ -1,0 +1,14 @@
+# Repository-wide local/build artifacts
+obj_dir/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
+.coverage
+coverage.xml
+.DS_Store
+
+# Local environments and tool state
+.venv/
+venv/
+env/
+.claude/
