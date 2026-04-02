@@ -236,18 +236,19 @@ async def test_set_scale_from_buffer_fault(dut):
 
 
 @cocotb.test()
-async def test_oversized_load_fault(dut):
-    """LOAD lengths beyond the current single-burst DMA limit fault immediately."""
+async def test_multiburst_load_supported(dut):
+    """Phase B accepts LOAD lengths above 256 beats and completes via SYNC."""
     dram, _ = await init_dut(dut)
     prog = [
         SET_ADDR_LO(0, 0),
         SET_ADDR_HI(0, 0),
         LOAD(BUF_ABUF, 0, 257, 0, 0),
+        SYNC(0b001),
+        HALT(),
     ]
-    done, fault, fault_code, _ = await run_program(dut, dram, prog)
-    assert done == 0
-    assert fault == 1
-    assert fault_code == 6, f"Expected FAULT_UNSUPPORTED_OP=6, got {fault_code}"
+    done, fault, _, _ = await run_program(dut, dram, prog)
+    assert done == 1
+    assert fault == 0
 
 
 @cocotb.test()

@@ -198,7 +198,8 @@ public:
         : mem_(size_bytes, 0), pending_valid_(false), pending_addr_(0),
           pending_timer_(0), r_valid_(false),
           aw_pending_(false), aw_addr_(0), aw_len_(0), w_beat_cnt_(0),
-          b_pending_(false), next_r_resp_(0), next_r_last_override_(-1)
+          b_pending_(false), next_r_resp_(0), next_r_last_override_(-1),
+          next_b_resp_(0), active_b_resp_(0), read_beat_count_(0)
     {}
 
     // Write a big-endian 64-bit instruction word at instruction index pc_idx
@@ -226,6 +227,10 @@ public:
         next_r_last_override_ = force_last;
     }
 
+    void inject_next_bresp(int resp) {
+        next_b_resp_ = resp & 0x3;
+    }
+
     // Write raw bytes at byte address
     void write_bytes(size_t addr, const uint8_t* data, size_t len) {
         assert(addr + len <= mem_.size());
@@ -235,6 +240,18 @@ public:
     uint8_t read_byte(size_t addr) const {
         assert(addr < mem_.size());
         return mem_[addr];
+    }
+
+    const std::vector<uint64_t>& read_addr_log() const {
+        return read_addr_log_;
+    }
+
+    const std::vector<int>& read_len_log() const {
+        return read_len_log_;
+    }
+
+    uint64_t read_beat_count() const {
+        return read_beat_count_;
     }
 
     // Drive AXI slave outputs given DUT's master outputs (call every cycle).
@@ -251,6 +268,8 @@ public:
             pending_beat_    = 0;
             pending_timer_   = latency;
             pending_valid_   = true;
+            read_addr_log_.push_back(aligned);
+            read_len_log_.push_back(pending_ar_len_);
         }
 
         // ----------------------------------------------------------------
@@ -258,6 +277,7 @@ public:
         // ----------------------------------------------------------------
         if (r_valid_) {
             if (dut->m_axi_r_ready) {
+                read_beat_count_++;
                 r_valid_           = false;
                 dut->m_axi_r_valid = 0;
                 dut->m_axi_r_last  = 0;
@@ -326,6 +346,8 @@ public:
                 if (last) {
                     aw_pending_ = false;
                     b_pending_  = true;
+                    active_b_resp_ = next_b_resp_;
+                    next_b_resp_ = 0;
                     // Keep w_ready=1 this cycle so DUT sees it on posedge;
                     // the else branch below will clear it next cycle.
                 }
@@ -339,7 +361,7 @@ public:
         // ----------------------------------------------------------------
         if (b_pending_) {
             dut->m_axi_b_valid = 1;
-            dut->m_axi_b_resp  = 0;
+            dut->m_axi_b_resp  = active_b_resp_;
             if (dut->m_axi_b_ready) {
                 b_pending_ = false;
                 // Keep b_valid=1 this cycle so DUT sees it on posedge;
@@ -368,6 +390,11 @@ private:
     bool     b_pending_;
     int      next_r_resp_;
     int      next_r_last_override_;
+    int      next_b_resp_;
+    int      active_b_resp_;
+    uint64_t read_beat_count_;
+    std::vector<uint64_t> read_addr_log_;
+    std::vector<int> read_len_log_;
 };
 
 // ============================================================================

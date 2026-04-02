@@ -55,6 +55,71 @@ async def _wait_halt(dut, max_cycles=100_000):
     raise TimeoutError("DUT did not halt")
 
 
+def _pattern(nbytes: int, seed: int) -> bytes:
+    return bytes((seed + 37 * i) & 0xFF for i in range(nbytes))
+
+
+async def _roundtrip_case(dut, name: str, buf_id: int, beats: int, src: int, dst: int, seed: int):
+    src_data = _pattern(beats * 16, seed)
+    prog = [
+        SET_ADDR_LO(0, src), SET_ADDR_HI(0, 0),
+        LOAD(buf_id, 0, beats, 0, 0),
+        SYNC(0b001),
+        SET_ADDR_LO(1, dst), SET_ADDR_HI(1, 0),
+        STORE(buf_id, 0, beats, 1, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog, {src: src_data})
+    await _wait_halt(dut, max_cycles=2_000_000)
+
+    assert dut.done.value == 1, f"{name}: expected done"
+    assert dut.fault.value == 0, f"{name}: unexpected fault"
+    assert bytes(dram.mem[dst:dst + len(src_data)]) == src_data, f"{name}: data mismatch"
+    dut._log.info(f"{name}: OK")
+
+
+async def _expect_dma_read_fault(
+    dut,
+    name: str,
+    xfer_len: int,
+    beat_index: int,
+    resp: int = 0,
+    force_last=None,
+):
+    src = 0x1D0000
+    prog = [
+        SET_ADDR_LO(0, src), SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, xfer_len, 0, 0),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog, {src: _pattern(xfer_len * 16, 0x44)})
+
+    dma_ar_seen = False
+    dma_read_base = 0
+    injected = False
+
+    for _ in range(20_000):
+        await RisingEdge(dut.clk)
+
+        if not dma_ar_seen and any(addr == src for addr, _ in dram.ar_log):
+            dma_ar_seen = True
+            dma_read_base = dram.read_beat_count
+
+        if dma_ar_seen and not injected and dram.read_beat_count == dma_read_base + beat_index:
+            dram.inject_next_read(resp=resp, force_last=force_last)
+            injected = True
+
+        if int(dut.done.value) or int(dut.fault.value):
+            break
+
+    assert injected, f"{name}: did not inject DMA read fault"
+    assert dut.fault.value == 1, f"{name}: expected fault"
+    assert int(dut.fault_code.value) == 2, f"{name}: expected FAULT_DRAM_OOB=2"
+    dut._log.info(f"{name}: OK")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -342,6 +407,99 @@ async def test_load_store_max_len_256(dut):
 
 
 @cocotb.test()
+async def test_zero_length_load_noop(dut):
+    """xfer_len=0 LOAD is a legal no-op with no DMA read burst."""
+    SRC = 0x150000
+    prog = [
+        SET_ADDR_LO(0, SRC), SET_ADDR_HI(0, 0),
+        LOAD(BUF_ABUF, 0, 0, 0, 0),
+        NOP(),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog)
+    await _wait_halt(dut)
+
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert all(addr != SRC for addr, _ in dram.ar_log), "zero-length LOAD should not issue DMA AR"
+    dut._log.info("zero_length_load_noop: OK")
+
+
+@cocotb.test()
+async def test_zero_length_store_noop(dut):
+    """xfer_len=0 STORE is a legal no-op and leaves DRAM untouched."""
+    DST = 0x152000
+    sentinel = _pattern(16, 0xA3)
+    prog = [
+        SET_ADDR_LO(0, DST), SET_ADDR_HI(0, 0),
+        STORE(BUF_ABUF, 0, 0, 0, 0),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog, {DST: sentinel})
+    await _wait_halt(dut)
+
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert bytes(dram.mem[DST:DST+16]) == sentinel, "zero-length STORE modified DRAM"
+    dut._log.info("zero_length_store_noop: OK")
+
+
+@cocotb.test()
+async def test_roundtrip_257_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_257_beats", BUF_ABUF, 257, 0x200000, 0x220000, 0x11)
+
+
+@cocotb.test()
+async def test_roundtrip_511_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_511_beats", BUF_ABUF, 511, 0x240000, 0x260000, 0x21)
+
+
+@cocotb.test()
+async def test_roundtrip_512_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_512_beats", BUF_ABUF, 512, 0x280000, 0x2A0000, 0x31)
+
+
+@cocotb.test()
+async def test_roundtrip_2304_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_2304_beats", BUF_WBUF, 2304, 0x2C0000, 0x300000, 0x41)
+
+
+@cocotb.test()
+async def test_roundtrip_2352_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_2352_beats", BUF_WBUF, 2352, 0x340000, 0x380000, 0x51)
+
+
+@cocotb.test()
+async def test_roundtrip_9216_beats(dut):
+    await _roundtrip_case(dut, "roundtrip_9216_beats", BUF_WBUF, 9216, 0x3C0000, 0x500000, 0x61)
+
+
+@cocotb.test()
+async def test_fetch_interleave_between_dma_bursts(dut):
+    """Fetch should slip in between DMA read bursts on a long LOAD."""
+    SRC = 0x540000
+    prog = [
+        SET_ADDR_LO(0, SRC), SET_ADDR_HI(0, 0),
+        LOAD(BUF_WBUF, 0, 257, 0, 0),
+        NOP(),
+        SYNC(0b001),
+        HALT(),
+    ]
+    dram = await _setup(dut, prog, {SRC: _pattern(257 * 16, 0x77)})
+    await _wait_halt(dut, max_cycles=200_000)
+
+    assert dut.done.value == 1, "expected done"
+    assert dut.fault.value == 0, "unexpected fault"
+    assert any(
+        dram.ar_log[i] == (SRC, 255) and
+        dram.ar_log[i + 1][0] < 0x1000 and
+        dram.ar_log[i + 2] == (SRC + 256 * 16, 0)
+        for i in range(len(dram.ar_log) - 2)
+    ), f"expected fetch AR between DMA bursts, got {dram.ar_log}"
+    dut._log.info("fetch_interleave_between_dma_bursts: OK")
+
+
+@cocotb.test()
 async def test_store_backpressure_aw_w(dut):
     """STORE should complete when AW/W are stalled for several cycles."""
     SRC = 0x160000
@@ -375,7 +533,7 @@ async def test_store_backpressure_aw_w(dut):
 
 @cocotb.test()
 async def test_store_bresp_non_okay_path(dut):
-    """Exercise DMA B channel when slave returns non-OKAY BRESP."""
+    """STORE should fault when the slave returns non-OKAY BRESP."""
     SRC = 0x1A0000
     DST = 0x1C0000
     src_data = bytes((0x90 ^ i) & 0xFF for i in range(16))
@@ -396,8 +554,32 @@ async def test_store_bresp_non_okay_path(dut):
     )
     await _wait_halt(dut)
 
-    # Current RTL does not fault on BRESP and only waits for BVALID handshake.
-    assert dut.done.value == 1, "expected done"
-    assert dut.fault.value == 0, "unexpected fault"
-    assert bytes(dram.mem[DST:DST+16]) == src_data, "data mismatch"
-    dut._log.info("store_bresp_non_okay_path: exercised")
+    assert dut.done.value == 0, "unexpected done on BRESP fault"
+    assert dut.fault.value == 1, "expected fault"
+    assert int(dut.fault_code.value) == 2, "expected FAULT_DRAM_OOB=2"
+    dut._log.info("store_bresp_non_okay_path: OK")
+
+
+@cocotb.test()
+async def test_load_rresp_fault_first_beat(dut):
+    await _expect_dma_read_fault(dut, "load_rresp_fault_first_beat", 4, 0, resp=2)
+
+
+@cocotb.test()
+async def test_load_rresp_fault_middle_beat(dut):
+    await _expect_dma_read_fault(dut, "load_rresp_fault_middle_beat", 4, 1, resp=2)
+
+
+@cocotb.test()
+async def test_load_rresp_fault_final_beat(dut):
+    await _expect_dma_read_fault(dut, "load_rresp_fault_final_beat", 4, 3, resp=2)
+
+
+@cocotb.test()
+async def test_load_early_rlast_fault(dut):
+    await _expect_dma_read_fault(dut, "load_early_rlast_fault", 4, 1, force_last=1)
+
+
+@cocotb.test()
+async def test_load_missing_final_rlast_fault(dut):
+    await _expect_dma_read_fault(dut, "load_missing_final_rlast_fault", 1, 0, force_last=0)

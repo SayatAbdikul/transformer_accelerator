@@ -257,20 +257,24 @@ static void test_set_scale_from_buffer_unsupported() {
 }
 
 // ============================================================================
-// Test: oversized single-burst DMA requests are rejected before dispatch
+// Test: multi-burst DMA lengths are supported in Phase B
 // ============================================================================
-static void test_oversized_dma_unsupported() {
-    expect_fault_program("unsupported_load_xfer_gt_256", {
+static void test_multiburst_dma_supported() {
+    const char* name = "multiburst_dma_supported";
+    Sim s;
+    s.load({
         insn::SET_ADDR_LO(0, 0),
         insn::SET_ADDR_HI(0, 0),
-        insn::LOAD(0, 0, 257, 0, 0)
-    }, 6, 1000);
-
-    expect_fault_program("unsupported_store_xfer_gt_256", {
-        insn::SET_ADDR_LO(0, 0),
-        insn::SET_ADDR_HI(0, 0),
-        insn::STORE(0, 0, 257, 0, 0)
-    }, 6, 1000);
+        insn::LOAD(0, 0, 257, 0, 0),
+        insn::SYNC(0b001),
+        insn::STORE(0, 0, 257, 0, 0),
+        insn::SYNC(0b001),
+        insn::HALT()
+    });
+    s.run(20000);
+    EXPECT(s.dut->done == 1, "done after multi-burst LOAD/STORE");
+    EXPECT(s.dut->fault == 0, "no fault for multi-burst DMA");
+    TEST_PASS(name);
 }
 
 // ============================================================================
@@ -403,7 +407,7 @@ int main(int argc, char** argv) {
     test_illegal_opcode();
     test_unsupported_ops();
     test_set_scale_from_buffer_unsupported();
-    test_oversized_dma_unsupported();
+    test_multiburst_dma_supported();
     test_matmul_no_config();
     test_fetch_rresp_fault();
     test_fetch_missing_rlast_fault();

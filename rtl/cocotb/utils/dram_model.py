@@ -33,6 +33,9 @@ class DramModel:
         self.size = size
         self._next_r_resp = 0
         self._next_r_last_override = None
+        self._next_b_resp_override = None
+        self.ar_log = []
+        self.read_beat_count = 0
 
     # -----------------------------------------------------------------------
     # Write helpers
@@ -61,6 +64,10 @@ class DramModel:
         """Override the next AXI read beat's RRESP and/or RLAST."""
         self._next_r_resp = int(resp) & 0x3
         self._next_r_last_override = None if force_last is None else int(force_last)
+
+    def inject_next_bresp(self, resp: int = 0) -> None:
+        """Override the next AXI write response BRESP."""
+        self._next_b_resp_override = int(resp) & 0x3
 
     @staticmethod
     def _sig_int(sig, default: int = 0) -> int:
@@ -109,6 +116,7 @@ class DramModel:
             if self._sig_int(dut.m_axi_ar_valid, 0) and self._sig_int(dut.m_axi_ar_ready, 0):
                 aligned  = int(dut.m_axi_ar_addr.value) & ~0xF
                 ar_len   = int(dut.m_axi_ar_len.value)
+                self.ar_log.append((aligned, ar_len))
                 pending.append({'addr': aligned, 'ar_len': ar_len,
                                 'beat': 0, 'cd': latency})
 
@@ -142,6 +150,7 @@ class DramModel:
                     while True:
                         await RisingEdge(dut.clk)
                         if self._sig_int(dut.m_axi_r_ready, 0):
+                            self.read_beat_count += 1
                             break
                     dut.m_axi_r_valid.value  = 0
                     dut.m_axi_r_last.value   = 0
@@ -277,8 +286,11 @@ class DramModel:
             if self._sig_int(dut.rst_n, default=0) == 0:
                 continue
 
+            burst_b_resp = b_resp_val if self._next_b_resp_override is None else self._next_b_resp_override
+            self._next_b_resp_override = None
+
             dut.m_axi_b_valid.value = 1
-            dut.m_axi_b_resp.value = b_resp_val
+            dut.m_axi_b_resp.value = burst_b_resp
             while True:
                 await RisingEdge(dut.clk)
                 if self._sig_int(dut.rst_n, default=0) == 0:

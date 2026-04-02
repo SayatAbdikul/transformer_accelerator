@@ -134,9 +134,6 @@ module control_unit
         OP_SET_SCALE:
           unsupported_op = (s_src_mode != 2'b00);
 
-        OP_LOAD, OP_STORE:
-          unsupported_op = (m_xfer_len == 16'h0) || (m_xfer_len > 16'd256);
-
         default:
           unsupported_op = 1'b0;
       endcase

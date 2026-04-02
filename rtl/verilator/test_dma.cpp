@@ -45,11 +45,20 @@ struct Sim {
         dram.write_program(prog);
     }
 
-    // Start execution; run until halt or fault
-    int run(int timeout = 100000) {
+    void start() {
         dut->start = 1;
         tick(dut.get(), dram);
         dut->start = 0;
+    }
+
+    void step(int cycles = 1) {
+        for (int i = 0; i < cycles; ++i)
+            tick(dut.get(), dram);
+    }
+
+    // Start execution; run until halt or fault
+    int run(int timeout = 100000) {
+        start();
         return run_until_halt(dut.get(), dram, timeout);
     }
 };
@@ -94,6 +103,100 @@ static void sram_read_row(Vtaccel_top* dut, int buf_id, int row, uint8_t out[16]
         out[w * 4 + 2] = uint8_t((word >> 16) & 0xFF);
         out[w * 4 + 3] = uint8_t((word >> 24) & 0xFF);
     }
+}
+
+static std::vector<uint8_t> make_pattern(size_t size, uint8_t seed) {
+    std::vector<uint8_t> data(size);
+    for (size_t i = 0; i < size; ++i)
+        data[i] = uint8_t((seed + (37 * i)) & 0xFF);
+    return data;
+}
+
+static void expect_dram_bytes(AXI4SlaveModel& dram, uint64_t addr,
+                              const std::vector<uint8_t>& expected,
+                              const char* name) {
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (dram.read_byte(addr + i) != expected[i])
+            TEST_FAIL(name, "DRAM data mismatch");
+    }
+}
+
+static void expect_dram_bytes_16(AXI4SlaveModel& dram, uint64_t addr,
+                                 const uint8_t expected[16], const char* name) {
+    for (int i = 0; i < 16; ++i) {
+        if (dram.read_byte(addr + i) != expected[i])
+            TEST_FAIL(name, "DRAM data mismatch");
+    }
+}
+
+static void run_roundtrip_case(const char* name, int buf_id, int beats,
+                               uint64_t src_addr, uint64_t dst_addr,
+                               uint8_t seed) {
+    Sim s;
+    const size_t nbytes = size_t(beats) * 16;
+    std::vector<uint8_t> src = make_pattern(nbytes, seed);
+    s.dram.write_bytes(src_addr, src.data(), src.size());
+
+    s.load({
+        insn::SET_ADDR_LO(0, src_addr), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(buf_id, 0, beats, 0, 0),
+        insn::SYNC(0b001),
+        insn::SET_ADDR_LO(1, dst_addr), insn::SET_ADDR_HI(1, 0),
+        insn::STORE(buf_id, 0, beats, 1, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(2000000);
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+    expect_dram_bytes(s.dram, dst_addr, src, name);
+    TEST_PASS(name);
+}
+
+static void expect_dma_fault_after_injection(const char* name, int xfer_len,
+                                             int beat_index, int resp,
+                                             int force_last) {
+    Sim s;
+    constexpr uint64_t SRC = 0x1D0000;
+    std::vector<uint8_t> src = make_pattern(size_t(xfer_len) * 16, 0x44);
+    s.dram.write_bytes(SRC, src.data(), src.size());
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(BUF_ABUF_ID, 0, xfer_len, 0, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.start();
+
+    bool dma_ar_seen = false;
+    bool injected = false;
+    uint64_t dma_read_base = 0;
+
+    for (int cycle = 0; cycle < 20000; ++cycle) {
+      s.step();
+
+      const auto& read_log = s.dram.read_addr_log();
+      if (!dma_ar_seen && !read_log.empty() && read_log.back() == SRC) {
+          dma_ar_seen = true;
+          dma_read_base = s.dram.read_beat_count();
+      }
+
+      if (dma_ar_seen && !injected &&
+          s.dram.read_beat_count() == dma_read_base + uint64_t(beat_index)) {
+          s.dram.inject_next_read(resp, force_last);
+          injected = true;
+      }
+
+      if (s.dut->done || s.dut->fault)
+          break;
+    }
+
+    if (!injected) TEST_FAIL(name, "did not inject DMA read fault");
+    if (!s.dut->fault) TEST_FAIL(name, "expected fault=1");
+    if (s.dut->fault_code != 2) TEST_FAIL(name, "expected fault_code=2 (DRAM_OOB)");
+    TEST_PASS(name);
 }
 
 // ============================================================================
@@ -451,6 +554,146 @@ static void test_dram_offset() {
 }
 
 // ============================================================================
+// test: xfer_len=0 LOAD leaves SRAM untouched and completes without DMA busy
+// ============================================================================
+static void test_zero_length_load_noop() {
+    const char* name = "zero_length_load_noop";
+    Sim s;
+
+    constexpr uint64_t SRC = 0x102000;
+    constexpr uint64_t DST = 0x104000;
+    uint8_t sentinel[16];
+    for (int i = 0; i < 16; ++i) sentinel[i] = uint8_t(0xE0 + i);
+    sram_write_row(s.dut.get(), BUF_ABUF_ID, 0, sentinel);
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(BUF_ABUF_ID, 0, 0, 0, 0),
+        insn::SET_ADDR_LO(1, DST), insn::SET_ADDR_HI(1, 0),
+        insn::STORE(BUF_ABUF_ID, 0, 1, 1, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(20000);
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+    expect_dram_bytes_16(s.dram, DST, sentinel, name);
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// test: xfer_len=0 STORE leaves DRAM untouched and completes without fault
+// ============================================================================
+static void test_zero_length_store_noop() {
+    const char* name = "zero_length_store_noop";
+    Sim s;
+
+    constexpr uint64_t DST = 0x106000;
+    std::vector<uint8_t> sentinel = make_pattern(16, 0xA3);
+    s.dram.write_bytes(DST, sentinel.data(), sentinel.size());
+
+    s.load({
+        insn::SET_ADDR_LO(0, DST), insn::SET_ADDR_HI(0, 0),
+        insn::STORE(BUF_ABUF_ID, 0, 0, 0, 0),
+        insn::HALT(),
+    });
+
+    s.run(5000);
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+    expect_dram_bytes(s.dram, DST, sentinel, name);
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// test: boundary and compiler-scale DMA transfers roundtrip correctly
+// ============================================================================
+static void test_large_roundtrip_lengths() {
+    run_roundtrip_case("roundtrip_257_beats",  BUF_ABUF_ID, 257,  0x200000, 0x220000, 0x11);
+    run_roundtrip_case("roundtrip_511_beats",  BUF_ABUF_ID, 511,  0x240000, 0x260000, 0x21);
+    run_roundtrip_case("roundtrip_512_beats",  BUF_ABUF_ID, 512,  0x280000, 0x2A0000, 0x31);
+    run_roundtrip_case("roundtrip_2304_beats", BUF_WBUF_ID, 2304, 0x2C0000, 0x300000, 0x41);
+    run_roundtrip_case("roundtrip_2352_beats", BUF_WBUF_ID, 2352, 0x340000, 0x380000, 0x51);
+    run_roundtrip_case("roundtrip_9216_beats", BUF_WBUF_ID, 9216, 0x3C0000, 0x500000, 0x61);
+}
+
+// ============================================================================
+// test: fetch can interleave between DMA read bursts
+// ============================================================================
+static void test_fetch_interleave_between_dma_bursts() {
+    const char* name = "fetch_interleave_between_dma_bursts";
+    Sim s;
+
+    constexpr uint64_t SRC = 0x540000;
+    std::vector<uint8_t> src = make_pattern(size_t(257) * 16, 0x77);
+    s.dram.write_bytes(SRC, src.data(), src.size());
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(BUF_WBUF_ID, 0, 257, 0, 0),
+        insn::NOP(),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(200000);
+    if (!s.dut->done || s.dut->fault) TEST_FAIL(name, "did not halt cleanly");
+
+    const auto& read_log = s.dram.read_addr_log();
+    bool interleaved = false;
+    for (size_t i = 0; i + 2 < read_log.size(); ++i) {
+        if (read_log[i] == SRC &&
+            read_log[i + 1] < 0x1000 &&
+            read_log[i + 2] == (SRC + 256 * 16)) {
+            interleaved = true;
+            break;
+        }
+    }
+
+    if (!interleaved) TEST_FAIL(name, "expected fetch AR between DMA bursts");
+    TEST_PASS(name);
+}
+
+// ============================================================================
+// test: DMA read faults are surfaced for first/middle/final beats and bad RLAST
+// ============================================================================
+static void test_dma_read_faults() {
+    expect_dma_fault_after_injection("load_rresp_fault_first_beat", 4, 0, 2, -1);
+    expect_dma_fault_after_injection("load_rresp_fault_middle_beat", 4, 1, 2, -1);
+    expect_dma_fault_after_injection("load_rresp_fault_final_beat", 4, 3, 2, -1);
+    expect_dma_fault_after_injection("load_early_rlast_fault", 4, 1, 0, 1);
+    expect_dma_fault_after_injection("load_missing_final_rlast_fault", 1, 0, 0, 0);
+}
+
+// ============================================================================
+// test: non-OKAY BRESP faults STORE
+// ============================================================================
+static void test_store_bresp_fault() {
+    const char* name = "store_bresp_fault";
+    Sim s;
+
+    constexpr uint64_t SRC = 0x580000;
+    constexpr uint64_t DST = 0x5A0000;
+    std::vector<uint8_t> src = make_pattern(16, 0x99);
+    s.dram.write_bytes(SRC, src.data(), src.size());
+    s.dram.inject_next_bresp(2);
+
+    s.load({
+        insn::SET_ADDR_LO(0, SRC), insn::SET_ADDR_HI(0, 0),
+        insn::LOAD(BUF_ABUF_ID, 0, 1, 0, 0),
+        insn::SYNC(0b001),
+        insn::SET_ADDR_LO(1, DST), insn::SET_ADDR_HI(1, 0),
+        insn::STORE(BUF_ABUF_ID, 0, 1, 1, 0),
+        insn::SYNC(0b001),
+        insn::HALT(),
+    });
+
+    s.run(20000);
+    if (!s.dut->fault) TEST_FAIL(name, "expected fault=1");
+    if (s.dut->fault_code != 2) TEST_FAIL(name, "expected fault_code=2 (DRAM_OOB)");
+    TEST_PASS(name);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 int main(int argc, char** argv) {
@@ -467,6 +710,12 @@ int main(int argc, char** argv) {
     test_store_oob_fault();
     test_load_dispatch_async();
     test_dram_offset();
+    test_zero_length_load_noop();
+    test_zero_length_store_noop();
+    test_large_roundtrip_lengths();
+    test_fetch_interleave_between_dma_bursts();
+    test_dma_read_faults();
+    test_store_bresp_fault();
 
     printf("\n%d / %d tests passed\n", tests_pass, tests_run);
     return (tests_pass == tests_run) ? 0 : 1;

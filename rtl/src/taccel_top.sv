@@ -2,7 +2,6 @@
 //
 // Phase 2 additions:
 //   - DMA engine instantiated (LOAD/STORE via AXI4 master)
-//   - AXI4 AR/R arbitration: DMA has priority over fetch during LOAD
 //   - SRAM Port A connected to DMA engine
 //   - AXI write channels (AW/W/B) connected to DMA engine
 //   - New ports: m_axi_aw_len, m_axi_aw_size, m_axi_aw_burst
@@ -11,6 +10,11 @@
 //   - Systolic controller instantiated
 //   - sys_busy now driven by systolic controller (not stubbed)
 //   - SRAM port arbitration between DMA and systolic controller
+//
+// Phase B DMA productionization:
+//   - explicit AR grant tracking for fetch vs DMA
+//   - burst-boundary fetch interleave between DMA read bursts
+//   - R channel ownership based on the accepted AR request
 
 `ifndef TACCEL_TOP_SV
 `define TACCEL_TOP_SV
@@ -71,8 +75,8 @@ module taccel_top
   // --- Fetch unit AXI connections (before arbitration mux) ---
   logic [AXI_ADDR_W-1:0] fetch_ar_addr;
   logic                   fetch_ar_valid;
-  logic                   fetch_ar_ready;   // gated: ar_ready & ~dma_rd_busy
-  logic                   fetch_r_valid;    // gated: r_valid & ~axi_r_owner
+  logic                   fetch_ar_ready;
+  logic                   fetch_r_valid;
   logic                   fetch_r_ready;
 
   // --- DMA engine AXI connections ---
@@ -82,32 +86,72 @@ module taccel_top
   logic                   dma_ar_ready;
   logic                   dma_r_valid;
   logic                   dma_r_ready;
+  logic                   dma_r_owner_q;
+  logic                   rd_inflight_q;
+  logic                   prefer_fetch_after_dma_q;
+  logic                   select_dma_ar_w;
+  logic                   select_fetch_ar_w;
 
-  // Tracks who sent the last accepted AR (0=fetch, 1=DMA)
-  logic axi_r_owner;
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n)
-      axi_r_owner <= 1'b0;
-    else if (m_axi_ar_valid && m_axi_ar_ready)
-      axi_r_owner <= dma_ar_valid;
-  end
-
-  // AR mux: DMA wins; fetch is gated when DMA read is active
+  // AR arbitration: only one read request may be in flight at a time. DMA gets
+  // default priority, but after each completed DMA burst we allow one pending
+  // fetch read to slip in before the next DMA burst is launched.
   logic dma_rd_busy;
 
-  assign m_axi_ar_addr  = dma_ar_valid ? dma_ar_addr : fetch_ar_addr;
-  assign m_axi_ar_len   = dma_ar_valid ? dma_ar_len  : 8'h00;
+  always_comb begin
+    select_dma_ar_w   = 1'b0;
+    select_fetch_ar_w = 1'b0;
+
+    if (!rd_inflight_q) begin
+      if (dma_ar_valid && fetch_ar_valid) begin
+        if (prefer_fetch_after_dma_q)
+          select_fetch_ar_w = 1'b1;
+        else
+          select_dma_ar_w = 1'b1;
+      end else if (dma_ar_valid) begin
+        select_dma_ar_w = 1'b1;
+      end else if (fetch_ar_valid) begin
+        select_fetch_ar_w = 1'b1;
+      end
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dma_r_owner_q            <= 1'b0;
+      rd_inflight_q            <= 1'b0;
+      prefer_fetch_after_dma_q <= 1'b0;
+    end else begin
+      if (m_axi_ar_valid && m_axi_ar_ready) begin
+        dma_r_owner_q <= select_dma_ar_w;
+        rd_inflight_q <= 1'b1;
+        if (select_fetch_ar_w)
+          prefer_fetch_after_dma_q <= 1'b0;
+      end
+
+      if (rd_inflight_q && m_axi_r_valid && m_axi_r_ready && m_axi_r_last) begin
+        rd_inflight_q <= 1'b0;
+        if (dma_r_owner_q)
+          prefer_fetch_after_dma_q <= 1'b1;
+      end
+    end
+  end
+
+  assign m_axi_ar_addr  = select_dma_ar_w ? dma_ar_addr : fetch_ar_addr;
+  assign m_axi_ar_len   = select_dma_ar_w ? dma_ar_len  : 8'h00;
   assign m_axi_ar_size  = 3'b100;   // 16 bytes/beat
   assign m_axi_ar_burst = 2'b01;    // INCR
-  assign m_axi_ar_valid = dma_ar_valid | (fetch_ar_valid & ~dma_rd_busy);
+  assign m_axi_ar_valid = select_dma_ar_w | select_fetch_ar_w;
 
-  assign dma_ar_ready   = m_axi_ar_ready &  dma_ar_valid;
-  assign fetch_ar_ready = m_axi_ar_ready & ~dma_rd_busy;
+  assign dma_ar_ready   = m_axi_ar_ready & ~rd_inflight_q &
+                          (~fetch_ar_valid | ~prefer_fetch_after_dma_q);
+  assign fetch_ar_ready = m_axi_ar_ready & ~rd_inflight_q &
+                          (~dma_ar_valid | prefer_fetch_after_dma_q);
 
   // R channel routing
-  assign dma_r_valid    = m_axi_r_valid &  axi_r_owner;
-  assign fetch_r_valid  = m_axi_r_valid & ~axi_r_owner;
-  assign m_axi_r_ready  = axi_r_owner ? dma_r_ready : fetch_r_ready;
+  assign dma_r_valid    = m_axi_r_valid &  rd_inflight_q &  dma_r_owner_q;
+  assign fetch_r_valid  = m_axi_r_valid &  rd_inflight_q & ~dma_r_owner_q;
+  assign m_axi_r_ready  = rd_inflight_q ? (dma_r_owner_q ? dma_r_ready : fetch_r_ready)
+                                        : 1'b0;
 
   // AXI write: fixed protocol fields (DMA always uses 16B/INCR)
   assign m_axi_aw_size  = 3'b100;
@@ -362,6 +406,7 @@ module taccel_top
     .dma_ar_valid    (dma_ar_valid),
     .dma_ar_ready    (dma_ar_ready),
     .dma_r_data      (m_axi_r_data),
+    .dma_r_resp      (m_axi_r_resp),
     .dma_r_valid     (dma_r_valid),
     .dma_r_last      (m_axi_r_last),
     .dma_r_ready     (dma_r_ready),
