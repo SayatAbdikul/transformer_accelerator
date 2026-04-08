@@ -92,6 +92,20 @@ package taccel_pkg;
   } fault_code_t;
 
   // -------------------------------------------------------------------------
+  // Internal-only fault source tags used by the Verilator runner and trace
+  // hooks. These are intentionally not exposed through the ISA.
+  // -------------------------------------------------------------------------
+  typedef enum logic [2:0] {
+    OBS_FAULT_SRC_NONE    = 3'd0,
+    OBS_FAULT_SRC_FETCH   = 3'd1,
+    OBS_FAULT_SRC_DMA     = 3'd2,
+    OBS_FAULT_SRC_HELPER  = 3'd3,
+    OBS_FAULT_SRC_SFU     = 3'd4,
+    OBS_FAULT_SRC_SRAM    = 3'd5,
+    OBS_FAULT_SRC_CONTROL = 3'd6
+  } obs_fault_src_t;
+
+  // -------------------------------------------------------------------------
   // Decoded instruction struct
   //
   // All format fields are decoded in parallel; only those matching the current

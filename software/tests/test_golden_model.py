@@ -4,6 +4,7 @@ import numpy as np
 from taccel.golden_model.state import MachineState
 from taccel.golden_model.simulator import Simulator, ConfigError, IllegalBufferError
 from taccel.golden_model.memory import SRAMAccessError, DRAMAccessError
+from taccel.golden_model import memory as mem
 from taccel.assembler.assembler import Assembler, ProgramBinary
 from taccel.isa.opcodes import BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from tools.run_golden import write_runtime_inputs
@@ -689,3 +690,109 @@ class TestErfPoly:
         poly = _erf_poly(x)
         max_err = float(np.max(np.abs(ref - poly)))
         assert max_err < 1e-6, f"Max erf error {max_err:.2e} exceeds 1e-6"
+
+
+class TestTraceRawSnapshots:
+    def test_trace_payload_includes_raw_int8_tensor(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "trace_abuf",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 16,
+                    "logical_rows": 1,
+                    "logical_cols": 16,
+                    "full_rows": 1,
+                    "full_cols": 16,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.5,
+                    "when": "after",
+                }
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace(["trace_abuf"])
+        values = np.arange(16, dtype=np.int8)
+        mem.write_bytes(sim.state, BUF_ABUF, 0, values.tobytes())
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        np.testing.assert_array_equal(trace["raw_tensors"]["trace_abuf"], values.reshape(1, 16))
+        assert trace["meta"]["trace_abuf"]["dtype"] == "int8"
+        assert trace["meta"]["trace_abuf"]["raw_available"] is True
+        assert trace["raw_events"][0]["event_index"] == 0
+        assert trace["raw_events"][0]["raw_available"] is True
+
+    def test_trace_payload_includes_raw_int32_tensor(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "trace_accum",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 1.25,
+                    "when": "after",
+                }
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace(["trace_accum"])
+        values = np.array([7, -9, 11, -13], dtype=np.int32)
+        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, values.reshape(1, 4))
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        np.testing.assert_array_equal(trace["raw_tensors"]["trace_accum"], values.reshape(1, 4))
+        assert trace["meta"]["trace_accum"]["dtype"] == "int32"
+        assert trace["meta"]["trace_accum"]["scale"] == pytest.approx(1.25)
+        assert trace["raw_events"][0]["raw_available"] is True
+
+    def test_virtual_trace_events_are_marked_non_architectural(self):
+        program = Assembler().assemble("HALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "virtual_node",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 1.0,
+                    "when": "after",
+                    "source": "virtual",
+                }
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace(["virtual_node"])
+        sim._virtual_trace_payloads["virtual_node"] = np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float32)
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        assert trace["meta"]["virtual_node"]["source"] == "virtual"
+        assert trace["meta"]["virtual_node"]["raw_available"] is False
+        assert trace["raw_events"][0]["source"] == "virtual"
+        assert trace["raw_events"][0]["raw_available"] is False
+        assert "virtual_node" not in trace["raw_tensors"]

@@ -78,7 +78,7 @@ async def run_program(dut, dram, insns, timeout_cycles=2000):
 
 @cocotb.test()
 async def test_nop_halt(dut):
-    """NOP → HALT: done=1, fault=0."""
+    """NOP -> HALT: done=1, fault=0."""
     dram, _ = await init_dut(dut)
     done, fault, _, cycles = await run_program(dut, dram, [NOP(), HALT()])
     assert done == 1,  f"Expected done=1, got {done}"
@@ -103,12 +103,12 @@ async def test_multi_nop_then_halt(dut):
     done, fault, _, cycles = await run_program(dut, dram, prog)
     assert done == 1
     assert fault == 0
-    dut._log.info(f"5×NOP+HALT: {cycles} cycles")
+    dut._log.info(f"5xNOP+HALT: {cycles} cycles")
 
 
 @cocotb.test()
 async def test_config_tile_then_halt(dut):
-    """CONFIG_TILE M=3,N=5,K=12 → HALT: no fault."""
+    """CONFIG_TILE M=3,N=5,K=12 -> HALT: no fault."""
     dram, _ = await init_dut(dut)
     done, fault, _, _ = await run_program(dut, dram, [CONFIG_TILE(3, 5, 12), HALT()])
     assert done == 1
@@ -117,7 +117,7 @@ async def test_config_tile_then_halt(dut):
 
 @cocotb.test()
 async def test_set_scale_then_halt(dut):
-    """SET_SCALE S0=0x3C00 (1.0 FP16) → HALT: no fault."""
+    """SET_SCALE S0=0x3C00 (1.0 FP16) -> HALT: no fault."""
     dram, _ = await init_dut(dut)
     done, fault, _, _ = await run_program(dut, dram, [SET_SCALE(0, 0x3C00), HALT()])
     assert done == 1
@@ -126,7 +126,7 @@ async def test_set_scale_then_halt(dut):
 
 @cocotb.test()
 async def test_set_addr_then_halt(dut):
-    """SET_ADDR_LO + SET_ADDR_HI → HALT: no fault."""
+    """SET_ADDR_LO + SET_ADDR_HI -> HALT: no fault."""
     dram, _ = await init_dut(dut)
     prog = [
         SET_ADDR_LO(0, 0x0100000),
@@ -140,7 +140,7 @@ async def test_set_addr_then_halt(dut):
 
 @cocotb.test()
 async def test_sync_zero_mask(dut):
-    """SYNC 0b000 → immediately passes (no units to wait for)."""
+    """SYNC 0b000 -> immediately passes (no units to wait for)."""
     dram, _ = await init_dut(dut)
     done, fault, _, _ = await run_program(dut, dram, [SYNC(0b000), HALT()])
     assert done == 1
@@ -149,7 +149,7 @@ async def test_sync_zero_mask(dut):
 
 @cocotb.test()
 async def test_sync_all_units_idle(dut):
-    """SYNC 0b111 → passes immediately when all units are idle."""
+    """SYNC 0b111 -> passes immediately when all units are idle."""
     dram, _ = await init_dut(dut)
     done, fault, _, cycles = await run_program(dut, dram, [SYNC(0b111), HALT()])
     assert done == 1
@@ -159,7 +159,7 @@ async def test_sync_all_units_idle(dut):
 
 @cocotb.test()
 async def test_config_tile_then_matmul_no_fault(dut):
-    """CONFIG_TILE → MATMUL → SYNC → HALT: no fault (MATMUL dispatches, SYS stub)."""
+    """CONFIG_TILE -> MATMUL -> SYNC -> HALT: no fault (MATMUL dispatches, SYS stub)."""
     dram, _ = await init_dut(dut)
     prog = [
         CONFIG_TILE(1, 1, 1),
@@ -174,7 +174,7 @@ async def test_config_tile_then_matmul_no_fault(dut):
 
 @cocotb.test()
 async def test_load_dispatch_no_stall(dut):
-    """LOAD dispatched (DMA stub) → SYNC(001) clears immediately → HALT."""
+    """LOAD dispatched (DMA stub) -> SYNC(001) clears immediately -> HALT."""
     dram, _ = await init_dut(dut)
     prog = [
         SET_ADDR_LO(0, 0x0),
@@ -190,7 +190,7 @@ async def test_load_dispatch_no_stall(dut):
 
 @cocotb.test()
 async def test_illegal_opcode_fault(dut):
-    """Reserved opcode 0x14 → fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
+    """Reserved opcode 0x14 -> fault=1, fault_code=1 (FAULT_ILLEGAL_OP)."""
     dram, _ = await init_dut(dut)
     done, fault, fault_code, _ = await run_program(dut, dram, [ILLEGAL_OP()])
     assert fault == 1,       f"Expected fault=1, got {fault}"
@@ -265,7 +265,7 @@ async def test_multiburst_load_supported(dut):
 
 @cocotb.test()
 async def test_matmul_without_config_tile_fault(dut):
-    """MATMUL without preceding CONFIG_TILE → fault_code=4 (FAULT_NO_CONFIG)."""
+    """MATMUL without preceding CONFIG_TILE -> fault_code=4 (FAULT_NO_CONFIG)."""
     dram, _ = await init_dut(dut)
     done, fault, fault_code, _ = await run_program(
         dut, dram,
@@ -343,4 +343,4 @@ async def test_ten_nops_halt(dut):
     done, fault, _, cycles = await run_program(dut, dram, prog, timeout_cycles=5000)
     assert done  == 1
     assert fault == 0
-    dut._log.info(f"10×NOP+HALT: {cycles} cycles")
+    dut._log.info(f"10xNOP+HALT: {cycles} cycles")

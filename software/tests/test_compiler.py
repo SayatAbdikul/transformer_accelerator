@@ -13,7 +13,7 @@ from taccel.quantizer.bias_correction import compute_bias_corrections
 from taccel.quantizer.quantize import quantize_tensor, quantize_weights
 
 from taccel.compiler.memory_alloc import MemoryAllocator, BufferAllocator
-from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_ACCUM
+from taccel.isa.opcodes import ABUF_SIZE, WBUF_SIZE, ACCUM_SIZE, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from taccel.isa.instructions import (
     BufCopyInsn,
     DequantAddInsn,
@@ -460,6 +460,42 @@ class TestGeluFromAccumCodegen:
         assert any(isinstance(insn, RequantPcInsn) for insn in instructions)
         assert not any(isinstance(insn, RequantInsn) for insn in instructions)
         assert f"{weight_name}__requant_pc" in codegen.dram_layout
+
+
+class TestPosEmbedTraceCodegen:
+    def test_pos_embed_add_emits_input_and_output_trace_events(self):
+        codegen = CodeGenerator(
+            weight_data={},
+            calibration_scales={
+                "pos_embed_add": 0.25,
+            },
+            prescaled_biases={},
+        )
+        codegen.dram_layout["position_embeddings"] = 0x1000
+        act_alloc = codegen.mem.abuf.alloc("cls_prepend", pad_dim(197) * pad_dim(192))
+
+        node = IRNode(
+            op="pos_embed_add",
+            name="pos_embed_add",
+            inputs=["cls_prepend", "position_embeddings"],
+            output_shape=(197, 192),
+        )
+
+        codegen._emit_pos_embed_add(node)
+
+        flat_events = [
+            (pc, event["node_name"], event["buf_id"], event["offset_units"])
+            for pc, events in sorted(codegen.trace_manifest.items())
+            for event in events
+        ]
+
+        input_pc = flat_events[0][0]
+        assert flat_events[0] == (input_pc, "pos_embed_add__act_input", BUF_ABUF, act_alloc.offset_units)
+        assert flat_events[1][0] == input_pc
+        assert flat_events[1][1] == "pos_embed_add__pos_input"
+        assert flat_events[1][2] == BUF_WBUF
+        assert flat_events[2][0] == input_pc + 1
+        assert flat_events[2][1] == "pos_embed_add"
 
 
 class TestFusedSoftmaxAttnVCodegen:

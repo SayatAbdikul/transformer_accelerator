@@ -23,7 +23,7 @@ IllegalOpcodeError.  RTL behaviour: the processor halts (equivalent to
 executing HALT) and sets a fault status register.
 """
 import numpy as np
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
 from ..isa.encoding import decode
 from ..isa.opcodes import Opcode, BUF_ABUF, BUF_WBUF, BUF_ACCUM
 from ..isa.instructions import (
@@ -65,8 +65,10 @@ class Simulator:
         self.trace_enabled = False
         self.trace_node_names: Optional[Set[str]] = None
         self.trace_tensors: Dict[str, np.ndarray] = {}
+        self.trace_raw_tensors: Dict[str, np.ndarray] = {}
         self.trace_saturation: Dict[str, Dict[str, int]] = {}
         self.trace_meta: Dict[str, Dict[str, object]] = {}
+        self.trace_raw_events: list[Dict[str, Any]] = []
         self._virtual_trace_payloads: Dict[str, Dict[str, object]] = {}
 
     def load_program(self, program):
@@ -85,8 +87,10 @@ class Simulator:
                 self.runtime_twin_specs[int(pc_key)] = spec_dict
         self.state.runtime_twin_specs = dict(self.runtime_twin_specs)
         self.trace_tensors = {}
+        self.trace_raw_tensors = {}
         self.trace_saturation = {}
         self.trace_meta = {}
+        self.trace_raw_events = []
         self._virtual_trace_payloads = {}
         if program.data_base > 0:
             # Unified DRAM layout: instructions at 0, data at data_base.
@@ -117,8 +121,10 @@ class Simulator:
         self.trace_enabled = True
         self.trace_node_names = set(node_names) if node_names else None
         self.trace_tensors = {}
+        self.trace_raw_tensors = {}
         self.trace_saturation = {}
         self.trace_meta = {}
+        self.trace_raw_events = []
 
     def get_trace_payload(self):
         """Return traced tensors and saturation statistics."""
@@ -139,6 +145,8 @@ class Simulator:
             }
         return {
             "tensors": self.trace_tensors,
+            "raw_tensors": self.trace_raw_tensors,
+            "raw_events": self.trace_raw_events,
             "stats": trace_stats,
             "meta": self.trace_meta,
         }
@@ -172,7 +180,7 @@ class Simulator:
         """Snapshot traced tensors after the instruction at pc has completed."""
         if not self.trace_enabled:
             return
-        for event in self.trace_manifest.get(pc, []):
+        for event_index, event in enumerate(self.trace_manifest.get(pc, [])):
             node_name = event["node_name"]
             if self.trace_node_names is not None and node_name not in self.trace_node_names:
                 continue
@@ -187,36 +195,90 @@ class Simulator:
             full_cols = event["full_cols"]
             row_start = event.get("row_start", 0)
             scale = np.float32(event["scale"])
-            self.trace_meta[node_name] = {
-                "scale": float(scale),
+            source = str(event.get("source", "architectural"))
+            node_meta = self.trace_meta.setdefault(
+                node_name,
+                {
+                    "scale": float(scale),
+                    "dtype": event["dtype"],
+                    "source": source,
+                    "full_rows": int(full_rows),
+                    "full_cols": int(full_cols),
+                    "row_start": int(row_start),
+                    "fragments": [],
+                    "raw_available": source != "virtual",
+                },
+            )
+            node_meta["scale"] = float(scale)
+            node_meta["dtype"] = event["dtype"]
+            node_meta["source"] = source
+            node_meta["full_rows"] = int(full_rows)
+            node_meta["full_cols"] = int(full_cols)
+            node_meta["raw_available"] = bool(node_meta.get("raw_available", False) or source != "virtual")
+            node_meta["fragments"].append(
+                {
+                    "pc": int(pc),
+                    "event_index": int(event_index),
+                    "row_start": int(row_start),
+                    "logical_rows": int(logical_rows),
+                    "logical_cols": int(logical_cols),
+                }
+            )
+
+            raw_event: Dict[str, Any] = {
+                "pc": int(pc),
+                "event_index": int(event_index),
+                "node_name": node_name,
                 "dtype": event["dtype"],
+                "scale": float(scale),
+                "source": source,
+                "row_start": int(row_start),
+                "logical_rows": int(logical_rows),
+                "logical_cols": int(logical_cols),
+                "full_rows": int(full_rows),
+                "full_cols": int(full_cols),
             }
 
-            if event.get("source") == "virtual":
+            if source == "virtual":
                 payload = self._virtual_trace_payloads.get(node_name)
                 if payload is None:
+                    raw_event["raw_available"] = False
+                    self.trace_raw_events.append(raw_event)
                     continue
                 raw_view = payload["raw"][:logical_rows, :logical_cols]
                 if payload["dtype"] == "int8":
                     dequant = raw_view.astype(np.float32) * scale
                 else:
                     dequant = raw_view.astype(np.float32)
-                self.trace_meta[node_name]["dtype"] = payload["dtype"]
-                self.trace_meta[node_name]["scale"] = float(payload.get("scale", scale))
+                node_meta["dtype"] = payload["dtype"]
+                node_meta["scale"] = float(payload.get("scale", scale))
+                raw_event["dtype"] = payload["dtype"]
+                raw_event["scale"] = float(payload.get("scale", scale))
+                raw_event["raw_available"] = False
             elif event["dtype"] == "int32":
                 raw_tile = mem.read_int32_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
                 raw_view = raw_tile[:logical_rows, :logical_cols]
                 dequant = raw_view.astype(np.float32) * scale
+                raw_event["raw_available"] = True
+                raw_event["raw"] = raw_view.tolist()
             else:
                 raw_tile = mem.read_int8_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
                 raw_view = raw_tile[:logical_rows, :logical_cols]
                 dequant = raw_view.astype(np.float32) * scale
+                raw_event["raw_available"] = True
+                raw_event["raw"] = raw_view.tolist()
 
             if node_name not in self.trace_tensors:
                 self.trace_tensors[node_name] = np.zeros((full_rows, full_cols), dtype=np.float32)
             self.trace_tensors[node_name][row_start:row_start + logical_rows, :logical_cols] = dequant
+            if source != "virtual":
+                if node_name not in self.trace_raw_tensors:
+                    raw_dtype = np.int32 if event["dtype"] == "int32" else np.int8
+                    self.trace_raw_tensors[node_name] = np.zeros((full_rows, full_cols), dtype=raw_dtype)
+                self.trace_raw_tensors[node_name][row_start:row_start + logical_rows, :logical_cols] = raw_view
+            self.trace_raw_events.append(raw_event)
 
-            if event.get("source") == "virtual":
+            if source == "virtual":
                 if payload["dtype"] == "int8":
                     stats = self.trace_saturation.setdefault(node_name, {"sat": 0, "zero": 0, "total": 0})
                     stats["sat"] += int(payload.get("sat", 0))

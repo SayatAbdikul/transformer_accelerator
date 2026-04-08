@@ -75,7 +75,19 @@ module control_unit
   // --- Status outputs ---
   output logic          done,
   output logic          fault,
-  output logic [3:0]    fault_code
+  output logic [3:0]    fault_code,
+
+  // --- Internal-only observability hooks for the Verilator program runner ---
+  output logic          obs_retire_pulse,
+  output logic [55:0]   obs_retire_pc,
+  output logic [4:0]    obs_retire_opcode,
+  output logic          obs_ctrl_fault_pulse,
+  output logic [3:0]    obs_ctrl_fault_code,
+  output logic [55:0]   obs_ctrl_fault_pc,
+  output logic [4:0]    obs_ctrl_fault_opcode,
+  output logic          obs_sync_wait_dma,
+  output logic          obs_sync_wait_sys,
+  output logic          obs_sync_wait_sfu
 );
 
   // -------------------------------------------------------------------------
@@ -142,8 +154,18 @@ module control_unit
       pc_reg       <= 56'h0;
       sync_mask_q  <= 3'h0;
       fault_code_r <= 4'h0;
+      obs_retire_pulse     <= 1'b0;
+      obs_retire_pc        <= 56'h0;
+      obs_retire_opcode    <= 5'h0;
+      obs_ctrl_fault_pulse <= 1'b0;
+      obs_ctrl_fault_code  <= 4'h0;
+      obs_ctrl_fault_pc    <= 56'h0;
+      obs_ctrl_fault_opcode <= 5'h0;
 
     end else begin
+      obs_retire_pulse     <= 1'b0;
+      obs_ctrl_fault_pulse <= 1'b0;
+
       case (state)
 
         // ------------------------------------------------------------------
@@ -172,22 +194,41 @@ module control_unit
           end else if (insn.illegal) begin
             fault_code_r <= (insn.opcode > 5'h13) ?
                              4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            obs_ctrl_fault_pulse  <= 1'b1;
+            obs_ctrl_fault_code   <= (insn.opcode > 5'h13) ?
+                                     4'(FAULT_ILLEGAL_OP) : 4'(FAULT_BAD_BUF);
+            obs_ctrl_fault_pc     <= pc_reg;
+            obs_ctrl_fault_opcode <= insn.opcode;
             state        <= S_FAULT;
           end else if (unsupported_now) begin
             fault_code_r <= 4'(FAULT_UNSUPPORTED_OP);
+            obs_ctrl_fault_pulse  <= 1'b1;
+            obs_ctrl_fault_code   <= 4'(FAULT_UNSUPPORTED_OP);
+            obs_ctrl_fault_pc     <= pc_reg;
+            obs_ctrl_fault_opcode <= insn.opcode;
             state        <= S_FAULT;
           end else begin
             case (insn.opcode)
               OP_NOP: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
 
-              OP_HALT:
+              OP_HALT: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 state <= S_HALT;
+              end
 
               OP_SYNC: begin
                 if (sync_clear_now) begin
+                  obs_retire_pulse  <= 1'b1;
+                  obs_retire_pc     <= pc_reg;
+                  obs_retire_opcode <= insn.opcode;
                   pc_reg <= pc_reg + 56'h1;
                   state  <= S_FETCH;
                 end else begin
@@ -197,21 +238,33 @@ module control_unit
               end
 
               OP_CONFIG_TILE: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
 
               OP_SET_SCALE: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
 
               OP_SET_ADDR_LO: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
 
               OP_SET_ADDR_HI: begin
+                obs_retire_pulse  <= 1'b1;
+                obs_retire_pc     <= pc_reg;
+                obs_retire_opcode <= insn.opcode;
                 pc_reg <= pc_reg + 56'h1;
                 state  <= S_FETCH;
               end
@@ -232,6 +285,9 @@ module control_unit
                 if (sfu_busy) begin
                   state <= S_ISSUE;
                 end else begin
+                  obs_retire_pulse  <= 1'b1;
+                  obs_retire_pc     <= pc_reg;
+                  obs_retire_opcode <= insn.opcode;
                   pc_reg <= pc_reg + 56'h1;
                   state  <= S_FETCH;
                 end
@@ -244,6 +300,10 @@ module control_unit
               OP_DEQUANT_ADD: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pulse  <= 1'b1;
+                  obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pc     <= pc_reg;
+                  obs_ctrl_fault_opcode <= insn.opcode;
                   state        <= S_FAULT;
                 end else if (dma_busy || sys_busy || helper_busy || sfu_busy) begin
                   state <= S_ISSUE;
@@ -256,10 +316,17 @@ module control_unit
               OP_MATMUL: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pulse  <= 1'b1;
+                  obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pc     <= pc_reg;
+                  obs_ctrl_fault_opcode <= insn.opcode;
                   state        <= S_FAULT;
                 end else if (sfu_busy) begin
                   state <= S_ISSUE;
                 end else begin
+                  obs_retire_pulse  <= 1'b1;
+                  obs_retire_pc     <= pc_reg;
+                  obs_retire_opcode <= insn.opcode;
                   pc_reg <= pc_reg + 56'h1;
                   state  <= S_FETCH;
                 end
@@ -274,10 +341,17 @@ module control_unit
               OP_GELU: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pulse  <= 1'b1;
+                  obs_ctrl_fault_code   <= 4'(FAULT_NO_CONFIG);
+                  obs_ctrl_fault_pc     <= pc_reg;
+                  obs_ctrl_fault_opcode <= insn.opcode;
                   state        <= S_FAULT;
                 end else if (dma_busy || sys_busy || helper_busy || sfu_busy) begin
                   state <= S_ISSUE;
                 end else begin
+                  obs_retire_pulse  <= 1'b1;
+                  obs_retire_pc     <= pc_reg;
+                  obs_retire_opcode <= insn.opcode;
                   pc_reg <= pc_reg + 56'h1;
                   state  <= S_FETCH;
                 end
@@ -285,6 +359,10 @@ module control_unit
 
               default: begin
                 fault_code_r <= 4'(FAULT_ILLEGAL_OP);
+                obs_ctrl_fault_pulse  <= 1'b1;
+                obs_ctrl_fault_code   <= 4'(FAULT_ILLEGAL_OP);
+                obs_ctrl_fault_pc     <= pc_reg;
+                obs_ctrl_fault_opcode <= insn.opcode;
                 state        <= S_FAULT;
               end
             endcase
@@ -299,6 +377,9 @@ module control_unit
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (sync_clear_q) begin
+            obs_retire_pulse  <= 1'b1;
+            obs_retire_pc     <= pc_reg;
+            obs_retire_opcode <= 5'(OP_SYNC);
             pc_reg <= pc_reg + 56'h1;
             state  <= S_FETCH;
           end
@@ -310,6 +391,9 @@ module control_unit
             fault_code_r <= ext_fault_code;
             state        <= S_FAULT;
           end else if (!helper_busy) begin
+            obs_retire_pulse  <= 1'b1;
+            obs_retire_pc     <= pc_reg;
+            obs_retire_opcode <= insn.opcode;
             pc_reg <= pc_reg + 56'h1;
             state  <= S_FETCH;
           end
@@ -408,6 +492,15 @@ module control_unit
       default: ;
     endcase
   end
+
+  // The program runner samples these wait-cause bits to attribute SYNC stalls
+  // to specific asynchronous engines.
+  assign obs_sync_wait_dma = (state == S_SYNC_WAIT) &&
+                             sync_mask_q[SYNC_DMA_BIT] && dma_busy;
+  assign obs_sync_wait_sys = (state == S_SYNC_WAIT) &&
+                             sync_mask_q[SYNC_SYS_BIT] && sys_busy;
+  assign obs_sync_wait_sfu = (state == S_SYNC_WAIT) &&
+                             sync_mask_q[SYNC_SFU_BIT] && sfu_busy;
 
 endmodule
 

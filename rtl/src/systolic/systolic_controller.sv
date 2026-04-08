@@ -78,6 +78,14 @@ module systolic_controller
   logic [4:0]  drain_row_q;
   logic [1:0]  drain_grp_q;
 
+  // Row-major drain address tracking.
+  // tile_drain_base_q = dst_off + mtile * n_tiles * 64 (advances by n_tiles*64 per M-tile).
+  // drain_row_addr_q  = tile_drain_base_q + ntile*4 + drain_row*(n_tiles*4);
+  //   advances by n_tiles*4 on each drain_row increment.
+  // sram_a_row = drain_row_addr_q + drain_grp_q  (in ST_DRAIN_WR)
+  logic [15:0] tile_drain_base_q;
+  logic [15:0] drain_row_addr_q;
+
   logic step_en;
   logic clear_acc;
   logic       inject_zero_data;
@@ -113,11 +121,10 @@ module systolic_controller
 
   // Base row addresses for the current logical 16x16 tile.
   // src1/src2 advance in 16-byte row units; dst advances in 4-row INT32 chunks.
-  logic [31:0] src1_tile_base, src2_tile_base, dst_tile_base;
+  logic [31:0] src1_tile_base, src2_tile_base;
   always_comb begin
     src1_tile_base = {16'h0, src1_off_q} + (((mtile_q * k_tiles_q) + {21'h0, ktile_q}) << 4);
     src2_tile_base = {16'h0, src2_off_q} + (((ktile_q * n_tiles_q) + {21'h0, ntile_q}) << 4);
-    dst_tile_base  = {16'h0, dst_off_q}  + (((mtile_q * n_tiles_q) + {21'h0, ntile_q}) << 6);
   end
 
   // Tile-walking FSM. One MATMUL dispatch can cover many logical 16x16 tiles
@@ -141,6 +148,8 @@ module systolic_controller
       lane_q <= 6'd0;
       drain_row_q <= 5'd0;
       drain_grp_q <= 2'd0;
+      tile_drain_base_q <= 16'h0;
+      drain_row_addr_q <= 16'h0;
     end else begin
       case (state)
         ST_IDLE: begin
@@ -152,6 +161,7 @@ module systolic_controller
             src2_off_q <= src2_off;
             dst_off_q <= dst_off;
             flags_accumulate_q <= flags_accumulate;
+            tile_drain_base_q <= dst_off;
             m_tiles_q <= {1'b0, tile_m} + 11'd1;
             n_tiles_q <= {1'b0, tile_n} + 11'd1;
             k_tiles_q <= {1'b0, tile_k} + 11'd1;
@@ -190,6 +200,7 @@ module systolic_controller
         end
 
         ST_DRAIN_PREP: begin
+          drain_row_addr_q <= tile_drain_base_q + ({5'h0, ntile_q} << 2);
           state <= ST_DRAIN_WR;
         end
 
@@ -205,12 +216,14 @@ module systolic_controller
               end else if (mtile_q + 11'd1 < m_tiles_q) begin
                 mtile_q <= mtile_q + 11'd1;
                 ntile_q <= 11'd0;
+                tile_drain_base_q <= tile_drain_base_q + ({5'h0, n_tiles_q} << 6);
                 state <= ST_INIT_TILE;
               end else begin
                 state <= ST_IDLE;
               end
             end else begin
               drain_row_q <= drain_row_q + 5'd1;
+              drain_row_addr_q <= drain_row_addr_q + ({5'h0, n_tiles_q} << 2);
             end
           end else begin
             drain_grp_q <= drain_grp_q + 2'd1;
@@ -285,7 +298,7 @@ module systolic_controller
         sram_a_en = 1'b1;
         sram_a_we = 1'b1;
         sram_a_buf = dst_buf_q;
-        sram_a_row = dst_tile_base[15:0] + ({11'd0, drain_row_q} << 2) + {14'h0, drain_grp_q};
+        sram_a_row = drain_row_addr_q + {14'h0, drain_grp_q};
         sram_a_wdata[31:0]   = acc_at(drain_row_q, c0);
         sram_a_wdata[63:32]  = acc_at(drain_row_q, c1);
         sram_a_wdata[95:64]  = acc_at(drain_row_q, c2);

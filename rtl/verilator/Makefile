@@ -10,6 +10,9 @@
 #   make test_control  — control unit / full-chip tests only
 #   make clean     — remove generated objects
 
+export LC_ALL := C
+export LANG := C
+
 VERILATOR     ?= verilator
 CXX           ?= g++
 CXXFLAGS      := -std=c++17 -O2 -Wall -Wno-unused-variable
@@ -42,10 +45,27 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all test_decode test_control test_dma test_helpers test_sfu test_systolic \
-        test_systolic_array_chained test_systolic_chained clean
+.PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
+        test_systolic test_systolic_array_chained test_systolic_chained clean
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
+
+# -----------------------------------------------------------------------
+# run_program: build the full-program Verilator runner
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/run_program/Vtaccel_top: $(CONTROL_SV) run_program.cpp
+	mkdir -p $(BUILD_DIR)/run_program
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=$(SYSTOLIC_ARCH_MODE) \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/run_program \
+	  $(CONTROL_SV) \
+	  run_program.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/run_program -f Vtaccel_top.mk
+
+run_program: $(BUILD_DIR)/run_program/Vtaccel_top
 
 # -----------------------------------------------------------------------
 # test_decode: verilate tb_decode_unit + compile + run

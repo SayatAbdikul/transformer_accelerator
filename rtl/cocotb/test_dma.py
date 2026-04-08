@@ -1,6 +1,6 @@
 """cocotb DMA tests for TACCEL Phase 2.
 
-Tests LOAD (DRAM→SRAM) and STORE (SRAM→DRAM) via AXI4 master.
+Tests LOAD (DRAM->SRAM) and STORE (SRAM->DRAM) via AXI4 master.
 Verification uses LOAD+STORE roundtrips (data appears in DRAM after STORE).
 """
 
@@ -149,7 +149,7 @@ async def test_load_store_roundtrip(dut):
 
 @cocotb.test()
 async def test_load_multi_beat(dut):
-    """LOAD 16 beats (256 bytes) → STORE → verify all 256 bytes."""
+    """LOAD 16 beats (256 bytes) -> STORE -> verify all 256 bytes."""
     SRC = 0x30000
     DST = 0x40000
     src_data = bytes(i & 0xFF for i in range(256))
@@ -220,7 +220,7 @@ async def test_load_to_accum(dut):
 
 @cocotb.test()
 async def test_addr_reg_independence(dut):
-    """R2 and R3 used for LOADs; R0/R1 used for STOREs — all independent."""
+    """R2 and R3 used for LOADs; R0/R1 used for STOREs - all independent."""
     SRC_A = 0x90000
     SRC_B = 0xA0000
     DST_A = 0xB0000
@@ -254,7 +254,7 @@ async def test_addr_reg_independence(dut):
 
 @cocotb.test()
 async def test_dram_oob_fault(dut):
-    """LOAD past DRAM end → fault_code = 2 (FAULT_DRAM_OOB)."""
+    """LOAD past DRAM end -> fault_code = 2 (FAULT_DRAM_OOB)."""
     # DRAM_SIZE = 16 MB = 0x1000000
     # addr = 0xFFFFF0; end = 0xFFFFF0 + 2*16 = 0x1000010 > 0x1000000
     NEAR_END = 0xFFFFF0
@@ -294,9 +294,9 @@ async def test_load_dispatch_async(dut):
 
 @cocotb.test()
 async def test_dram_offset_field(dut):
-    """dram_off=4 shifts effective address by 4×16=64 bytes."""
+    """dram_off=4 shifts effective address by 4x16=64 bytes."""
     BASE   = 0x50000
-    OFFSET = 4        # dram_off field value → +64 bytes
+    OFFSET = 4        # dram_off field value -> +64 bytes
     SRC    = BASE + OFFSET * 16   # 0x50040
     DST    = 0xE0000
     src_data = bytes(0xD0 ^ i for i in range(16))

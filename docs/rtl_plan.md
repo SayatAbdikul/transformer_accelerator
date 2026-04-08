@@ -519,16 +519,19 @@ So they belong in the main roadmap, not in a speculative appendix.
 
 #### Goal
 
-Improve overlap, debuggability, and implementation quality after functional parity.
+Close the remaining program-level sign-off gap after ISA parity by adding an
+RTL-vs-golden acceptance harness, internal observability, and cleanup work that
+does not change the architectural contract.
 
 #### Candidate work
 
-- Better overlap between DMA, systolic, and SFU under `SYNC`
-- Performance counters and trace hooks
+- Verilator-first program runner for compiled `ProgramBinary` images
+- Software-side RTL-vs-golden comparison driver and regression summaries
+- Internal-only performance counters and fault/retire trace hooks
 - Cleaner AXI response handling and fault observability
-- Synthesis-driven cleanup and timing closure
+- Locale-safe and ASCII-safe regression cleanup
+- Synthesis-driven cleanup and timing closure after sign-off is green
 - Optional instruction cache
-- Optional chained systolic mode after numerical parity is proven
 
 #### Explicitly deferred until after parity
 
@@ -566,12 +569,10 @@ Required program-level tests:
 - FC1 / GELU / FC2 strip-mining path
 - CLS prepend / position-embedding add / CLS extract
 - Bias-add and residual-add paths
-
-Optional program-level tests once feature parity is reached:
-
 - `REQUANT_PC` block subsets
 - `DEQUANT_ADD` residual1 paths
 - `SOFTMAX_ATTNV` selected blocks
+- fused out-proj accumulation variants
 - `gelu_from_accum`
 
 ### 7.4 Regression criteria
@@ -591,6 +592,8 @@ Minimum functional bar:
 The RTL is baseline-complete when all of the following are true:
 
 - The default compiler-generated DeiT-tiny program runs end-to-end on RTL
+- The Verilator sign-off harness compares final RTL logits against the software
+  golden model without hand-editing the emitted program
 - No software-side instruction rewriting is required for hardware bring-up
 - DMA supports real compiler transfer sizes
 - `MATMUL`, `BUF_COPY`, `REQUANT`, `VADD`, `SOFTMAX`, `LAYERNORM`, and `GELU`
@@ -602,7 +605,7 @@ The RTL is baseline-complete when all of the following are true:
 The RTL is software-parity complete when:
 
 - All 20 ISA instructions are implemented
-- Experimental compiler options run on RTL
+- Experimental compiler options run on RTL and pass the RTL-vs-golden harness
 - The compiler, golden model, ISA docs, and RTL all agree on opcode meaning,
   data layout, and fault behavior
 

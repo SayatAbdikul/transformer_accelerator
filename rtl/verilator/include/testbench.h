@@ -31,6 +31,7 @@
 #include <string>
 #include <array>
 #include <algorithm>
+#include <utility>
 
 // ============================================================================
 // ISA helper: build 64-bit big-endian instruction words
@@ -196,12 +197,30 @@ constexpr uint64_t ILLEGAL_OP() { return uint64_t(0x14) << OPCODE_SHIFT; }
 // ============================================================================
 class AXI4SlaveModel {
 public:
+    struct ReadInjection {
+        uint64_t beat_idx;
+        int resp;
+        int force_last;
+    };
+
+    struct BrespInjection {
+        uint64_t resp_idx;
+        int resp;
+    };
+
+    struct ReadAddrInjection {
+        uint64_t addr;
+        int resp;
+        int force_last;
+    };
+
     explicit AXI4SlaveModel(size_t size_bytes)
         : mem_(size_bytes, 0), pending_valid_(false), pending_addr_(0),
           pending_timer_(0), r_valid_(false),
           aw_pending_(false), aw_addr_(0), aw_len_(0), w_beat_cnt_(0),
           b_pending_(false), next_r_resp_(0), next_r_last_override_(-1),
-          next_b_resp_(0), active_b_resp_(0), read_beat_count_(0)
+          next_b_resp_(0), active_b_resp_(0), read_beat_count_(0),
+          read_emit_count_(0), bresp_emit_count_(0)
     {}
 
     // Write a big-endian 64-bit instruction word at instruction index pc_idx
@@ -231,6 +250,32 @@ public:
 
     void inject_next_bresp(int resp) {
         next_b_resp_ = resp & 0x3;
+    }
+
+    void inject_read_at(uint64_t beat_idx, int resp, int force_last = -1) {
+        scheduled_read_injections_.push_back(ReadInjection{beat_idx, resp & 0x3, force_last});
+        std::sort(
+            scheduled_read_injections_.begin(),
+            scheduled_read_injections_.end(),
+            [](const ReadInjection& lhs, const ReadInjection& rhs) {
+                return lhs.beat_idx < rhs.beat_idx;
+            }
+        );
+    }
+
+    void inject_bresp_at(uint64_t resp_idx, int resp) {
+        scheduled_bresp_injections_.push_back(BrespInjection{resp_idx, resp & 0x3});
+        std::sort(
+            scheduled_bresp_injections_.begin(),
+            scheduled_bresp_injections_.end(),
+            [](const BrespInjection& lhs, const BrespInjection& rhs) {
+                return lhs.resp_idx < rhs.resp_idx;
+            }
+        );
+    }
+
+    void inject_read_addr(uint64_t addr, int resp, int force_last = -1) {
+        scheduled_read_addr_injections_.push_back(ReadAddrInjection{addr, resp & 0x3, force_last});
     }
 
     // Write raw bytes at byte address
@@ -307,13 +352,31 @@ public:
                 rdata[3] = (hi >> 32) & 0xFFFFFFFF;
 
                 bool is_last = (pending_beat_ >= (int)pending_ar_len_);
-                if (next_r_last_override_ >= 0)
-                    is_last = (next_r_last_override_ != 0);
+                int resp = next_r_resp_;
+                int force_last = next_r_last_override_;
+                for (auto it = scheduled_read_addr_injections_.begin();
+                     it != scheduled_read_addr_injections_.end(); ++it) {
+                    if (it->addr == beat_addr) {
+                        resp = it->resp;
+                        force_last = it->force_last;
+                        scheduled_read_addr_injections_.erase(it);
+                        break;
+                    }
+                }
+                if (!scheduled_read_injections_.empty() &&
+                    scheduled_read_injections_.front().beat_idx == read_emit_count_) {
+                    resp = scheduled_read_injections_.front().resp;
+                    force_last = scheduled_read_injections_.front().force_last;
+                    scheduled_read_injections_.erase(scheduled_read_injections_.begin());
+                }
+                if (force_last >= 0)
+                    is_last = (force_last != 0);
                 dut->m_axi_r_valid = 1;
                 dut->m_axi_r_last  = is_last ? 1 : 0;
-                dut->m_axi_r_resp  = next_r_resp_;
+                dut->m_axi_r_resp  = resp;
                 r_valid_           = true;
                 pending_beat_++;
+                read_emit_count_++;
                 next_r_resp_ = 0;
                 next_r_last_override_ = -1;
                 if (is_last)
@@ -349,7 +412,13 @@ public:
                     aw_pending_ = false;
                     b_pending_  = true;
                     active_b_resp_ = next_b_resp_;
+                    if (!scheduled_bresp_injections_.empty() &&
+                        scheduled_bresp_injections_.front().resp_idx == bresp_emit_count_) {
+                        active_b_resp_ = scheduled_bresp_injections_.front().resp;
+                        scheduled_bresp_injections_.erase(scheduled_bresp_injections_.begin());
+                    }
                     next_b_resp_ = 0;
+                    bresp_emit_count_++;
                     // Keep w_ready=1 this cycle so DUT sees it on posedge;
                     // the else branch below will clear it next cycle.
                 }
@@ -395,8 +464,13 @@ private:
     int      next_b_resp_;
     int      active_b_resp_;
     uint64_t read_beat_count_;
+    uint64_t read_emit_count_;
+    uint64_t bresp_emit_count_;
     std::vector<uint64_t> read_addr_log_;
     std::vector<int> read_len_log_;
+    std::vector<ReadInjection> scheduled_read_injections_;
+    std::vector<ReadAddrInjection> scheduled_read_addr_injections_;
+    std::vector<BrespInjection> scheduled_bresp_injections_;
 };
 
 // ============================================================================

@@ -235,6 +235,52 @@ module taccel_top
 
   logic sys_busy, sfu_busy, helper_busy;
 
+  // -----------------------------------------------------------------------
+  // Internal-only observability state used by the Verilator program runner.
+  // These signals intentionally stay off the architectural interface.
+  // -----------------------------------------------------------------------
+  logic         obs_retire_pulse_w /* verilator public_flat_rd */;
+  logic [55:0]  obs_retire_pc_w /* verilator public_flat_rd */;
+  logic [4:0]   obs_retire_opcode_w /* verilator public_flat_rd */;
+  logic         obs_ctrl_fault_pulse_w /* verilator public_flat_rd */;
+  logic [3:0]   obs_ctrl_fault_code_w /* verilator public_flat_rd */;
+  logic [55:0]  obs_ctrl_fault_pc_w /* verilator public_flat_rd */;
+  logic [4:0]   obs_ctrl_fault_opcode_w /* verilator public_flat_rd */;
+  logic         obs_sync_wait_dma_w /* verilator public_flat_rd */;
+  logic         obs_sync_wait_sys_w /* verilator public_flat_rd */;
+  logic         obs_sync_wait_sfu_w /* verilator public_flat_rd */;
+
+  logic         obs_run_active_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_cycle_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_retired_insn_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sync_wait_dma_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sync_wait_sys_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sync_wait_sfu_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_burst_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_dma_beat_count_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_helper_busy_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sfu_busy_cycles_q /* verilator public_flat_rd */;
+  logic [63:0]  obs_sys_busy_cycles_q /* verilator public_flat_rd */;
+  logic         obs_fault_valid_q /* verilator public_flat_rd */;
+  logic [55:0]  obs_fault_pc_q /* verilator public_flat_rd */;
+  logic [4:0]   obs_fault_opcode_q /* verilator public_flat_rd */;
+  logic         obs_fault_opcode_valid_q /* verilator public_flat_rd */;
+  logic [2:0]   obs_fault_source_q /* verilator public_flat_rd */;
+  logic [3:0]   obs_fault_code_q /* verilator public_flat_rd */;
+  logic         obs_forbidden_overlap_violation_q /* verilator public_flat_rd */;
+  logic [55:0]  obs_dma_issue_pc_q /* verilator public_flat_rd */;
+  logic [4:0]   obs_dma_issue_opcode_q /* verilator public_flat_rd */;
+  logic [55:0]  obs_sys_issue_pc_q /* verilator public_flat_rd */;
+  logic [4:0]   obs_sys_issue_opcode_q /* verilator public_flat_rd */;
+  logic [55:0]  obs_helper_issue_pc_q /* verilator public_flat_rd */;
+  logic [4:0]   obs_helper_issue_opcode_q /* verilator public_flat_rd */;
+  logic [55:0]  obs_sfu_issue_pc_q /* verilator public_flat_rd */;
+  logic [4:0]   obs_sfu_issue_opcode_q /* verilator public_flat_rd */;
+
+  logic         obs_dma_burst_fire_w;
+  logic         obs_dma_beat_fire_w;
+  logic         obs_terminal_event_w;
+
   // SRAM Port A requests from helper / SFU / DMA / Systolic
   logic         helper_sram_a_en,  helper_sram_a_we;
   logic [1:0]   helper_sram_a_buf;
@@ -356,6 +402,181 @@ module taccel_top
       ext_fault_code_w = 4'(FAULT_NONE);
   end
 
+  assign obs_dma_burst_fire_w = (dma_ar_valid && dma_ar_ready) ||
+                                (m_axi_aw_valid && m_axi_aw_ready);
+  assign obs_dma_beat_fire_w  = (dma_r_valid && dma_r_ready) ||
+                                (m_axi_w_valid && m_axi_w_ready);
+  assign obs_terminal_event_w = obs_ctrl_fault_pulse_w |
+                                fetch_fault_w |
+                                dma_fault_w |
+                                helper_fault_w |
+                                sfu_fault_w |
+                                sys_sram_fault_now |
+                                sys_sram_fault_latched |
+                                (obs_retire_pulse_w &&
+                                 (obs_retire_opcode_w == 5'(OP_HALT)));
+
+  // Keep run-level counters and latched fault context local to the RTL. The
+  // native program runner reads these signals hierarchically after each run
+  // without introducing any new architectural debug interface.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      obs_run_active_q                 <= 1'b0;
+      obs_cycle_count_q                <= 64'h0;
+      obs_retired_insn_count_q         <= 64'h0;
+      obs_sync_wait_dma_cycles_q       <= 64'h0;
+      obs_sync_wait_sys_cycles_q       <= 64'h0;
+      obs_sync_wait_sfu_cycles_q       <= 64'h0;
+      obs_dma_burst_count_q            <= 64'h0;
+      obs_dma_beat_count_q             <= 64'h0;
+      obs_helper_busy_cycles_q         <= 64'h0;
+      obs_sfu_busy_cycles_q            <= 64'h0;
+      obs_sys_busy_cycles_q            <= 64'h0;
+      obs_fault_valid_q                <= 1'b0;
+      obs_fault_pc_q                   <= 56'h0;
+      obs_fault_opcode_q               <= 5'h0;
+      obs_fault_opcode_valid_q         <= 1'b0;
+      obs_fault_source_q               <= 3'(OBS_FAULT_SRC_NONE);
+      obs_fault_code_q                 <= 4'(FAULT_NONE);
+      obs_forbidden_overlap_violation_q <= 1'b0;
+      obs_dma_issue_pc_q               <= 56'h0;
+      obs_dma_issue_opcode_q           <= 5'h0;
+      obs_sys_issue_pc_q               <= 56'h0;
+      obs_sys_issue_opcode_q           <= 5'h0;
+      obs_helper_issue_pc_q            <= 56'h0;
+      obs_helper_issue_opcode_q        <= 5'h0;
+      obs_sfu_issue_pc_q               <= 56'h0;
+      obs_sfu_issue_opcode_q           <= 5'h0;
+    end else if (start && !obs_run_active_q && !done && !fault) begin
+      obs_run_active_q                 <= 1'b1;
+      obs_cycle_count_q                <= 64'h0;
+      obs_retired_insn_count_q         <= 64'h0;
+      obs_sync_wait_dma_cycles_q       <= 64'h0;
+      obs_sync_wait_sys_cycles_q       <= 64'h0;
+      obs_sync_wait_sfu_cycles_q       <= 64'h0;
+      obs_dma_burst_count_q            <= 64'h0;
+      obs_dma_beat_count_q             <= 64'h0;
+      obs_helper_busy_cycles_q         <= 64'h0;
+      obs_sfu_busy_cycles_q            <= 64'h0;
+      obs_sys_busy_cycles_q            <= 64'h0;
+      obs_fault_valid_q                <= 1'b0;
+      obs_fault_pc_q                   <= 56'h0;
+      obs_fault_opcode_q               <= 5'h0;
+      obs_fault_opcode_valid_q         <= 1'b0;
+      obs_fault_source_q               <= 3'(OBS_FAULT_SRC_NONE);
+      obs_fault_code_q                 <= 4'(FAULT_NONE);
+      obs_forbidden_overlap_violation_q <= 1'b0;
+      obs_dma_issue_pc_q               <= 56'h0;
+      obs_dma_issue_opcode_q           <= 5'h0;
+      obs_sys_issue_pc_q               <= 56'h0;
+      obs_sys_issue_opcode_q           <= 5'h0;
+      obs_helper_issue_pc_q            <= 56'h0;
+      obs_helper_issue_opcode_q        <= 5'h0;
+      obs_sfu_issue_pc_q               <= 56'h0;
+      obs_sfu_issue_opcode_q           <= 5'h0;
+    end else begin
+      if (obs_run_active_q) begin
+        obs_cycle_count_q <= obs_cycle_count_q + 64'd1;
+
+        if (obs_sync_wait_dma_w)
+          obs_sync_wait_dma_cycles_q <= obs_sync_wait_dma_cycles_q + 64'd1;
+        if (obs_sync_wait_sys_w)
+          obs_sync_wait_sys_cycles_q <= obs_sync_wait_sys_cycles_q + 64'd1;
+        if (obs_sync_wait_sfu_w)
+          obs_sync_wait_sfu_cycles_q <= obs_sync_wait_sfu_cycles_q + 64'd1;
+        if (helper_busy)
+          obs_helper_busy_cycles_q <= obs_helper_busy_cycles_q + 64'd1;
+        if (sfu_busy)
+          obs_sfu_busy_cycles_q <= obs_sfu_busy_cycles_q + 64'd1;
+        if (sys_busy)
+          obs_sys_busy_cycles_q <= obs_sys_busy_cycles_q + 64'd1;
+      end
+
+      if (obs_retire_pulse_w)
+        obs_retired_insn_count_q <= obs_retired_insn_count_q + 64'd1;
+
+      if (obs_dma_burst_fire_w)
+        obs_dma_burst_count_q <= obs_dma_burst_count_q + 64'd1;
+
+      if (obs_dma_beat_fire_w)
+        obs_dma_beat_count_q <= obs_dma_beat_count_q + 64'd1;
+
+      if (dma_dispatch) begin
+        obs_dma_issue_pc_q     <= pc;
+        obs_dma_issue_opcode_q <= insn.opcode;
+      end
+
+      if (sys_dispatch) begin
+        obs_sys_issue_pc_q     <= pc;
+        obs_sys_issue_opcode_q <= insn.opcode;
+      end
+
+      if (helper_dispatch) begin
+        obs_helper_issue_pc_q     <= pc;
+        obs_helper_issue_opcode_q <= insn.opcode;
+      end
+
+      if (sfu_dispatch) begin
+        obs_sfu_issue_pc_q     <= pc;
+        obs_sfu_issue_opcode_q <= insn.opcode;
+      end
+
+      if (helper_busy && (dma_busy || sys_busy || sfu_busy))
+        obs_forbidden_overlap_violation_q <= 1'b1;
+      if (sfu_busy && (dma_busy || sys_busy || helper_busy))
+        obs_forbidden_overlap_violation_q <= 1'b1;
+
+      if (!obs_fault_valid_q) begin
+        if (obs_ctrl_fault_pulse_w) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= obs_ctrl_fault_pc_w;
+          obs_fault_opcode_q       <= obs_ctrl_fault_opcode_w;
+          obs_fault_opcode_valid_q <= 1'b1;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_CONTROL);
+          obs_fault_code_q         <= obs_ctrl_fault_code_w;
+        end else if (fetch_fault_w) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= pc;
+          obs_fault_opcode_q       <= 5'h0;
+          obs_fault_opcode_valid_q <= 1'b0;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_FETCH);
+          obs_fault_code_q         <= fetch_fault_code_w;
+        end else if (dma_fault_w) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= obs_dma_issue_pc_q;
+          obs_fault_opcode_q       <= obs_dma_issue_opcode_q;
+          obs_fault_opcode_valid_q <= 1'b1;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_DMA);
+          obs_fault_code_q         <= dma_fault_code_w;
+        end else if (helper_fault_w) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= obs_helper_issue_pc_q;
+          obs_fault_opcode_q       <= obs_helper_issue_opcode_q;
+          obs_fault_opcode_valid_q <= 1'b1;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_HELPER);
+          obs_fault_code_q         <= helper_fault_code_w;
+        end else if (sfu_fault_w) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= obs_sfu_issue_pc_q;
+          obs_fault_opcode_q       <= obs_sfu_issue_opcode_q;
+          obs_fault_opcode_valid_q <= 1'b1;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_SFU);
+          obs_fault_code_q         <= sfu_fault_code_w;
+        end else if (sys_sram_fault_now || sys_sram_fault_latched) begin
+          obs_fault_valid_q        <= 1'b1;
+          obs_fault_pc_q           <= obs_sys_issue_pc_q;
+          obs_fault_opcode_q       <= obs_sys_issue_opcode_q;
+          obs_fault_opcode_valid_q <= 1'b1;
+          obs_fault_source_q       <= 3'(OBS_FAULT_SRC_SRAM);
+          obs_fault_code_q         <= 4'(FAULT_SRAM_OOB);
+        end
+      end
+
+      if (obs_run_active_q && obs_terminal_event_w)
+        obs_run_active_q <= 1'b0;
+    end
+  end
+
   // =========================================================================
   // Instruction register.
   // Fetch and decode are separated by one register so the control FSM sees a
@@ -433,7 +654,17 @@ module taccel_top
     .ext_fault_code (ext_fault_code_w),
     .done           (done),
     .fault          (fault),
-    .fault_code     (fault_code)
+    .fault_code     (fault_code),
+    .obs_retire_pulse    (obs_retire_pulse_w),
+    .obs_retire_pc       (obs_retire_pc_w),
+    .obs_retire_opcode   (obs_retire_opcode_w),
+    .obs_ctrl_fault_pulse(obs_ctrl_fault_pulse_w),
+    .obs_ctrl_fault_code (obs_ctrl_fault_code_w),
+    .obs_ctrl_fault_pc   (obs_ctrl_fault_pc_w),
+    .obs_ctrl_fault_opcode(obs_ctrl_fault_opcode_w),
+    .obs_sync_wait_dma   (obs_sync_wait_dma_w),
+    .obs_sync_wait_sys   (obs_sync_wait_sys_w),
+    .obs_sync_wait_sfu   (obs_sync_wait_sfu_w)
   );
 
   register_file u_regfile (

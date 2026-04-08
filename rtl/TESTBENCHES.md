@@ -25,6 +25,10 @@ This repo standardizes RTL verification around two complementary layers:
   - `rtl/verilator/test_systolic_chained.cpp`
   - `rtl/cocotb/test_systolic.py`
   - `rtl/cocotb/test_systolic_chained.py`
+- Program-level sign-off:
+  - `rtl/verilator/run_program.cpp`
+  - `software/tools/compare_rtl_golden.py`
+  - `software/tests/test_compare_rtl_golden.py`
 
 ## Shared Harnesses
 
@@ -58,10 +62,21 @@ When a bug is fixed, prefer the smallest regression at the lowest useful layer f
   - `make -C rtl/verilator test_systolic`
   - `make -C rtl/verilator test_systolic_array_chained`
   - `make -C rtl/verilator test_systolic_chained`
+  - `make -C rtl/verilator run_program`
 - cocotb:
   - `make -C rtl/cocotb test_all SIM=verilator`
   - `make -C rtl/cocotb test_dma SIM=verilator`
   - `make -C rtl/cocotb test_sfu SIM=verilator`
   - `make -C rtl/cocotb test_systolic_chained SIM=verilator`
+
+## Program Sign-Off
+
+- Build the native runner with `make -C rtl/verilator run_program`.
+- Compare a precompiled binary with:
+  - `software/tools/compare_rtl_golden.py --summary-out out.json program --program program.bin`
+- Compile and compare a model variant with:
+  - `software/tools/compare_rtl_golden.py --summary-out out.json compile --scenario baseline_default --weights pytorch_model.bin --image sample.jpg`
+- Failed compares automatically leave a work directory with the RTL summary and,
+  when needed, golden/RTL trace artifacts for mismatch triage.
 
 Verilator is the primary sign-off simulator. Icarus remains best-effort only.

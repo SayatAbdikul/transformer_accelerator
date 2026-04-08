@@ -1604,6 +1604,32 @@ class CodeGenerator:
         act_alloc = self.mem.abuf.get(node.inputs[0]) or \
                     self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
 
+        trace_scale = self.calibration_scales.get(node.name, 14.0 / 127.0)
+        # Trace both inputs at the pre-VADD PC so the first-divergence harness
+        # can tell whether the bug is in runtime placement or in the helper op.
+        self._record_trace_event(
+            f"{node.name}__act_input",
+            BUF_ABUF,
+            act_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            trace_scale,
+        )
+        self._record_trace_event(
+            f"{node.name}__pos_input",
+            BUF_WBUF,
+            pos_alloc.offset_units,
+            M_pad,
+            N_pad,
+            node.output_shape[0],
+            node.output_shape[1],
+            "int8",
+            trace_scale,
+        )
+
         # VADD: activations + pos_embed (both INT8, same scale)
         out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
         self._emit(VaddInsn(
@@ -1620,7 +1646,7 @@ class CodeGenerator:
             node.output_shape[0],
             node.output_shape[1],
             "int8",
-            self.calibration_scales.get(node.name, 14.0 / 127.0),
+            trace_scale,
         )
 
         self.mem.wbuf.free("pos_embed")
