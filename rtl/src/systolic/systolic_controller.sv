@@ -63,7 +63,9 @@ module systolic_controller
     ST_READ_REQ   = 4'd2,
     ST_READ_USE   = 4'd3,
     ST_DRAIN_PREP = 4'd4,
-    ST_DRAIN_WR   = 4'd5
+    ST_DRAIN_WR   = 4'd5,
+    ST_A_LOAD_REQ = 4'd6,
+    ST_A_LOAD_LATCH = 4'd7
   } state_t;
 
   state_t state;
@@ -75,8 +77,10 @@ module systolic_controller
   logic [10:0] m_tiles_q, n_tiles_q, k_tiles_q;
   logic [10:0] mtile_q, ntile_q, ktile_q;
   logic [5:0]  lane_q;
+  logic [4:0]  a_load_row_q;
   logic [4:0]  drain_row_q;
   logic [1:0]  drain_grp_q;
+  logic [7:0]  a_tile_scratch [0:SYS_DIM-1][0:SYS_DIM-1];
 
   // Row-major drain address tracking.
   // tile_drain_base_q = dst_off + mtile * n_tiles * 64 (advances by n_tiles*64 per M-tile).
@@ -119,12 +123,23 @@ module systolic_controller
     end
   endfunction
 
-  // Base row addresses for the current logical 16x16 tile.
-  // src1/src2 advance in 16-byte row units; dst advances in 4-row INT32 chunks.
-  logic [31:0] src1_tile_base, src2_tile_base;
+  // Source SRAM is presented to MATMUL in compiler-visible row-major form:
+  //   src1 = A[M,K] with K/16 row units per logical row
+  //   src2 = B[K,N] with N/16 row units per logical row
+  // The controller stages one 16x16 A tile locally, then streams its columns
+  // into the array while reading the matching B rows directly from SRAM.
+  logic [31:0] src1_row_units, src2_row_units;
+  logic [31:0] src1_logical_row, src2_logical_row;
+  logic [31:0] src1_load_row_addr, src2_stream_row_addr;
   always_comb begin
-    src1_tile_base = {16'h0, src1_off_q} + (((mtile_q * k_tiles_q) + {21'h0, ktile_q}) << 4);
-    src2_tile_base = {16'h0, src2_off_q} + (((ktile_q * n_tiles_q) + {21'h0, ntile_q}) << 4);
+    src1_row_units = {21'h0, k_tiles_q};
+    src2_row_units = {21'h0, n_tiles_q};
+
+    src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, a_load_row_q};
+    src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, lane_q};
+
+    src1_load_row_addr = {16'h0, src1_off_q} + (src1_logical_row * src1_row_units) + {21'h0, ktile_q};
+    src2_stream_row_addr = {16'h0, src2_off_q} + (src2_logical_row * src2_row_units) + {21'h0, ntile_q};
   end
 
   // Tile-walking FSM. One MATMUL dispatch can cover many logical 16x16 tiles
@@ -146,10 +161,14 @@ module systolic_controller
       ntile_q <= 11'd0;
       ktile_q <= 11'd0;
       lane_q <= 6'd0;
+      a_load_row_q <= 5'd0;
       drain_row_q <= 5'd0;
       drain_grp_q <= 2'd0;
       tile_drain_base_q <= 16'h0;
       drain_row_addr_q <= 16'h0;
+      for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
+        for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
+          a_tile_scratch[row_idx][col_idx] <= 8'h0;
     end else begin
       case (state)
         ST_IDLE: begin
@@ -169,13 +188,32 @@ module systolic_controller
             ntile_q <= 11'd0;
             ktile_q <= 11'd0;
             lane_q <= 6'd0;
+            a_load_row_q <= 5'd0;
             state <= ST_INIT_TILE;
           end
         end
 
         ST_INIT_TILE: begin
           lane_q <= 6'd0;
-          state <= ST_READ_REQ;
+          a_load_row_q <= 5'd0;
+          state <= ST_A_LOAD_REQ;
+        end
+
+        ST_A_LOAD_REQ: begin
+          state <= ST_A_LOAD_LATCH;
+        end
+
+        ST_A_LOAD_LATCH: begin
+          for (int col_idx = 0; col_idx < SYS_DIM; col_idx = col_idx + 1)
+            a_tile_scratch[a_load_row_q[3:0]][col_idx] <= sram_b_rdata[(col_idx * 8) +: 8];
+
+          if (a_load_row_q == 5'd15) begin
+            lane_q <= 6'd0;
+            state <= ST_READ_REQ;
+          end else begin
+            a_load_row_q <= a_load_row_q + 5'd1;
+            state <= ST_A_LOAD_REQ;
+          end
         end
 
         ST_READ_REQ: begin
@@ -187,7 +225,8 @@ module systolic_controller
             lane_q <= 6'd0;
             if (ktile_q + 11'd1 < k_tiles_q) begin
               ktile_q <= ktile_q + 11'd1;
-              state <= ST_READ_REQ;
+              a_load_row_q <= 5'd0;
+              state <= ST_A_LOAD_REQ;
             end else begin
               drain_row_q <= 5'd0;
               drain_grp_q <= 2'd0;
@@ -247,7 +286,11 @@ module systolic_controller
     lane_row_idx = (SYSTOLIC_ARCH_MODE == SYS_MODE_CHAINED)
                ? {10'h0, lane_q[5:0]}
                : {10'h0, lane_q[5:0]};
-    a_row_data_q = inject_zero_data ? 128'h0 : sram_b_rdata;
+    a_row_data_q = 128'h0;
+    for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1) begin
+      if (!inject_zero_data && (lane_q < 6'd16))
+        a_row_data_q[(row_idx * 8) +: 8] = a_tile_scratch[row_idx][lane_q[3:0]];
+    end
     b_row_data_q = inject_zero_data ? 128'h0 : sram_a_rdata;
 
     sram_a_en = 1'b0;
@@ -265,6 +308,12 @@ module systolic_controller
     clear_acc = (state == ST_INIT_TILE) && !flags_accumulate_q;
 
     case (state)
+      ST_A_LOAD_REQ: begin
+        sram_b_en = 1'b1;
+        sram_b_buf = src1_buf_q;
+        sram_b_row = src1_load_row_addr[15:0];
+      end
+
       ST_READ_REQ: begin
         // Issue both source reads together. Their rows appear one cycle later
         // in ST_READ_USE, which then advances the systolic mesh by one step.
@@ -272,14 +321,10 @@ module systolic_controller
           sram_b_en = 1'b0;
           sram_a_en = 1'b0;
         end else begin
-          sram_b_en = 1'b1;
-          sram_b_buf = src1_buf_q;
-          sram_b_row = src1_tile_base[15:0] + lane_row_idx;
-
           sram_a_en = 1'b1;
           sram_a_we = 1'b0;
           sram_a_buf = src2_buf_q;
-          sram_a_row = src2_tile_base[15:0] + lane_row_idx;
+          sram_a_row = src2_stream_row_addr[15:0];
         end
       end
 
@@ -289,20 +334,14 @@ module systolic_controller
 
       ST_DRAIN_WR: begin
         // Pack four neighboring INT32 accumulators into one 128-bit SRAM row.
-        logic [4:0] c0, c1, c2, c3;
-        c0 = {1'b0, drain_grp_q, 2'b00};
-        c1 = c0 + 5'd1;
-        c2 = c0 + 5'd2;
-        c3 = c0 + 5'd3;
-
         sram_a_en = 1'b1;
         sram_a_we = 1'b1;
         sram_a_buf = dst_buf_q;
         sram_a_row = drain_row_addr_q + {14'h0, drain_grp_q};
-        sram_a_wdata[31:0]   = acc_at(drain_row_q, c0);
-        sram_a_wdata[63:32]  = acc_at(drain_row_q, c1);
-        sram_a_wdata[95:64]  = acc_at(drain_row_q, c2);
-        sram_a_wdata[127:96] = acc_at(drain_row_q, c3);
+        sram_a_wdata[31:0]   = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00});
+        sram_a_wdata[63:32]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd1);
+        sram_a_wdata[95:64]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd2);
+        sram_a_wdata[127:96] = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd3);
       end
 
       default: ;

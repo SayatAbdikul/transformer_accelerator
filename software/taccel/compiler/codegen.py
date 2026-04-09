@@ -266,6 +266,10 @@ class CodeGenerator:
     def _fused_softmax_attnv_accum_out_proj_enabled_for(self, node_name: str) -> bool:
         return self._block_selected(node_name, self.fused_softmax_attnv_accum_out_proj_blocks)
 
+    def _should_trace_attention_projection_debug(self, node_name: str) -> bool:
+        """Return True for per-head Q/K/V projections we may need to debug end-to-end."""
+        return re.match(r"block\d+_head\d+_(query|key|value)$", node_name) is not None
+
     def _residual1_skip_name(self, out_proj_name: str) -> str:
         match = re.match(r"block(\d+)_out_proj$", out_proj_name)
         if match is None:
@@ -364,6 +368,38 @@ class CodeGenerator:
         act_alloc = self.mem.abuf.get(node.inputs[0]) or \
                     self.mem.abuf.alloc(node.inputs[0], M_pad * K_pad)
         act_off = act_alloc.offset_units
+        input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
+        mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
+        accum_real_scale = input_act_scale * mean_w_scale
+        trace_projection_inputs = self._should_trace_attention_projection_debug(node.name)
+
+        if trace_projection_inputs:
+            # Snapshot the exact activation and weight tiles consumed by MATMUL.
+            # If the first divergence moves to one of these traces, we know the
+            # bug is upstream of the systolic datapath.
+            self._record_trace_event(
+                f"{node.name}__act_input",
+                BUF_ABUF,
+                act_off,
+                M_pad,
+                K_pad,
+                M,
+                K,
+                "int8",
+                input_act_scale,
+            )
+            self._record_trace_event(
+                f"{node.name}__weight_input",
+                BUF_WBUF,
+                w_alloc.offset_units,
+                K_pad,
+                N_pad,
+                K,
+                N,
+                "int8",
+                mean_w_scale,
+            )
 
         # MATMUL
         self._emit(MatmulInsn(
@@ -373,6 +409,18 @@ class CodeGenerator:
             flags=0,
         ))
         self._emit(SyncInsn(resource_mask=0b010))  # wait systolic
+        if trace_projection_inputs:
+            self._record_trace_event(
+                f"{node.name}__accum_pre_bias",
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M,
+                N,
+                "int32",
+                accum_real_scale,
+            )
 
         # Free weight allocation (no longer needed after MATMUL)
         self.mem.wbuf.free(f"_w_{weight_name}")
@@ -382,12 +430,29 @@ class CodeGenerator:
         if bias_name:
             if bias_name not in self.prescaled_biases:
                 raise KeyError(f"Missing prescaled bias '{bias_name}' for node '{node.name}'")
-            self._emit_bias_add(bias_name, N_pad, m_tiles)
+            self._emit_bias_add(
+                bias_name,
+                N_pad,
+                m_tiles,
+                trace_node_name=f"{node.name}__bias_input" if trace_projection_inputs else None,
+                trace_scale=accum_real_scale,
+                logical_cols=N,
+            )
 
-        input_act_scale = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
-        target_act_scale = self.calibration_scales.get(node.name, 6.0 / 127.0)
-        mean_w_scale = float(np.mean(w_scales.astype(np.float32)))
-        accum_real_scale = input_act_scale * mean_w_scale
+        if trace_projection_inputs:
+            # Capture the post-bias accumulator state so the first-divergence
+            # harness can distinguish MATMUL/bias errors from requantization errors.
+            self._record_trace_event(
+                f"{node.name}__accum",
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M,
+                N,
+                "int32",
+                accum_real_scale,
+            )
 
         if self._dequant_add_residual1_enabled_for_output(node.name):
             if weight_name in self.requant_pc_weight_names:
@@ -959,7 +1024,10 @@ class CodeGenerator:
         out_alloc = self.mem.abuf.alloc(node.name, strip_rows * N_pad)
         out_alloc.size_bytes = M_pad * N_pad  # real size is in DRAM
 
-    def _emit_bias_add(self, bias_name: str, N_pad: int, m_tiles: int):
+    def _emit_bias_add(self, bias_name: str, N_pad: int, m_tiles: int,
+                       trace_node_name: Optional[str] = None,
+                       trace_scale: float = 1.0,
+                       logical_cols: Optional[int] = None):
         """Emit bias load + VADD to accumulator."""
         bias_dram_off = self._dram_offset_required(bias_name, f"loading bias '{bias_name}'")
         bias_bytes = N_pad * 4  # INT32
@@ -968,6 +1036,18 @@ class CodeGenerator:
         bias_wbuf_off = self.mem.wbuf.alloc(f"bias_{bias_name}", bias_bytes).offset_units
         self._emit_dma_load(BUF_WBUF, bias_wbuf_off, bias_bytes, 1, bias_dram_off)
         self._emit(SyncInsn(resource_mask=0b001))
+        if trace_node_name is not None:
+            self._record_trace_event(
+                trace_node_name,
+                BUF_WBUF,
+                bias_wbuf_off,
+                1,
+                N_pad,
+                1,
+                logical_cols if logical_cols is not None else N_pad,
+                "int32",
+                trace_scale,
+            )
 
         # VADD: ACCUM += WBUF[bias] (INT32 add with broadcast)
         self._emit(VaddInsn(

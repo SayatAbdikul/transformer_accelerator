@@ -340,6 +340,73 @@ class TestRequantPcCodegen:
         assert not any(isinstance(insn, RequantInsn) for insn in instructions)
         assert f"{weight_name}__requant_pc" in codegen.dram_layout
 
+    def test_attention_projection_emits_debug_input_and_accum_traces(self):
+        weight_name = "vit.encoder.layer.0.attention.attention.query.weight_h0"
+        bias_name = "vit.encoder.layer.0.attention.attention.query.bias_h0"
+        graph = IRGraph()
+        graph.add_node(IRNode(
+            op="matmul",
+            name="block0_head0_query",
+            inputs=["ln1_input", weight_name],
+            output_shape=(16, 16),
+            attrs={"bias": bias_name},
+        ))
+
+        codegen = CodeGenerator(
+            weight_data={
+                weight_name: (
+                    np.ones((16, 16), dtype=np.int8),
+                    np.full(16, 0.125, dtype=np.float16),
+                ),
+            },
+            calibration_scales={
+                "ln1_input": 0.125,
+                "block0_head0_query": 0.25,
+            },
+            prescaled_biases={
+                bias_name: np.arange(16, dtype=np.int32),
+            },
+        )
+
+        codegen.generate(graph)
+
+        flat_events = [
+            (pc, event["node_name"], event["buf_id"], event["offset_units"], event["dtype"])
+            for pc, events in sorted(codegen.trace_manifest.items())
+            for event in events
+        ]
+
+        assert [name for _, name, *_ in flat_events] == [
+            "block0_head0_query__act_input",
+            "block0_head0_query__weight_input",
+            "block0_head0_query__accum_pre_bias",
+            "block0_head0_query__bias_input",
+            "block0_head0_query__accum",
+            "block0_head0_query",
+        ]
+        pre_matmul_pc = flat_events[0][0]
+        pre_bias_pc = flat_events[2][0]
+        bias_pc = flat_events[3][0]
+        accum_pc = flat_events[4][0]
+        output_pc = flat_events[5][0]
+        assert flat_events[0][2] == BUF_ABUF
+        assert flat_events[1][2] == BUF_WBUF
+        assert flat_events[2][2] == BUF_ACCUM
+        assert flat_events[3][2] == BUF_WBUF
+        assert flat_events[4][2] == BUF_ACCUM
+        assert flat_events[5][2] == BUF_ABUF
+        assert flat_events[0][4] == "int8"
+        assert flat_events[1][4] == "int8"
+        assert flat_events[2][4] == "int32"
+        assert flat_events[3][4] == "int32"
+        assert flat_events[4][4] == "int32"
+        assert flat_events[5][4] == "int8"
+        assert flat_events[1][0] == pre_matmul_pc
+        assert pre_bias_pc > pre_matmul_pc
+        assert bias_pc > pre_bias_pc
+        assert accum_pc > bias_pc
+        assert output_pc > accum_pc
+
 
 class TestGeluFromAccumCodegen:
     @staticmethod

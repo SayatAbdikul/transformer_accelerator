@@ -46,7 +46,8 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/taccel_top.sv
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
-        test_systolic test_systolic_array_chained test_systolic_chained clean
+        test_systolic test_systolic_array_chained test_systolic_chained \
+        test_systolic_query clean
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 
@@ -221,6 +222,25 @@ $(BUILD_DIR)/test_systolic_chained/Vtaccel_top: $(CONTROL_SV) test_systolic_chai
 test_systolic_chained: $(BUILD_DIR)/test_systolic_chained/Vtaccel_top
 	@echo "--- Running chained top-level systolic tests ---"
 	$(BUILD_DIR)/test_systolic_chained/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_systolic_query: focused chained query-projection regression
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.cpp
+	mkdir -p $(BUILD_DIR)/test_systolic_query
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_systolic_query \
+	  $(CONTROL_SV) \
+	  test_systolic_query.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_systolic_query -f Vtaccel_top.mk
+
+test_systolic_query: $(BUILD_DIR)/test_systolic_query/Vtaccel_top
+	@echo "--- Running focused chained query systolic regression ---"
+	$(BUILD_DIR)/test_systolic_query/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:

@@ -29,6 +29,7 @@ namespace {
 constexpr int ST_READ_REQ = 2;
 constexpr int ST_READ_USE = 3;
 constexpr int ST_DRAIN_WR = 5;
+constexpr int ST_A_LOAD_REQ = 6;
 constexpr int ST_INIT_TILE = 1;
 constexpr int CHAIN_TOTAL_STEPS = 16 + (2 * (16 - 1));
 
@@ -109,9 +110,9 @@ struct ChainedArrayRef {
 };
 
 struct ScheduleTrace {
+  std::vector<int> a_load_rows;
   std::vector<int> read_use_lanes;
-  std::vector<int> read_rows_a;
-  std::vector<int> read_rows_b;
+  std::vector<int> b_stream_rows;
   std::vector<int> zero_read_lanes;
   std::vector<int> drain_rows;
   int read_use_count_before_drain = -1;
@@ -169,13 +170,13 @@ void assert_identity_schedule(const char* name, const ScheduleTrace& trace) {
     }
   }
 
-  if (trace.read_rows_a.size() != 16 || trace.read_rows_b.size() != 16)
-    TEST_FAIL(name, "unexpected chained read row count");
+  if (trace.a_load_rows.size() != 16 || trace.b_stream_rows.size() != 16)
+    TEST_FAIL(name, "unexpected chained source row count");
 
   for (int row = 0; row < 16; ++row) {
-    if (trace.read_rows_a[row] != row || trace.read_rows_b[row] != row) {
-      std::fprintf(stderr, "read row mismatch idx=%d a=%d b=%d exp=%d\n",
-                   row, trace.read_rows_a[row], trace.read_rows_b[row], row);
+    if (trace.a_load_rows[row] != row || trace.b_stream_rows[row] != row) {
+      std::fprintf(stderr, "read row mismatch idx=%d a_load=%d b_stream=%d exp=%d\n",
+                   row, trace.a_load_rows[row], trace.b_stream_rows[row], row);
       TEST_FAIL(name, "source row progression mismatch");
     }
   }
@@ -286,10 +287,12 @@ void test_matmul_identity_schedule() {
       if (!check_identity_read_use_inputs(s.dut.get(), a, eye, lane))
         TEST_FAIL(name, "unexpected READ_USE inputs");
       ref.step(sample_vec16(s.dut.get(), true), sample_vec16(s.dut.get(), false), true, false);
+    } else if (state == ST_A_LOAD_REQ) {
+      if (r->taccel_top__DOT__sys_sram_b_en)
+        trace.a_load_rows.push_back(r->taccel_top__DOT__sys_sram_b_row);
     } else if (state == ST_READ_REQ) {
-      if (r->taccel_top__DOT__sys_sram_a_en || r->taccel_top__DOT__sys_sram_b_en) {
-        trace.read_rows_a.push_back(r->taccel_top__DOT__sys_sram_a_row);
-        trace.read_rows_b.push_back(r->taccel_top__DOT__sram_b_row);
+      if (r->taccel_top__DOT__sys_sram_a_en) {
+        trace.b_stream_rows.push_back(r->taccel_top__DOT__sys_sram_a_row);
       } else {
         trace.zero_read_lanes.push_back(lane);
       }

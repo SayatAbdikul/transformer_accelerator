@@ -17,7 +17,6 @@ constexpr int BUF_WBUF_ID  = 1;
 constexpr int BUF_ACCUM_ID = 2;
 
 constexpr int SYS_DIM = 16;
-constexpr int A_STAGE_OFF = 1024;
 
 struct Sim {
   std::unique_ptr<Vtaccel_top> dut;
@@ -49,18 +48,6 @@ inline void append_load_sync(std::vector<uint64_t>& prog, int reg, uint64_t addr
   append_set_addr(prog, reg, addr);
   prog.push_back(insn::LOAD(buf_id, sram_off, xfer_len, reg, 0));
   prog.push_back(insn::SYNC(0b001));
-}
-
-inline void append_prepare_a_tile(std::vector<uint64_t>& prog, int reg,
-                                  uint64_t addr, int abuf_off) {
-  append_load_sync(prog, reg, addr, BUF_ACCUM_ID, A_STAGE_OFF, SYS_DIM);
-  prog.push_back(insn::BUF_COPY(BUF_ACCUM_ID, A_STAGE_OFF,
-                                BUF_ABUF_ID, abuf_off, SYS_DIM, 1, 1));
-}
-
-inline void append_prepare_b_tile(std::vector<uint64_t>& prog, int reg,
-                                  uint64_t addr, int wbuf_off) {
-  append_load_sync(prog, reg, addr, BUF_WBUF_ID, wbuf_off, SYS_DIM);
 }
 
 inline std::vector<uint8_t> flatten_16x16(const int8_t (&m)[16][16]) {
@@ -109,45 +96,46 @@ inline void prepare_logical_16x16(AXI4SlaveModel& dram, std::vector<uint64_t>& p
                                   int abuf_off = 0, int wbuf_off = 0) {
   write_dram_bytes(dram, a_addr, flatten_16x16(a));
   write_dram_bytes(dram, b_addr, flatten_16x16(b));
-  append_prepare_a_tile(prog, 0, a_addr, abuf_off);
-  append_prepare_b_tile(prog, 1, b_addr, wbuf_off);
+  append_load_sync(prog, 0, a_addr, BUF_ABUF_ID, abuf_off, (16 * 16) / 16);
+  append_load_sync(prog, 1, b_addr, BUF_WBUF_ID, wbuf_off, (16 * 16) / 16);
 }
 
 inline void prepare_logical_32x32(AXI4SlaveModel& dram, std::vector<uint64_t>& prog,
                                   const int8_t (&a)[32][32], const int8_t (&b)[32][32],
                                   uint64_t a_base, uint64_t b_base,
                                   int abuf_off = 0, int wbuf_off = 0) {
-  for (int mt = 0; mt < 2; ++mt) {
-    for (int kt = 0; kt < 2; ++kt) {
-      int tile = mt * 2 + kt;
-      uint64_t a_addr = a_base + static_cast<uint64_t>(tile) * 0x1000ULL;
-      write_dram_bytes(dram, a_addr, flatten_tile_32x32(a, mt * 16, kt * 16));
-      append_prepare_a_tile(prog, 0, a_addr, abuf_off + tile * 16);
+  std::vector<uint8_t> a_bytes(32 * 32);
+  std::vector<uint8_t> b_bytes(32 * 32);
+  for (int r = 0; r < 32; ++r) {
+    for (int c = 0; c < 32; ++c) {
+      a_bytes[r * 32 + c] = static_cast<uint8_t>(a[r][c]);
+      b_bytes[r * 32 + c] = static_cast<uint8_t>(b[r][c]);
     }
   }
-
-  for (int kt = 0; kt < 2; ++kt) {
-    for (int nt = 0; nt < 2; ++nt) {
-      int tile = kt * 2 + nt;
-      uint64_t b_addr = b_base + static_cast<uint64_t>(tile) * 0x1000ULL;
-      write_dram_bytes(dram, b_addr, flatten_tile_32x32(b, kt * 16, nt * 16));
-      append_prepare_b_tile(prog, 1, b_addr, wbuf_off + tile * 16);
-    }
-  }
+  write_dram_bytes(dram, a_base, a_bytes);
+  write_dram_bytes(dram, b_base, b_bytes);
+  append_load_sync(prog, 0, a_base, BUF_ABUF_ID, abuf_off, (32 * 32) / 16);
+  append_load_sync(prog, 1, b_base, BUF_WBUF_ID, wbuf_off, (32 * 32) / 16);
 }
 
 inline void prepare_logical_16x64x16(AXI4SlaveModel& dram, std::vector<uint64_t>& prog,
                                      const int8_t (&a)[16][64], const int8_t (&b)[64][16],
                                      uint64_t a_base, uint64_t b_base,
                                      int abuf_off = 0, int wbuf_off = 0) {
-  for (int kt = 0; kt < 4; ++kt) {
-    uint64_t a_addr = a_base + static_cast<uint64_t>(kt) * 0x1000ULL;
-    uint64_t b_addr = b_base + static_cast<uint64_t>(kt) * 0x1000ULL;
-    write_dram_bytes(dram, a_addr, flatten_tile_16x64(a, kt * 16));
-    write_dram_bytes(dram, b_addr, flatten_tile_64x16(b, kt * 16));
-    append_prepare_a_tile(prog, 0, a_addr, abuf_off + kt * 16);
-    append_prepare_b_tile(prog, 1, b_addr, wbuf_off + kt * 16);
-  }
+  std::vector<uint8_t> a_bytes(16 * 64);
+  std::vector<uint8_t> b_bytes(64 * 16);
+  for (int r = 0; r < 16; ++r)
+    for (int c = 0; c < 64; ++c)
+      a_bytes[r * 64 + c] = static_cast<uint8_t>(a[r][c]);
+
+  for (int r = 0; r < 64; ++r)
+    for (int c = 0; c < 16; ++c)
+      b_bytes[r * 16 + c] = static_cast<uint8_t>(b[r][c]);
+
+  write_dram_bytes(dram, a_base, a_bytes);
+  write_dram_bytes(dram, b_base, b_bytes);
+  append_load_sync(prog, 0, a_base, BUF_ABUF_ID, abuf_off, (16 * 64) / 16);
+  append_load_sync(prog, 1, b_base, BUF_WBUF_ID, wbuf_off, (64 * 16) / 16);
 }
 
 inline int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
@@ -160,14 +148,9 @@ inline int32_t read_accum_ij(Vtaccel_top* dut, int dst_off, int i, int j) {
 }
 
 inline int32_t read_accum_32x32(Vtaccel_top* dut, int off, int i, int j) {
-  int mt = i / 16;
-  int nt = j / 16;
-  int li = i % 16;
-  int lj = j % 16;
-  int tile = mt * 2 + nt;
-  int grp = lj / 4;
-  int lane = lj % 4;
-  int row = off + tile * 64 + li * 4 + grp;
+  int grp = j / 4;
+  int lane = j % 4;
+  int row = off + i * 8 + grp;
   auto* r = dut->rootp;
   uint32_t word = r->taccel_top__DOT__u_sram__DOT__u_accum__DOT__mem[row][lane];
   return static_cast<int32_t>(word);

@@ -136,11 +136,8 @@ def read_accum_32x32(dut, dst_off: int = 0) -> list[list[int]]:
     out = [[0 for _ in range(32)] for _ in range(32)]
     for i in range(32):
         for j in range(32):
-            mt, nt = i // 16, j // 16
-            li, lj = i % 16, j % 16
-            tile = mt * 2 + nt
-            grp, lane = lj // 4, lj % 4
-            row = dst_off + tile * 64 + li * 4 + grp
+            grp, lane = j // 4, j % 4
+            row = dst_off + i * 8 + grp
             lanes = accum_row_u32x4(dut, row)
             u = lanes[lane]
             out[i][j] = u if u < (1 << 31) else (u - (1 << 32))
