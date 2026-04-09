@@ -565,6 +565,86 @@ class TestPosEmbedTraceCodegen:
         assert flat_events[2][1] == "pos_embed_add"
 
 
+class TestQktTraceCodegen:
+    def test_qkt_emits_query_and_k_debug_trace_events(self):
+        codegen = CodeGenerator(
+            weight_data={},
+            calibration_scales={
+                "block0_head0_query": 0.125,
+                "block0_head0_key": 0.25,
+                "block0_head0_qkt": 0.015625,
+                "block0_head0_softmax": 0.0625,
+            },
+            prescaled_biases={},
+        )
+        codegen.dram_layout["__zero_pad__"] = 0x2000
+        q_alloc = codegen.mem.abuf.alloc("block0_head0_query", pad_dim(197) * pad_dim(64))
+        k_alloc = codegen.mem.abuf.alloc("block0_head0_key", pad_dim(197) * pad_dim(64))
+
+        node = IRNode(
+            op="matmul_qkt",
+            name="block0_head0_qkt",
+            inputs=["block0_head0_query", "block0_head0_key"],
+            output_shape=(197, 197),
+            attrs={"head_idx": 0, "scale": 0.125},
+        )
+
+        codegen._emit_qkt(node)
+
+        trace_events = [
+            (pc, event["node_name"], event["buf_id"], event["offset_units"], event["row_start"])
+            for pc, events in sorted(codegen.trace_manifest.items())
+            for event in events
+        ]
+        names = [name for _, name, _, _, _ in trace_events]
+
+        key_input_idx = names.index("block0_head0_qkt__key_padded_input")
+        key_transpose_idx = names.index("block0_head0_qkt__key_transposed")
+        query_input_idx = names.index("block0_head0_qkt__query_input")
+        qkt_idx = names.index("block0_head0_qkt")
+
+        key_input_pc = trace_events[key_input_idx][0]
+        key_transpose_pc = trace_events[key_transpose_idx][0]
+        query_input_pc = trace_events[query_input_idx][0]
+        qkt_pc = trace_events[qkt_idx][0]
+
+        assert key_input_pc == key_transpose_pc
+        assert query_input_pc < qkt_pc
+        assert trace_events[key_input_idx][1:4] == (
+            "block0_head0_qkt__key_padded_input",
+            BUF_ABUF,
+            k_alloc.offset_units,
+        )
+        assert trace_events[key_transpose_idx][1:4] == (
+            "block0_head0_qkt__key_transposed",
+            BUF_WBUF,
+            0,
+        )
+        assert trace_events[query_input_idx][1:4] == (
+            "block0_head0_qkt__query_input",
+            BUF_ABUF,
+            q_alloc.offset_units,
+        )
+        assert trace_events[query_input_idx][4] == 0
+        assert trace_events[qkt_idx][4] == 0
+
+        manifest = codegen.trace_manifest
+        key_events = manifest[key_input_pc]
+        assert key_events[0]["node_name"] == "block0_head0_qkt__key_padded_input"
+        assert key_events[0]["logical_rows"] == pad_dim(197)
+        assert key_events[0]["logical_cols"] == pad_dim(64)
+        assert key_events[1]["node_name"] == "block0_head0_qkt__key_transposed"
+        assert key_events[1]["logical_rows"] == pad_dim(64)
+        assert key_events[1]["logical_cols"] == pad_dim(197)
+
+        query_events = [event for event in manifest[query_input_pc] if event["node_name"] == "block0_head0_qkt__query_input"]
+        assert len(query_events) == 1
+        assert query_events[0]["logical_rows"] == 16
+        assert query_events[0]["logical_cols"] == 64
+        assert query_events[0]["full_rows"] == 197
+        assert query_events[0]["full_cols"] == 64
+
+
 class TestFusedSoftmaxAttnVCodegen:
     def test_block_selected_qkt_emits_fused_softmax_attnv(self):
         graph = IRGraph()

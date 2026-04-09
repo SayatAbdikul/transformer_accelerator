@@ -1072,6 +1072,9 @@ class CodeGenerator:
         M_pad = pad_dim(seq_len)
         K_pad = pad_dim(head_dim)
         num_strips = M_pad // TILE  # 13 strips of 16 rows
+        trace_qkt_debug = re.match(r"block\d+_head\d+_qkt$", node.name) is not None
+        act_scale_q = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
+        act_scale_k = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
 
         # BUF_COPY K_h → WBUF (transpose) to get K^T [64,208]
         k_alloc = self.mem.abuf.get(node.inputs[1])
@@ -1100,6 +1103,40 @@ class CodeGenerator:
             src_rows=src_rows,
             transpose=1,
         ))
+        key_transpose_pc = len(self.instructions) - 1
+        if trace_qkt_debug:
+            # Snapshot the exact padded K tensor consumed by BUF_COPY and the
+            # transposed WBUF tensor it produces. If the first divergence moves
+            # to one of these traces we know whether the bug is in K
+            # preparation or later in the Q x K^T path.
+            self._record_trace_event(
+                f"{node.name}__key_padded_input",
+                BUF_ABUF,
+                k_alloc.offset_units,
+                M_pad,
+                K_pad,
+                M_pad,
+                K_pad,
+                "int8",
+                act_scale_k,
+                full_rows=M_pad,
+                full_cols=K_pad,
+                pc=key_transpose_pc,
+            )
+            self._record_trace_event(
+                f"{node.name}__key_transposed",
+                BUF_WBUF,
+                kt_wbuf.offset_units,
+                K_pad,
+                M_pad,
+                K_pad,
+                M_pad,
+                "int8",
+                act_scale_k,
+                full_rows=K_pad,
+                full_cols=M_pad,
+                pc=key_transpose_pc,
+            )
         self._emit(SyncInsn(resource_mask=0b001))
 
         q_alloc = self.mem.abuf.get(node.inputs[0])
@@ -1113,8 +1150,6 @@ class CodeGenerator:
 
         n_tiles = M_pad // TILE
         k_tiles = K_pad // TILE
-        act_scale_q = self.calibration_scales.get(node.inputs[0], 6.0 / 127.0)
-        act_scale_k = self.calibration_scales.get(node.inputs[1], 6.0 / 127.0)
         # C1: softmax consumes raw ACCUM values with this dequant scale.
         # qkt_in_scale = q_scale * k_scale * (1/sqrt(d_head)).
         qkt_in_scale = self.calibration_scales.get(
@@ -1153,6 +1188,23 @@ class CodeGenerator:
                 dst_buf=BUF_ACCUM, dst_off=0,
                 flags=0,
             ))
+            qkt_matmul_pc = len(self.instructions) - 1
+            if trace_qkt_debug:
+                self._record_trace_event(
+                    f"{node.name}__query_input",
+                    BUF_ABUF,
+                    q_strip_off,
+                    TILE,
+                    K_pad,
+                    logical_rows,
+                    head_dim,
+                    "int8",
+                    act_scale_q,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=head_dim,
+                    pc=qkt_matmul_pc,
+                )
             self._emit(SyncInsn(resource_mask=0b010))
             self._record_trace_event(
                 node.name,

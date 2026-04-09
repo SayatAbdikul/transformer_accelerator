@@ -47,7 +47,7 @@ CONTROL_SV    := $(PKG) \
 
 .PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
-        test_systolic_query clean
+        test_systolic_query test_systolic_qkt clean
 
 all: test_decode test_control test_dma test_helpers test_sfu test_systolic
 
@@ -241,6 +241,25 @@ $(BUILD_DIR)/test_systolic_query/Vtaccel_top: $(CONTROL_SV) test_systolic_query.
 test_systolic_query: $(BUILD_DIR)/test_systolic_query/Vtaccel_top
 	@echo "--- Running focused chained query systolic regression ---"
 	$(BUILD_DIR)/test_systolic_query/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_systolic_qkt: focused QK^T prep + matmul regressions
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_systolic_qkt/Vtaccel_top: $(CONTROL_SV) test_systolic_qkt.cpp
+	mkdir -p $(BUILD_DIR)/test_systolic_qkt
+	$(VERILATOR) $(VFLAGS) \
+	  -GSYSTOLIC_ARCH_MODE=1 \
+	  -I$(INCLUDE_DIR) -I$(SYSTOLIC_DIR) \
+	  --top-module taccel_top \
+	  --Mdir $(BUILD_DIR)/test_systolic_qkt \
+	  $(CONTROL_SV) \
+	  test_systolic_qkt.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_systolic_qkt -f Vtaccel_top.mk
+
+test_systolic_qkt: $(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
+	@echo "--- Running focused QK^T regressions ---"
+	$(BUILD_DIR)/test_systolic_qkt/Vtaccel_top
 
 # -----------------------------------------------------------------------
 clean:
