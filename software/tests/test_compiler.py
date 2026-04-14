@@ -378,34 +378,54 @@ class TestRequantPcCodegen:
 
         assert [name for _, name, *_ in flat_events] == [
             "block0_head0_query__act_input",
+            "block0_head0_query__act_input_padded",
             "block0_head0_query__weight_input",
             "block0_head0_query__accum_pre_bias",
+            "block0_head0_query__accum_pre_bias_padded",
             "block0_head0_query__bias_input",
             "block0_head0_query__accum",
+            "block0_head0_query__accum_padded",
             "block0_head0_query",
+            "block0_head0_query__output_padded",
         ]
         pre_matmul_pc = flat_events[0][0]
-        pre_bias_pc = flat_events[2][0]
-        bias_pc = flat_events[3][0]
-        accum_pc = flat_events[4][0]
-        output_pc = flat_events[5][0]
+        act_input_padded_pc = flat_events[1][0]
+        pre_bias_pc = flat_events[3][0]
+        pre_bias_padded_pc = flat_events[4][0]
+        bias_pc = flat_events[5][0]
+        accum_pc = flat_events[6][0]
+        accum_padded_pc = flat_events[7][0]
+        output_pc = flat_events[8][0]
+        output_padded_pc = flat_events[9][0]
         assert flat_events[0][2] == BUF_ABUF
-        assert flat_events[1][2] == BUF_WBUF
-        assert flat_events[2][2] == BUF_ACCUM
-        assert flat_events[3][2] == BUF_WBUF
+        assert flat_events[1][2] == BUF_ABUF
+        assert flat_events[2][2] == BUF_WBUF
+        assert flat_events[3][2] == BUF_ACCUM
         assert flat_events[4][2] == BUF_ACCUM
-        assert flat_events[5][2] == BUF_ABUF
+        assert flat_events[5][2] == BUF_WBUF
+        assert flat_events[6][2] == BUF_ACCUM
+        assert flat_events[7][2] == BUF_ACCUM
+        assert flat_events[8][2] == BUF_ABUF
+        assert flat_events[9][2] == BUF_ABUF
         assert flat_events[0][4] == "int8"
         assert flat_events[1][4] == "int8"
-        assert flat_events[2][4] == "int32"
+        assert flat_events[2][4] == "int8"
         assert flat_events[3][4] == "int32"
         assert flat_events[4][4] == "int32"
-        assert flat_events[5][4] == "int8"
-        assert flat_events[1][0] == pre_matmul_pc
+        assert flat_events[5][4] == "int32"
+        assert flat_events[6][4] == "int32"
+        assert flat_events[7][4] == "int32"
+        assert flat_events[8][4] == "int8"
+        assert flat_events[9][4] == "int8"
+        assert act_input_padded_pc == pre_matmul_pc
+        assert flat_events[2][0] == pre_matmul_pc
         assert pre_bias_pc > pre_matmul_pc
+        assert pre_bias_padded_pc == pre_bias_pc
         assert bias_pc > pre_bias_pc
         assert accum_pc > bias_pc
+        assert accum_padded_pc == accum_pc
         assert output_pc > accum_pc
+        assert output_padded_pc == output_pc
 
 
 class TestGeluFromAccumCodegen:
@@ -566,6 +586,56 @@ class TestPosEmbedTraceCodegen:
 
 
 class TestQktTraceCodegen:
+    def test_block0_ln1_emits_padded_input_and_output_debug_traces(self):
+        codegen = CodeGenerator(
+            weight_data={},
+            calibration_scales={
+                "pos_embed_add": 0.125,
+                "block0_ln1": 0.25,
+            },
+            prescaled_biases={},
+        )
+        in_alloc = codegen.mem.abuf.alloc("pos_embed_add", pad_dim(197) * pad_dim(192))
+        node = IRNode(
+            op="layernorm",
+            name="block0_ln1",
+            inputs=[
+                "pos_embed_add",
+                "vit.encoder.layer.0.layernorm_before.weight",
+                "vit.encoder.layer.0.layernorm_before.bias",
+            ],
+            output_shape=(197, 192),
+        )
+
+        codegen._emit_layernorm(node)
+
+        flat_events = [
+            (pc, event["node_name"], event["buf_id"], event["offset_units"], event["dtype"])
+            for pc, events in sorted(codegen.trace_manifest.items())
+            for event in events
+        ]
+        names = [name for _, name, *_ in flat_events]
+
+        assert names == [
+            "block0_ln1__input_padded",
+            "block0_ln1",
+            "block0_ln1__output_padded",
+        ]
+        assert flat_events[0][2:] == (BUF_ABUF, in_alloc.offset_units, "int8")
+        assert flat_events[1][2] == BUF_ABUF
+        assert flat_events[2][2] == BUF_ABUF
+        assert flat_events[0][0] < flat_events[1][0]
+        assert flat_events[2][0] == flat_events[1][0]
+
+        input_event = codegen.trace_manifest[flat_events[0][0]][0]
+        output_events = codegen.trace_manifest[flat_events[1][0]]
+        output_padded_event = output_events[1]
+        assert input_event["logical_rows"] == pad_dim(197)
+        assert input_event["logical_cols"] == pad_dim(192)
+        assert output_padded_event["node_name"] == "block0_ln1__output_padded"
+        assert output_padded_event["logical_rows"] == pad_dim(197)
+        assert output_padded_event["logical_cols"] == pad_dim(192)
+
     def test_qkt_emits_query_and_k_debug_trace_events(self):
         codegen = CodeGenerator(
             weight_data={},
@@ -600,16 +670,28 @@ class TestQktTraceCodegen:
 
         key_input_idx = names.index("block0_head0_qkt__key_padded_input")
         key_transpose_idx = names.index("block0_head0_qkt__key_transposed")
+        accum_pre_idx = names.index("block0_head0_qkt__accum_pre_matmul")
+        accum_pre_next_idx = names.index("block0_head0_qkt__accum_pre_matmul_next")
         query_input_idx = names.index("block0_head0_qkt__query_input")
         qkt_idx = names.index("block0_head0_qkt")
+        accum_pre_softmax_idx = names.index("block0_head0_qkt__accum_pre_softmax")
+        accum_pre_softmax_next_idx = names.index("block0_head0_qkt__accum_pre_softmax_next")
 
         key_input_pc = trace_events[key_input_idx][0]
         key_transpose_pc = trace_events[key_transpose_idx][0]
+        accum_pre_pc = trace_events[accum_pre_idx][0]
+        accum_pre_next_pc = trace_events[accum_pre_next_idx][0]
         query_input_pc = trace_events[query_input_idx][0]
         qkt_pc = trace_events[qkt_idx][0]
+        accum_pre_softmax_pc = trace_events[accum_pre_softmax_idx][0]
+        accum_pre_softmax_next_pc = trace_events[accum_pre_softmax_next_idx][0]
 
         assert key_input_pc == key_transpose_pc
+        assert accum_pre_pc == accum_pre_next_pc
+        assert accum_pre_pc < query_input_pc
         assert query_input_pc < qkt_pc
+        assert qkt_pc < accum_pre_softmax_pc
+        assert accum_pre_softmax_pc == accum_pre_softmax_next_pc
         assert trace_events[key_input_idx][1:4] == (
             "block0_head0_qkt__key_padded_input",
             BUF_ABUF,
@@ -620,11 +702,22 @@ class TestQktTraceCodegen:
             BUF_WBUF,
             0,
         )
+        assert trace_events[accum_pre_idx][1:4] == (
+            "block0_head0_qkt__accum_pre_matmul",
+            BUF_ACCUM,
+            0,
+        )
+        assert trace_events[accum_pre_next_idx][1:4] == (
+            "block0_head0_qkt__accum_pre_matmul_next",
+            BUF_ACCUM,
+            0,
+        )
         assert trace_events[query_input_idx][1:4] == (
             "block0_head0_qkt__query_input",
             BUF_ABUF,
             q_alloc.offset_units,
         )
+        assert trace_events[accum_pre_idx][4] == 0
         assert trace_events[query_input_idx][4] == 0
         assert trace_events[qkt_idx][4] == 0
 
@@ -637,12 +730,47 @@ class TestQktTraceCodegen:
         assert key_events[1]["logical_rows"] == pad_dim(64)
         assert key_events[1]["logical_cols"] == pad_dim(197)
 
+        accum_pre_events = [event for event in manifest[accum_pre_pc] if event["node_name"] == "block0_head0_qkt__accum_pre_matmul"]
+        assert len(accum_pre_events) == 1
+        assert accum_pre_events[0]["logical_rows"] == 16
+        assert accum_pre_events[0]["logical_cols"] == 197
+        assert accum_pre_events[0]["full_rows"] == 197
+        assert accum_pre_events[0]["full_cols"] == 197
+        assert accum_pre_events[0]["capture_phase"] == "retire_cycle"
+
+        accum_pre_next_events = [
+            event for event in manifest[accum_pre_next_pc]
+            if event["node_name"] == "block0_head0_qkt__accum_pre_matmul_next"
+        ]
+        assert len(accum_pre_next_events) == 1
+        assert accum_pre_next_events[0]["logical_rows"] == 16
+        assert accum_pre_next_events[0]["logical_cols"] == 197
+        assert accum_pre_next_events[0]["capture_phase"] == "retire_plus_1"
+
         query_events = [event for event in manifest[query_input_pc] if event["node_name"] == "block0_head0_qkt__query_input"]
         assert len(query_events) == 1
         assert query_events[0]["logical_rows"] == 16
         assert query_events[0]["logical_cols"] == 64
         assert query_events[0]["full_rows"] == 197
         assert query_events[0]["full_cols"] == 64
+
+        pre_softmax_events = [
+            event for event in manifest[accum_pre_softmax_pc]
+            if event["node_name"] == "block0_head0_qkt__accum_pre_softmax"
+        ]
+        assert len(pre_softmax_events) == 1
+        assert pre_softmax_events[0]["logical_rows"] == 16
+        assert pre_softmax_events[0]["logical_cols"] == 197
+        assert pre_softmax_events[0]["capture_phase"] == "retire_cycle"
+
+        pre_softmax_next_events = [
+            event for event in manifest[accum_pre_softmax_next_pc]
+            if event["node_name"] == "block0_head0_qkt__accum_pre_softmax_next"
+        ]
+        assert len(pre_softmax_next_events) == 1
+        assert pre_softmax_next_events[0]["logical_rows"] == 16
+        assert pre_softmax_next_events[0]["logical_cols"] == 197
+        assert pre_softmax_next_events[0]["capture_phase"] == "retire_plus_1"
 
 
 class TestFusedSoftmaxAttnVCodegen:

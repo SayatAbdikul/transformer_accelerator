@@ -65,7 +65,9 @@ module systolic_controller
     ST_DRAIN_PREP = 4'd4,
     ST_DRAIN_WR   = 4'd5,
     ST_A_LOAD_REQ = 4'd6,
-    ST_A_LOAD_LATCH = 4'd7
+    ST_A_LOAD_LATCH = 4'd7,
+    ST_DST_CLEAR_PREP = 4'd8,
+    ST_DST_CLEAR_WR   = 4'd9
   } state_t;
 
   state_t state;
@@ -80,6 +82,8 @@ module systolic_controller
   logic [4:0]  a_load_row_q;
   logic [4:0]  drain_row_q;
   logic [1:0]  drain_grp_q;
+  logic [31:0] dst_clear_row_idx_q;
+  logic [31:0] dst_clear_total_rows_q;
   logic [7:0]  a_tile_scratch [0:SYS_DIM-1][0:SYS_DIM-1];
 
   // Row-major drain address tracking.
@@ -131,9 +135,16 @@ module systolic_controller
   logic [31:0] src1_row_units, src2_row_units;
   logic [31:0] src1_logical_row, src2_logical_row;
   logic [31:0] src1_load_row_addr, src2_stream_row_addr;
+  logic [31:0] dispatch_m_tiles_w, dispatch_n_tiles_w, dispatch_clear_rows_w;
+  logic        needs_dst_preclear_w;
   always_comb begin
     src1_row_units = {21'h0, k_tiles_q};
     src2_row_units = {21'h0, n_tiles_q};
+
+    dispatch_m_tiles_w = {22'h0, tile_m} + 32'd1;
+    dispatch_n_tiles_w = {22'h0, tile_n} + 32'd1;
+    dispatch_clear_rows_w = (dispatch_m_tiles_w * dispatch_n_tiles_w) << 6;
+    needs_dst_preclear_w = !flags_accumulate && (dst_buf == BUF_ACCUM);
 
     src1_logical_row = ({21'h0, mtile_q} << 4) + {27'h0, a_load_row_q};
     src2_logical_row = ({21'h0, ktile_q} << 4) + {26'h0, lane_q};
@@ -164,6 +175,8 @@ module systolic_controller
       a_load_row_q <= 5'd0;
       drain_row_q <= 5'd0;
       drain_grp_q <= 2'd0;
+      dst_clear_row_idx_q <= 32'd0;
+      dst_clear_total_rows_q <= 32'd0;
       tile_drain_base_q <= 16'h0;
       drain_row_addr_q <= 16'h0;
       for (int row_idx = 0; row_idx < SYS_DIM; row_idx = row_idx + 1)
@@ -189,7 +202,30 @@ module systolic_controller
             ktile_q <= 11'd0;
             lane_q <= 6'd0;
             a_load_row_q <= 5'd0;
+            drain_row_q <= 5'd0;
+            drain_grp_q <= 2'd0;
+            dst_clear_row_idx_q <= 32'd0;
+            dst_clear_total_rows_q <= dispatch_clear_rows_w;
+            tile_drain_base_q <= dst_off;
+            drain_row_addr_q <= dst_off;
+            state <= needs_dst_preclear_w ? ST_DST_CLEAR_PREP : ST_INIT_TILE;
+          end
+        end
+
+        ST_DST_CLEAR_PREP: begin
+          dst_clear_row_idx_q <= 32'd0;
+          if (dst_clear_total_rows_q == 32'd0)
             state <= ST_INIT_TILE;
+          else
+            state <= ST_DST_CLEAR_WR;
+        end
+
+        ST_DST_CLEAR_WR: begin
+          if (dst_clear_row_idx_q + 32'd1 >= dst_clear_total_rows_q) begin
+            dst_clear_row_idx_q <= 32'd0;
+            state <= ST_INIT_TILE;
+          end else begin
+            dst_clear_row_idx_q <= dst_clear_row_idx_q + 32'd1;
           end
         end
 
@@ -342,6 +378,17 @@ module systolic_controller
         sram_a_wdata[63:32]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd1);
         sram_a_wdata[95:64]  = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd2);
         sram_a_wdata[127:96] = acc_at(drain_row_q, {1'b0, drain_grp_q, 2'b00} + 5'd3);
+      end
+
+      ST_DST_CLEAR_WR: begin
+        // Non-accumulating MATMUL starts from a clean architectural
+        // destination span. Clear the full padded ACCUM tile region once
+        // before the first compute tile begins.
+        sram_a_en = 1'b1;
+        sram_a_we = 1'b1;
+        sram_a_buf = dst_buf_q;
+        sram_a_row = dst_off_q + dst_clear_row_idx_q[15:0];
+        sram_a_wdata = 128'h0;
       end
 
       default: ;

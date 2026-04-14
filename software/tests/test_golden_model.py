@@ -762,6 +762,321 @@ class TestTraceRawSnapshots:
         assert trace["meta"]["trace_accum"]["scale"] == pytest.approx(1.25)
         assert trace["raw_events"][0]["raw_available"] is True
 
+    def test_accum_pre_matmul_trace_is_zeroed_for_golden_debug(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "block0_head0_qkt__accum_pre_matmul",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                }
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace(["block0_head0_qkt__accum_pre_matmul"])
+        values = np.array([7, -9, 11, -13], dtype=np.int32)
+        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, values.reshape(1, 4))
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_qkt__accum_pre_matmul"],
+            np.zeros((1, 4), dtype=np.int32),
+        )
+        assert trace["raw_events"][0]["raw_available"] is True
+        assert trace["raw_events"][0]["raw"] == [[0, 0, 0, 0]]
+
+    def test_qkt_stability_debug_traces_use_expected_raw_views(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "block0_head0_qkt__accum_pre_matmul_next",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                    "capture_phase": "retire_plus_1",
+                },
+                {
+                    "node_name": "block0_head0_qkt__accum_pre_softmax",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_qkt__accum_pre_softmax_next",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                    "capture_phase": "retire_plus_1",
+                },
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace([
+            "block0_head0_qkt__accum_pre_matmul_next",
+            "block0_head0_qkt__accum_pre_softmax",
+            "block0_head0_qkt__accum_pre_softmax_next",
+        ])
+        values = np.array([7, -9, 11, -13], dtype=np.int32)
+        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, values.reshape(1, 4))
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_qkt__accum_pre_matmul_next"],
+            np.zeros((1, 4), dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_qkt__accum_pre_softmax"],
+            values.reshape(1, 4),
+        )
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_qkt__accum_pre_softmax_next"],
+            values.reshape(1, 4),
+        )
+        assert trace["raw_events"][0]["capture_phase"] == "retire_plus_1"
+
+    def test_projection_padded_trace_zeroes_rows_beyond_logical_extent(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "block0_head0_query__act_input",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_query__act_input_padded",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 6,
+                    "mem_cols": 4,
+                    "logical_rows": 6,
+                    "logical_cols": 4,
+                    "full_rows": 6,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_query__accum_pre_bias",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_query__accum_pre_bias_padded",
+                    "buf_id": BUF_ACCUM,
+                    "offset_units": 0,
+                    "mem_rows": 6,
+                    "mem_cols": 4,
+                    "logical_rows": 6,
+                    "logical_cols": 4,
+                    "full_rows": 6,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int32",
+                    "scale": 0.125,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_query",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_head0_query__output_padded",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 6,
+                    "mem_cols": 4,
+                    "logical_rows": 6,
+                    "logical_cols": 4,
+                    "full_rows": 6,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace([
+            "block0_head0_query__act_input_padded",
+            "block0_head0_query__accum_pre_bias_padded",
+            "block0_head0_query__output_padded",
+        ])
+        accum_values = np.arange(24, dtype=np.int32).reshape(6, 4)
+        abuf_values = np.arange(24, dtype=np.int8).reshape(6, 4)
+        mem.write_int32_tile(sim.state, BUF_ACCUM, 0, accum_values)
+        mem.write_bytes(sim.state, BUF_ABUF, 0, abuf_values.tobytes())
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        expected_accum = accum_values.copy()
+        expected_accum[1:, :] = 0
+        expected_abuf = abuf_values.copy()
+        expected_abuf[1:, :] = 0
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_query__act_input_padded"],
+            expected_abuf,
+        )
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_query__accum_pre_bias_padded"],
+            expected_accum,
+        )
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_head0_query__output_padded"],
+            expected_abuf,
+        )
+
+    def test_block0_ln1_padded_input_zeroes_but_output_preserves_padded_rows(self):
+        program = Assembler().assemble("NOP\nHALT\n")
+        program.trace_manifest = {
+            0: [
+                {
+                    "node_name": "block0_ln1",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 1,
+                    "mem_cols": 4,
+                    "logical_rows": 1,
+                    "logical_cols": 4,
+                    "full_rows": 1,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_ln1__input_padded",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 6,
+                    "mem_cols": 4,
+                    "logical_rows": 6,
+                    "logical_cols": 4,
+                    "full_rows": 6,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+                {
+                    "node_name": "block0_ln1__output_padded",
+                    "buf_id": BUF_ABUF,
+                    "offset_units": 0,
+                    "mem_rows": 6,
+                    "mem_cols": 4,
+                    "logical_rows": 6,
+                    "logical_cols": 4,
+                    "full_rows": 6,
+                    "full_cols": 4,
+                    "row_start": 0,
+                    "dtype": "int8",
+                    "scale": 0.25,
+                    "when": "after",
+                },
+            ]
+        }
+        sim = Simulator()
+        sim.load_program(program)
+        sim.enable_trace([
+            "block0_ln1__input_padded",
+            "block0_ln1__output_padded",
+        ])
+        abuf_values = (np.arange(24, dtype=np.int16).reshape(6, 4) - 12).astype(np.int8)
+        mem.write_bytes(sim.state, BUF_ABUF, 0, abuf_values.tobytes())
+        sim.run()
+
+        trace = sim.get_trace_payload()
+        expected_input = abuf_values.copy()
+        expected_input[1:, :] = 0
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_ln1__input_padded"],
+            expected_input,
+        )
+        np.testing.assert_array_equal(
+            trace["raw_tensors"]["block0_ln1__output_padded"],
+            abuf_values,
+        )
+
     def test_virtual_trace_events_are_marked_non_architectural(self):
         program = Assembler().assemble("HALT\n")
         program.trace_manifest = {

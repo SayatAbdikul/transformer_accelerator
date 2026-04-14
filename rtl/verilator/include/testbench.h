@@ -33,6 +33,62 @@
 #include <algorithm>
 #include <utility>
 
+inline int sfu_round_half_even_fp32_scalar(float x) {
+    const long long floor_i = static_cast<long long>(std::floor(x));
+    const float frac = x - static_cast<float>(floor_i);
+    if (frac > 0.5f)
+        return static_cast<int>(floor_i + 1);
+    if (frac < 0.5f)
+        return static_cast<int>(floor_i);
+    if (floor_i & 1LL)
+        return static_cast<int>(floor_i + 1);
+    return static_cast<int>(floor_i);
+}
+
+extern "C" double sfu_fp32_round(double value_r) {
+    return static_cast<double>(static_cast<float>(value_r));
+}
+
+extern "C" double sfu_fp32_add(double lhs_r, double rhs_r) {
+    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) + static_cast<float>(rhs_r)));
+}
+
+extern "C" double sfu_fp32_sub(double lhs_r, double rhs_r) {
+    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) - static_cast<float>(rhs_r)));
+}
+
+extern "C" double sfu_fp32_mul(double lhs_r, double rhs_r) {
+    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) * static_cast<float>(rhs_r)));
+}
+
+extern "C" double sfu_fp32_div(double lhs_r, double rhs_r) {
+    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) / static_cast<float>(rhs_r)));
+}
+
+extern "C" double sfu_fp32_exp(double value_r) {
+    return static_cast<double>(static_cast<float>(std::exp(static_cast<float>(value_r))));
+}
+
+extern "C" double sfu_fp32_sqrt(double value_r) {
+    return static_cast<double>(static_cast<float>(std::sqrt(static_cast<float>(value_r))));
+}
+
+extern "C" double sfu_fp32_gelu(double value_r) {
+    const float x = static_cast<float>(value_r);
+    const float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+    const float y = x * 0.5f * (1.0f + std::erf(x * inv_sqrt2));
+    return static_cast<double>(y);
+}
+
+extern "C" int sfu_fp32_quantize_i8(double value_r, double out_scale_r) {
+    const float out_scale = static_cast<float>(out_scale_r);
+    if (out_scale == 0.0f)
+        return 0;
+    int q = sfu_round_half_even_fp32_scalar(static_cast<float>(value_r) / out_scale);
+    q = std::clamp(q, -128, 127);
+    return q;
+}
+
 // ============================================================================
 // ISA helper: build 64-bit big-endian instruction words
 // (Matches software/taccel/isa/encoding.py exactly)
@@ -497,6 +553,22 @@ inline void tick(Vtaccel_top* dut, AXI4SlaveModel& dram, int latency = 2) {
     dut->eval();
     dram.tick(dut, latency);  // update slave combinational outputs
     dut->eval();
+
+    dut->clk = 1;
+    dut->eval();
+}
+
+template <typename NegedgeObserver>
+inline void tick_with_negedge_observer(
+    Vtaccel_top* dut,
+    AXI4SlaveModel& dram,
+    NegedgeObserver&& observe_negedge,
+    int latency = 2) {
+    dut->clk = 0;
+    dut->eval();
+    dram.tick(dut, latency);
+    dut->eval();
+    observe_negedge();
 
     dut->clk = 1;
     dut->eval();

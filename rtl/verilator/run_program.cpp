@@ -1,4 +1,6 @@
 #include "testbench.h"
+#include "systolic_debug_artifacts.h"
+#include "systolic_window_trace.h"
 
 #include <cstdlib>
 #include <fstream>
@@ -43,6 +45,10 @@ struct CliOptions {
     std::string snapshot_request_path;
     std::string snapshot_manifest_out_path;
     std::string snapshot_data_out_path;
+    std::string systolic_window_json_out_path;
+    std::string accum_write_json_out_path;
+    std::string sram_write_json_out_path;
+    std::string systolic_hidden_snapshot_json_out_path;
     std::string patches_raw_path;
     std::string cls_raw_path;
     int patch_rows = 0;
@@ -50,6 +56,13 @@ struct CliOptions {
     int num_classes = 1000;
     int max_cycles = 500000;
     int latency = 2;
+    int systolic_window_start_pc = -1;
+    int systolic_window_end_pc = -1;
+    int accum_write_start_pc = -1;
+    int accum_write_end_pc = -1;
+    int sram_write_start_pc = -1;
+    int sram_write_end_pc = -1;
+    int systolic_hidden_snapshot_pc = -1;
     bool folded_pos_embed = false;
     int inject_next_rresp = -1;
     int inject_next_rlast = -1;
@@ -133,6 +146,7 @@ struct SnapshotRequest {
     std::string dtype;
     double scale = 0.0;
     std::string source;
+    std::string capture_phase = "retire_cycle";
 };
 
 struct SnapshotCapture {
@@ -141,6 +155,11 @@ struct SnapshotCapture {
     uint64_t cycle = 0;
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
+};
+
+struct PendingSnapshotCapture {
+    SnapshotRequest req;
+    uint64_t due_cycle = 0;
 };
 
 uint16_t read_be16(const std::vector<uint8_t>& data, size_t off) {
@@ -248,9 +267,9 @@ std::vector<SnapshotRequest> load_snapshot_requests(const std::string& path) {
             continue;
         }
         const auto fields = split_csv_line(line);
-        if (fields.size() != 15) {
+        if (fields.size() != 15 && fields.size() != 16) {
             std::ostringstream oss;
-            oss << "Bad snapshot request line " << lineno << ": expected 15 CSV fields";
+            oss << "Bad snapshot request line " << lineno << ": expected 15 or 16 CSV fields";
             throw std::runtime_error(oss.str());
         }
 
@@ -270,6 +289,15 @@ std::vector<SnapshotRequest> load_snapshot_requests(const std::string& path) {
         req.dtype = fields[12];
         req.scale = std::stod(fields[13]);
         req.source = fields[14];
+        if (fields.size() == 16) {
+            req.capture_phase = fields[15];
+        }
+        if (req.capture_phase != "retire_cycle" && req.capture_phase != "retire_plus_1") {
+            std::ostringstream oss;
+            oss << "Bad snapshot request line " << lineno
+                << ": unsupported capture_phase " << req.capture_phase;
+            throw std::runtime_error(oss.str());
+        }
         requests.push_back(req);
     }
 
@@ -308,6 +336,7 @@ std::string snapshot_manifest_to_json(const std::vector<SnapshotCapture>& captur
         oss << "      \"dtype\": \"" << json_escape(cap.req.dtype) << "\",\n";
         oss << "      \"scale\": " << cap.req.scale << ",\n";
         oss << "      \"source\": \"" << json_escape(cap.req.source) << "\",\n";
+        oss << "      \"capture_phase\": \"" << json_escape(cap.req.capture_phase) << "\",\n";
         oss << "      \"status\": \"" << json_escape(cap.status) << "\",\n";
         oss << "      \"cycle\": " << cap.cycle << ",\n";
         oss << "      \"byte_offset\": " << cap.byte_offset << ",\n";
@@ -602,6 +631,17 @@ void print_usage(const char* argv0) {
         << "  --snapshot-request <path>    Optional CSV snapshot request list\n"
         << "  --snapshot-manifest-out <p>  Snapshot manifest JSON output\n"
         << "  --snapshot-data-out <path>   Snapshot raw-data binary output\n"
+        << "  --systolic-window-start-pc <pc> Start PC for optional systolic microtrace window\n"
+        << "  --systolic-window-end-pc <pc>   End PC for optional systolic microtrace window\n"
+        << "  --systolic-window-json-out <p>  Optional systolic microtrace JSON output\n"
+        << "  --accum-write-start-pc <pc>   Start PC for optional ACCUM write provenance window\n"
+        << "  --accum-write-end-pc <pc>     End PC for optional ACCUM write provenance window\n"
+        << "  --accum-write-json-out <path> Optional ACCUM write provenance JSON output\n"
+        << "  --sram-write-start-pc <pc>    Start PC for optional generic SRAM write provenance window\n"
+        << "  --sram-write-end-pc <pc>      End PC for optional generic SRAM write provenance window\n"
+        << "  --sram-write-json-out <path>  Optional generic SRAM write provenance JSON output\n"
+        << "  --systolic-hidden-snapshot-pc <pc> Tagged retire PC for optional hidden systolic snapshot\n"
+        << "  --systolic-hidden-snapshot-json-out <path> Optional hidden systolic snapshot JSON output\n"
         << "  --patches-raw <path>         Raw INT8 patch rows\n"
         << "  --patch-rows <rows>          Patch row count for raw input\n"
         << "  --patch-cols <cols>          Patch column count before 16-byte padding\n"
@@ -686,6 +726,28 @@ CliOptions parse_args(int argc, char** argv) {
             opts.snapshot_manifest_out_path = need_value("--snapshot-manifest-out");
         } else if (arg == "--snapshot-data-out") {
             opts.snapshot_data_out_path = need_value("--snapshot-data-out");
+        } else if (arg == "--systolic-window-start-pc") {
+            opts.systolic_window_start_pc = std::stoi(need_value("--systolic-window-start-pc"));
+        } else if (arg == "--systolic-window-end-pc") {
+            opts.systolic_window_end_pc = std::stoi(need_value("--systolic-window-end-pc"));
+        } else if (arg == "--systolic-window-json-out") {
+            opts.systolic_window_json_out_path = need_value("--systolic-window-json-out");
+        } else if (arg == "--accum-write-start-pc") {
+            opts.accum_write_start_pc = std::stoi(need_value("--accum-write-start-pc"));
+        } else if (arg == "--accum-write-end-pc") {
+            opts.accum_write_end_pc = std::stoi(need_value("--accum-write-end-pc"));
+        } else if (arg == "--accum-write-json-out") {
+            opts.accum_write_json_out_path = need_value("--accum-write-json-out");
+        } else if (arg == "--sram-write-start-pc") {
+            opts.sram_write_start_pc = std::stoi(need_value("--sram-write-start-pc"));
+        } else if (arg == "--sram-write-end-pc") {
+            opts.sram_write_end_pc = std::stoi(need_value("--sram-write-end-pc"));
+        } else if (arg == "--sram-write-json-out") {
+            opts.sram_write_json_out_path = need_value("--sram-write-json-out");
+        } else if (arg == "--systolic-hidden-snapshot-pc") {
+            opts.systolic_hidden_snapshot_pc = std::stoi(need_value("--systolic-hidden-snapshot-pc"));
+        } else if (arg == "--systolic-hidden-snapshot-json-out") {
+            opts.systolic_hidden_snapshot_json_out_path = need_value("--systolic-hidden-snapshot-json-out");
         } else if (arg == "--patches-raw") {
             opts.patches_raw_path = need_value("--patches-raw");
         } else if (arg == "--patch-rows") {
@@ -742,6 +804,48 @@ CliOptions parse_args(int argc, char** argv) {
             "--snapshot-request, --snapshot-manifest-out, and --snapshot-data-out must be used together"
         );
     }
+    const bool window_enabled = !opts.systolic_window_json_out_path.empty() ||
+                                opts.systolic_window_start_pc >= 0 ||
+                                opts.systolic_window_end_pc >= 0;
+    if (window_enabled &&
+        (opts.systolic_window_json_out_path.empty() ||
+         opts.systolic_window_start_pc < 0 ||
+         opts.systolic_window_end_pc < 0)) {
+        throw std::runtime_error(
+            "--systolic-window-start-pc, --systolic-window-end-pc, and --systolic-window-json-out must be used together"
+        );
+    }
+    const bool accum_write_enabled = !opts.accum_write_json_out_path.empty() ||
+                                     opts.accum_write_start_pc >= 0 ||
+                                     opts.accum_write_end_pc >= 0;
+    if (accum_write_enabled &&
+        (opts.accum_write_json_out_path.empty() ||
+         opts.accum_write_start_pc < 0 ||
+         opts.accum_write_end_pc < 0)) {
+        throw std::runtime_error(
+            "--accum-write-start-pc, --accum-write-end-pc, and --accum-write-json-out must be used together"
+        );
+    }
+    const bool sram_write_enabled = !opts.sram_write_json_out_path.empty() ||
+                                    opts.sram_write_start_pc >= 0 ||
+                                    opts.sram_write_end_pc >= 0;
+    if (sram_write_enabled &&
+        (opts.sram_write_json_out_path.empty() ||
+         opts.sram_write_start_pc < 0 ||
+         opts.sram_write_end_pc < 0)) {
+        throw std::runtime_error(
+            "--sram-write-start-pc, --sram-write-end-pc, and --sram-write-json-out must be used together"
+        );
+    }
+    const bool hidden_snapshot_enabled = !opts.systolic_hidden_snapshot_json_out_path.empty() ||
+                                         opts.systolic_hidden_snapshot_pc >= 0;
+    if (hidden_snapshot_enabled &&
+        (opts.systolic_hidden_snapshot_json_out_path.empty() ||
+         opts.systolic_hidden_snapshot_pc < 0)) {
+        throw std::runtime_error(
+            "--systolic-hidden-snapshot-pc and --systolic-hidden-snapshot-json-out must be used together"
+        );
+    }
     return opts;
 }
 
@@ -761,6 +865,14 @@ int main(int argc, char** argv) {
     std::vector<RetireEvent> retire_events;
     std::vector<SnapshotCapture> snapshot_captures;
     std::vector<uint8_t> snapshot_bytes;
+    tbutil::SystolicWindowCollector window_collector(0, 0);
+    bool window_trace_enabled = false;
+    tbutil::AccumWriteLogCollector accum_write_collector(0, 0);
+    bool accum_write_log_enabled = false;
+    tbutil::SramWriteLogCollector sram_write_collector(0, 0);
+    bool sram_write_log_enabled = false;
+    tbutil::SystolicHiddenSnapshotCollector hidden_snapshot_collector(0);
+    bool hidden_snapshot_enabled = false;
 
     try {
         const auto program_bytes = read_file_bytes(opts.program_path);
@@ -804,7 +916,35 @@ int main(int argc, char** argv) {
 
         sim.start_once(opts.latency);
         auto* root = sim.dut->rootp;
+        window_trace_enabled = !opts.systolic_window_json_out_path.empty();
+        if (window_trace_enabled) {
+            window_collector = tbutil::SystolicWindowCollector(
+                uint64_t(opts.systolic_window_start_pc),
+                uint64_t(opts.systolic_window_end_pc)
+            );
+        }
+        accum_write_log_enabled = !opts.accum_write_json_out_path.empty();
+        if (accum_write_log_enabled) {
+            accum_write_collector = tbutil::AccumWriteLogCollector(
+                uint64_t(opts.accum_write_start_pc),
+                uint64_t(opts.accum_write_end_pc)
+            );
+        }
+        sram_write_log_enabled = !opts.sram_write_json_out_path.empty();
+        if (sram_write_log_enabled) {
+            sram_write_collector = tbutil::SramWriteLogCollector(
+                uint64_t(opts.sram_write_start_pc),
+                uint64_t(opts.sram_write_end_pc)
+            );
+        }
+        hidden_snapshot_enabled = !opts.systolic_hidden_snapshot_json_out_path.empty();
+        if (hidden_snapshot_enabled) {
+            hidden_snapshot_collector = tbutil::SystolicHiddenSnapshotCollector(
+                uint64_t(opts.systolic_hidden_snapshot_pc)
+            );
+        }
         size_t next_snapshot_req = 0;
+        std::vector<PendingSnapshotCapture> pending_snapshot_reqs;
         const bool want_retire_trace = !opts.trace_json_out_path.empty();
         const bool want_snapshots = !snapshot_requests.empty();
 
@@ -824,6 +964,55 @@ int main(int argc, char** argv) {
             }
         };
 
+        auto capture_snapshot_request = [&](const SnapshotRequest& req, uint64_t cycle) {
+            SnapshotCapture cap;
+            cap.req = req;
+            cap.cycle = cycle;
+            if (req.source == "virtual") {
+                cap.status = "skipped_virtual";
+            } else if (req.dtype == "int8") {
+                cap.status = "captured";
+                cap.byte_offset = snapshot_bytes.size();
+                cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols);
+                const auto bytes = tbutil::sram_read_bytes(
+                    sim.dut.get(),
+                    req.buf_id,
+                    size_t(req.offset_units) * 16u,
+                    size_t(cap.byte_size)
+                );
+                snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
+            } else if (req.dtype == "int32") {
+                cap.status = "captured";
+                cap.byte_offset = snapshot_bytes.size();
+                cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols) * 4u;
+                const auto bytes = tbutil::sram_read_bytes(
+                    sim.dut.get(),
+                    req.buf_id,
+                    size_t(req.offset_units) * 16u,
+                    size_t(cap.byte_size)
+                );
+                snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
+            } else {
+                cap.status = "unsupported_dtype";
+            }
+            snapshot_captures.push_back(cap);
+        };
+
+        auto capture_due_pending_snapshot_requests = [&](uint64_t cycle) {
+            if (!want_snapshots || pending_snapshot_reqs.empty()) {
+                return;
+            }
+            auto it = pending_snapshot_reqs.begin();
+            while (it != pending_snapshot_reqs.end()) {
+                if (it->due_cycle <= cycle) {
+                    capture_snapshot_request(it->req, cycle);
+                    it = pending_snapshot_reqs.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+
         auto capture_snapshot_requests_for_pc = [&](uint64_t cycle, uint64_t retired_pc) {
             if (!want_snapshots) {
                 return;
@@ -832,65 +1021,58 @@ int main(int argc, char** argv) {
             while (next_snapshot_req < snapshot_requests.size() &&
                    snapshot_requests[next_snapshot_req].pc == retired_pc) {
                 const auto& req = snapshot_requests[next_snapshot_req];
-                SnapshotCapture cap;
-                cap.req = req;
-                cap.cycle = cycle;
-                if (req.source == "virtual") {
-                    cap.status = "skipped_virtual";
-                } else if (req.dtype == "int8") {
-                    cap.status = "captured";
-                    cap.byte_offset = snapshot_bytes.size();
-                    cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols);
-                    const auto bytes = tbutil::sram_read_bytes(
-                        sim.dut.get(),
-                        req.buf_id,
-                        size_t(req.offset_units) * 16u,
-                        size_t(cap.byte_size)
-                    );
-                    snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
-                } else if (req.dtype == "int32") {
-                    cap.status = "captured";
-                    cap.byte_offset = snapshot_bytes.size();
-                    cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols) * 4u;
-                    const auto bytes = tbutil::sram_read_bytes(
-                        sim.dut.get(),
-                        req.buf_id,
-                        size_t(req.offset_units) * 16u,
-                        size_t(cap.byte_size)
-                    );
-                    snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
+                if (req.capture_phase == "retire_plus_1") {
+                    pending_snapshot_reqs.push_back(PendingSnapshotCapture{req, cycle + 1});
                 } else {
-                    cap.status = "unsupported_dtype";
+                    capture_snapshot_request(req, cycle);
                 }
-                snapshot_captures.push_back(cap);
                 next_snapshot_req++;
             }
         };
 
-        bool terminated = sim.dut->done || sim.dut->fault;
-        if (!terminated && (want_retire_trace || want_snapshots) &&
-            root->taccel_top__DOT__obs_retire_pulse_w) {
+        auto process_current_cycle = [&]() {
+            const bool retire_valid = root->taccel_top__DOT__obs_retire_pulse_w;
             const uint64_t retire_cycle = root->taccel_top__DOT__obs_cycle_count_q;
             const uint64_t retire_pc = root->taccel_top__DOT__obs_retire_pc_w;
             const int retire_opcode = int(root->taccel_top__DOT__obs_retire_opcode_w);
-            if (want_retire_trace) {
-                retire_events.push_back(RetireEvent{retire_cycle, retire_pc, retire_opcode});
-            }
-            capture_snapshot_requests_for_pc(retire_cycle, retire_pc);
-        }
-
-        for (int i = 0; !terminated && i < opts.max_cycles; ++i) {
-            tick(sim.dut.get(), sim.dram, opts.latency);
-            if ((want_retire_trace || want_snapshots) &&
-                root->taccel_top__DOT__obs_retire_pulse_w) {
-                const uint64_t retire_cycle = root->taccel_top__DOT__obs_cycle_count_q;
-                const uint64_t retire_pc = root->taccel_top__DOT__obs_retire_pc_w;
-                const int retire_opcode = int(root->taccel_top__DOT__obs_retire_opcode_w);
+            capture_due_pending_snapshot_requests(retire_cycle);
+            if (retire_valid) {
                 if (want_retire_trace) {
                     retire_events.push_back(RetireEvent{retire_cycle, retire_pc, retire_opcode});
                 }
                 capture_snapshot_requests_for_pc(retire_cycle, retire_pc);
             }
+            if (window_trace_enabled) {
+                window_collector.observe(root, retire_valid, retire_pc, retire_opcode);
+            }
+            if (accum_write_log_enabled) {
+                accum_write_collector.observe(root, retire_valid, retire_pc, retire_opcode);
+            }
+            if (sram_write_log_enabled) {
+                sram_write_collector.observe(root, retire_valid, retire_pc, retire_opcode);
+            }
+            if (hidden_snapshot_enabled) {
+                hidden_snapshot_collector.observe(root, retire_valid, retire_pc, retire_opcode);
+            }
+        };
+
+        auto process_negedge_sram_writes = [&]() {
+            if (!sram_write_log_enabled) {
+                return;
+            }
+            sram_write_collector.observe(
+                root,
+                root->taccel_top__DOT__obs_retire_pulse_w,
+                root->taccel_top__DOT__obs_retire_pc_w,
+                int(root->taccel_top__DOT__obs_retire_opcode_w));
+        };
+
+        bool terminated = sim.dut->done || sim.dut->fault;
+        process_current_cycle();
+
+        for (int i = 0; !terminated && i < opts.max_cycles; ++i) {
+            tick_with_negedge_observer(sim.dut.get(), sim.dram, process_negedge_sram_writes, opts.latency);
+            process_current_cycle();
             terminated = sim.dut->done || sim.dut->fault;
         }
 
@@ -898,7 +1080,8 @@ int main(int argc, char** argv) {
         // one cycle after the retiring/faulting event. Advance one extra cycle
         // after HALT/FAULT so the summary reflects the terminal instruction.
         if (terminated) {
-            tick(sim.dut.get(), sim.dram, opts.latency);
+            tick_with_negedge_observer(sim.dut.get(), sim.dram, process_negedge_sram_writes, opts.latency);
+            process_current_cycle();
         }
 
         summary = build_summary(sim.dut.get(), opts.num_classes);
@@ -914,6 +1097,17 @@ int main(int argc, char** argv) {
             );
             next_snapshot_req++;
         }
+        for (const auto& pending : pending_snapshot_reqs) {
+            snapshot_captures.push_back(
+                SnapshotCapture{
+                    pending.req,
+                    "missing_capture_phase",
+                    0,
+                    0,
+                    0,
+                }
+            );
+        }
         if (!terminated) {
             summary.status = "timeout";
             summary.timeout = true;
@@ -926,6 +1120,36 @@ int main(int argc, char** argv) {
         if (!opts.trace_json_out_path.empty()) {
             write_text_file(opts.trace_json_out_path, trace_to_json(retire_events, summary));
         }
+        if (!opts.systolic_window_json_out_path.empty()) {
+            tbutil::SystolicWindowTrace trace;
+            trace.window_start_pc = uint64_t(opts.systolic_window_start_pc >= 0 ? opts.systolic_window_start_pc : 0);
+            trace.window_end_pc = uint64_t(opts.systolic_window_end_pc >= 0 ? opts.systolic_window_end_pc : 0);
+            trace.reason = "parse_error";
+            write_text_file(opts.systolic_window_json_out_path, tbutil::systolic_window_trace_to_json(trace));
+        }
+        if (!opts.accum_write_json_out_path.empty()) {
+            tbutil::AccumWriteLog log;
+            log.window_start_pc = uint64_t(opts.accum_write_start_pc >= 0 ? opts.accum_write_start_pc : 0);
+            log.window_end_pc = uint64_t(opts.accum_write_end_pc >= 0 ? opts.accum_write_end_pc : 0);
+            log.reason = "parse_error";
+            write_text_file(opts.accum_write_json_out_path, tbutil::accum_write_log_to_json(log));
+        }
+        if (!opts.sram_write_json_out_path.empty()) {
+            tbutil::SramWriteLog log;
+            log.window_start_pc = uint64_t(opts.sram_write_start_pc >= 0 ? opts.sram_write_start_pc : 0);
+            log.window_end_pc = uint64_t(opts.sram_write_end_pc >= 0 ? opts.sram_write_end_pc : 0);
+            log.reason = "parse_error";
+            write_text_file(opts.sram_write_json_out_path, tbutil::sram_write_log_to_json(log));
+        }
+        if (!opts.systolic_hidden_snapshot_json_out_path.empty()) {
+            tbutil::SystolicHiddenSnapshot snapshot;
+            snapshot.requested_pc = uint64_t(opts.systolic_hidden_snapshot_pc >= 0 ? opts.systolic_hidden_snapshot_pc : 0);
+            snapshot.reason = "parse_error";
+            write_text_file(
+                opts.systolic_hidden_snapshot_json_out_path,
+                tbutil::hidden_snapshot_to_json(snapshot)
+            );
+        }
         return 2;
     }
 
@@ -936,6 +1160,30 @@ int main(int argc, char** argv) {
     if (!opts.snapshot_manifest_out_path.empty()) {
         write_text_file(opts.snapshot_manifest_out_path, snapshot_manifest_to_json(snapshot_captures));
         write_binary_file(opts.snapshot_data_out_path, snapshot_bytes);
+    }
+    if (!opts.systolic_window_json_out_path.empty()) {
+        write_text_file(
+            opts.systolic_window_json_out_path,
+            tbutil::systolic_window_trace_to_json(window_collector.finish())
+        );
+    }
+    if (!opts.accum_write_json_out_path.empty()) {
+        write_text_file(
+            opts.accum_write_json_out_path,
+            tbutil::accum_write_log_to_json(accum_write_collector.finish())
+        );
+    }
+    if (!opts.sram_write_json_out_path.empty()) {
+        write_text_file(
+            opts.sram_write_json_out_path,
+            tbutil::sram_write_log_to_json(sram_write_collector.finish())
+        );
+    }
+    if (!opts.systolic_hidden_snapshot_json_out_path.empty()) {
+        write_text_file(
+            opts.systolic_hidden_snapshot_json_out_path,
+            tbutil::hidden_snapshot_to_json(hidden_snapshot_collector.finish())
+        );
     }
 
     if (summary.timeout) {

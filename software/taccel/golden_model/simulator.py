@@ -151,6 +151,62 @@ class Simulator:
             "meta": self.trace_meta,
         }
 
+    def _trace_node_logical_shape(self, node_name: str) -> tuple[int, int]:
+        rows = 0
+        cols = 0
+        for events in self.trace_manifest.values():
+            for event in events:
+                if event["node_name"] != node_name:
+                    continue
+                row_start = int(event.get("row_start", 0))
+                rows = max(rows, row_start + int(event["logical_rows"]))
+                cols = max(cols, int(event["logical_cols"]))
+        return rows, cols
+
+    def _projection_padded_base_name(self, node_name: str) -> Optional[str]:
+        if node_name.endswith("__act_input_padded"):
+            base_name = node_name[:-7]
+        elif node_name.endswith("__accum_pre_bias_padded"):
+            base_name = node_name[:-7]
+        elif node_name.endswith("__accum_padded"):
+            base_name = node_name[:-7]
+        elif node_name.endswith("__output_padded"):
+            base_name = node_name[:-15]
+        else:
+            return None
+        if base_name.split("__", 1)[0].endswith(("_query", "_key", "_value")):
+            return base_name
+        return None
+
+    def _layernorm_padded_input_base_name(self, node_name: str) -> Optional[str]:
+        if node_name.endswith("__input_padded") and node_name.startswith("block") and "_ln1__" in node_name:
+            return node_name.removesuffix("__input_padded")
+        return None
+
+    def _zero_layernorm_input_padding(self, node_name: str, raw_view: np.ndarray) -> np.ndarray:
+        base_name = self._layernorm_padded_input_base_name(node_name)
+        if base_name is None:
+            return raw_view
+        logical_rows, logical_cols = self._trace_node_logical_shape(base_name)
+        padded = raw_view.copy()
+        if logical_rows < padded.shape[0]:
+            padded[logical_rows:, :] = 0
+        if logical_cols < padded.shape[1]:
+            padded[:, logical_cols:] = 0
+        return padded
+
+    def _zero_projection_padding(self, node_name: str, raw_view: np.ndarray) -> np.ndarray:
+        base_name = self._projection_padded_base_name(node_name)
+        if base_name is None:
+            return raw_view
+        logical_rows, logical_cols = self._trace_node_logical_shape(base_name)
+        padded = raw_view.copy()
+        if logical_rows < padded.shape[0]:
+            padded[logical_rows:, :] = 0
+        if logical_cols < padded.shape[1]:
+            padded[:, logical_cols:] = 0
+        return padded
+
     def step(self):
         """Execute one instruction."""
         if self.state.halted:
@@ -232,6 +288,7 @@ class Simulator:
                 "dtype": event["dtype"],
                 "scale": float(scale),
                 "source": source,
+                "capture_phase": str(event.get("capture_phase", "retire_cycle")),
                 "row_start": int(row_start),
                 "logical_rows": int(logical_rows),
                 "logical_cols": int(logical_cols),
@@ -256,14 +313,33 @@ class Simulator:
                 raw_event["scale"] = float(payload.get("scale", scale))
                 raw_event["raw_available"] = False
             elif event["dtype"] == "int32":
-                raw_tile = mem.read_int32_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
-                raw_view = raw_tile[:logical_rows, :logical_cols]
+                if (node_name.endswith("__accum_pre_matmul") or
+                        node_name.endswith("__accum_pre_matmul_next")):
+                    # Debug traces use this checkpoint to compare the intended
+                    # architectural pre-state for a fresh MATMUL strip. QK^T
+                    # dispatches in this path are non-accumulating, so the
+                    # golden reference should expose zeros here even if a prior
+                    # op happened to leave bytes in ACCUM.
+                    raw_view = np.zeros((logical_rows, logical_cols), dtype=np.int32)
+                elif (node_name.endswith("__accum_pre_softmax") or
+                      node_name.endswith("__accum_pre_softmax_next")):
+                    # These checkpoints intentionally mirror the stable QK^T
+                    # INT32 output at the softmax boundary.
+                    raw_tile = mem.read_int32_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
+                    raw_view = raw_tile[:logical_rows, :logical_cols]
+                else:
+                    raw_tile = mem.read_int32_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
+                    raw_view = raw_tile[:logical_rows, :logical_cols]
+                    raw_view = self._zero_layernorm_input_padding(node_name, raw_view)
+                    raw_view = self._zero_projection_padding(node_name, raw_view)
                 dequant = raw_view.astype(np.float32) * scale
                 raw_event["raw_available"] = True
                 raw_event["raw"] = raw_view.tolist()
             else:
                 raw_tile = mem.read_int8_tile(self.state, buf_id, offset_units, mem_rows, mem_cols)
                 raw_view = raw_tile[:logical_rows, :logical_cols]
+                raw_view = self._zero_layernorm_input_padding(node_name, raw_view)
+                raw_view = self._zero_projection_padding(node_name, raw_view)
                 dequant = raw_view.astype(np.float32) * scale
                 raw_event["raw_available"] = True
                 raw_event["raw"] = raw_view.tolist()

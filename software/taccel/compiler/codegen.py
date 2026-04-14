@@ -215,7 +215,8 @@ class CodeGenerator:
                             row_start: int = 0,
                             full_rows: Optional[int] = None,
                             full_cols: Optional[int] = None,
-                            pc: Optional[int] = None):
+                            pc: Optional[int] = None,
+                            capture_phase: str = "retire_cycle"):
         """Record how to snapshot a node tensor after an emitted instruction."""
         if logical_rows <= 0 or logical_cols <= 0:
             return
@@ -235,6 +236,7 @@ class CodeGenerator:
             "dtype": dtype,
             "scale": float(scale),
             "when": "after",
+            "capture_phase": capture_phase,
         }
         self.trace_manifest.setdefault(pc, []).append(event)
 
@@ -269,6 +271,10 @@ class CodeGenerator:
     def _should_trace_attention_projection_debug(self, node_name: str) -> bool:
         """Return True for per-head Q/K/V projections we may need to debug end-to-end."""
         return re.match(r"block\d+_head\d+_(query|key|value)$", node_name) is not None
+
+    def _should_trace_ln1_padding_debug(self, node_name: str) -> bool:
+        """Return True when a layernorm should emit padded input/output debug views."""
+        return node_name == "block0_ln1"
 
     def _residual1_skip_name(self, out_proj_name: str) -> str:
         match = re.match(r"block(\d+)_out_proj$", out_proj_name)
@@ -390,6 +396,17 @@ class CodeGenerator:
                 input_act_scale,
             )
             self._record_trace_event(
+                f"{node.name}__act_input_padded",
+                BUF_ABUF,
+                act_off,
+                M_pad,
+                K_pad,
+                M_pad,
+                K_pad,
+                "int8",
+                input_act_scale,
+            )
+            self._record_trace_event(
                 f"{node.name}__weight_input",
                 BUF_WBUF,
                 w_alloc.offset_units,
@@ -418,6 +435,17 @@ class CodeGenerator:
                 N_pad,
                 M,
                 N,
+                "int32",
+                accum_real_scale,
+            )
+            self._record_trace_event(
+                f"{node.name}__accum_pre_bias_padded",
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M_pad,
+                N_pad,
                 "int32",
                 accum_real_scale,
             )
@@ -450,6 +478,17 @@ class CodeGenerator:
                 N_pad,
                 M,
                 N,
+                "int32",
+                accum_real_scale,
+            )
+            self._record_trace_event(
+                f"{node.name}__accum_padded",
+                BUF_ACCUM,
+                0,
+                M_pad,
+                N_pad,
+                M_pad,
+                N_pad,
                 "int32",
                 accum_real_scale,
             )
@@ -514,6 +553,18 @@ class CodeGenerator:
             "int8",
             target_act_scale,
         )
+        if trace_projection_inputs:
+            self._record_trace_event(
+                f"{node.name}__output_padded",
+                BUF_ABUF,
+                out_alloc.offset_units,
+                M_pad,
+                N_pad,
+                M_pad,
+                N_pad,
+                "int8",
+                target_act_scale,
+            )
         if node.name == "classifier":
             self._record_trace_event(
                 node.name,
@@ -1179,6 +1230,43 @@ class CodeGenerator:
             logical_rows = max(0, min(TILE, seq_len - row_start))
             # CONFIG_TILE: M=1 strip (16 rows), N=full, K=head_dim
             self._emit(ConfigTileInsn(M=0, N=n_tiles - 1, K=k_tiles - 1))
+            qkt_config_pc = len(self.instructions) - 1
+            if trace_qkt_debug:
+                # Snapshot ACCUM immediately before the QK^T MATMUL. CONFIG_TILE
+                # itself does not mutate SRAM, so tracing at this PC gives us the
+                # architectural pre-state without adding a new "before" semantic
+                # to the trace manifest.
+                self._record_trace_event(
+                    f"{node.name}__accum_pre_matmul",
+                    BUF_ACCUM,
+                    0,
+                    TILE,
+                    M_pad,
+                    logical_rows,
+                    seq_len,
+                    "int32",
+                    qkt_in_scale,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=seq_len,
+                    pc=qkt_config_pc,
+                )
+                self._record_trace_event(
+                    f"{node.name}__accum_pre_matmul_next",
+                    BUF_ACCUM,
+                    0,
+                    TILE,
+                    M_pad,
+                    logical_rows,
+                    seq_len,
+                    "int32",
+                    qkt_in_scale,
+                    row_start=row_start,
+                    full_rows=seq_len,
+                    full_cols=seq_len,
+                    pc=qkt_config_pc,
+                    capture_phase="retire_plus_1",
+                )
 
             # Q strip offset: s * 16 rows * K_pad cols
             q_strip_off = q_alloc.offset_units + (s * TILE * K_pad) // UNIT
@@ -1282,6 +1370,39 @@ class CodeGenerator:
                     dst_buf=BUF_WBUF, dst_off=strip_wbuf_off,
                     sreg=sreg,
                 ))
+                softmax_pc = len(self.instructions) - 1
+                if trace_qkt_debug:
+                    self._record_trace_event(
+                        f"{node.name}__accum_pre_softmax",
+                        BUF_ACCUM,
+                        0,
+                        TILE,
+                        M_pad,
+                        logical_rows,
+                        seq_len,
+                        "int32",
+                        qkt_in_scale,
+                        row_start=row_start,
+                        full_rows=seq_len,
+                        full_cols=seq_len,
+                        pc=softmax_pc,
+                    )
+                    self._record_trace_event(
+                        f"{node.name}__accum_pre_softmax_next",
+                        BUF_ACCUM,
+                        0,
+                        TILE,
+                        M_pad,
+                        logical_rows,
+                        seq_len,
+                        "int32",
+                        qkt_in_scale,
+                        row_start=row_start,
+                        full_rows=seq_len,
+                        full_cols=seq_len,
+                        pc=softmax_pc,
+                        capture_phase="retire_plus_1",
+                    )
                 self._emit(SyncInsn(resource_mask=0b100))
                 self._record_trace_event(
                     softmax_name,
@@ -1556,6 +1677,20 @@ class CodeGenerator:
                    self.mem.abuf.alloc(node.inputs[0], M_pad * N_pad)
         gb_alloc = self.mem.wbuf.get(f"gb_{node.name}")
         gb_off = gb_alloc.offset_units if gb_alloc else 0
+        trace_ln1_padding = self._should_trace_ln1_padding_debug(node.name)
+
+        if trace_ln1_padding:
+            self._record_trace_event(
+                f"{node.name}__input_padded",
+                BUF_ABUF,
+                in_alloc.offset_units,
+                M_pad,
+                N_pad,
+                M_pad,
+                N_pad,
+                "int8",
+                in_scale,
+            )
 
         out_alloc = self.mem.abuf.alloc(node.name, M_pad * N_pad)
         self._emit(LayernormInsn(
@@ -1576,6 +1711,18 @@ class CodeGenerator:
             "int8",
             out_scale,
         )
+        if trace_ln1_padding:
+            self._record_trace_event(
+                f"{node.name}__output_padded",
+                BUF_ABUF,
+                out_alloc.offset_units,
+                M_pad,
+                N_pad,
+                M_pad,
+                N_pad,
+                "int8",
+                out_scale,
+            )
 
         if gb_alloc:
             self.mem.wbuf.free(f"gb_{node.name}")
