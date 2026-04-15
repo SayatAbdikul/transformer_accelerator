@@ -313,6 +313,9 @@ module control_unit
               end
 
               // Systolic matmul is also asynchronous from the control FSM.
+              // DST_CLEAR uses SRAM port A; the helper engine holds higher SRAM
+              // priority, so MATMUL must not be dispatched while helper is busy
+              // or DST_CLEAR writes would be silently dropped.
               OP_MATMUL: begin
                 if (!tile_valid) begin
                   fault_code_r <= 4'(FAULT_NO_CONFIG);
@@ -321,7 +324,7 @@ module control_unit
                   obs_ctrl_fault_pc     <= pc_reg;
                   obs_ctrl_fault_opcode <= insn.opcode;
                   state        <= S_FAULT;
-                end else if (sfu_busy) begin
+                end else if (sfu_busy || helper_busy) begin
                   state <= S_ISSUE;
                 end else begin
                   obs_retire_pulse  <= 1'b1;
@@ -467,7 +470,7 @@ module control_unit
               dma_dispatch = !sfu_busy;
 
             OP_MATMUL:
-              sys_dispatch = tile_valid && !sfu_busy;
+              sys_dispatch = tile_valid && !sfu_busy && !helper_busy;
 
             OP_BUF_COPY:
               helper_dispatch = helper_ready_now;

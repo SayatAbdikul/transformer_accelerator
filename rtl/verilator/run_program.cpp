@@ -974,23 +974,35 @@ int main(int argc, char** argv) {
                 cap.status = "captured";
                 cap.byte_offset = snapshot_bytes.size();
                 cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols);
-                const auto bytes = tbutil::sram_read_bytes(
+                // Use tile-layout reader: handles both padded (mem_cols > logical_cols)
+                // and unpadded (mem_cols == logical_cols) cases correctly.
+                const auto bytes = tbutil::sfu_read_logical_i8(
                     sim.dut.get(),
                     req.buf_id,
-                    size_t(req.offset_units) * 16u,
-                    size_t(cap.byte_size)
+                    req.offset_units, req.mem_cols,
+                    req.logical_rows, req.logical_cols
                 );
                 snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
             } else if (req.dtype == "int32") {
                 cap.status = "captured";
                 cap.byte_offset = snapshot_bytes.size();
                 cap.byte_size = uint64_t(req.logical_rows) * uint64_t(req.logical_cols) * 4u;
-                const auto bytes = tbutil::sram_read_bytes(
-                    sim.dut.get(),
-                    req.buf_id,
-                    size_t(req.offset_units) * 16u,
-                    size_t(cap.byte_size)
-                );
+                std::vector<uint8_t> bytes;
+                if (req.buf_id == tbutil::BUF_ACCUM_ID) {
+                    // ACCUM uses tile-major physical layout; convert to logical row-major.
+                    bytes = tbutil::accum_read_logical_i32(
+                        sim.dut.get(),
+                        req.offset_units, req.mem_cols,
+                        req.logical_rows, req.logical_cols
+                    );
+                } else {
+                    bytes = tbutil::sram_read_bytes(
+                        sim.dut.get(),
+                        req.buf_id,
+                        size_t(req.offset_units) * 16u,
+                        size_t(cap.byte_size)
+                    );
+                }
                 snapshot_bytes.insert(snapshot_bytes.end(), bytes.begin(), bytes.end());
             } else {
                 cap.status = "unsupported_dtype";

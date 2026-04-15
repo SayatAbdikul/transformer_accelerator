@@ -166,7 +166,11 @@ def test_runner_snapshot_captures_int8_rows(tmp_path: Path):
     snapshot_manifest = tmp_path / "snapshot_manifest.json"
     snapshot_data = tmp_path / "snapshot_data.bin"
     snapshot_request.write_text(
-        "3,0,trace_abuf,0,0,1,1,1,16,1,16,0,int8,1,architectural\n"
+        # fields: pc, event_index, node_name, buf_id, offset_units,
+        #         mem_rows, mem_cols, logical_rows, logical_cols,
+        #         full_rows, full_cols, row_start, dtype, scale, source
+        # mem_cols=16: 1 tile × 16 bytes for a 16-element INT8 row
+        "3,0,trace_abuf,0,0,1,16,1,16,1,16,0,int8,1,architectural\n"
     )
 
     proc = _run_runner(
@@ -214,7 +218,11 @@ def test_runner_snapshot_captures_int32_rows(tmp_path: Path):
     snapshot_manifest = tmp_path / "snapshot_manifest.json"
     snapshot_data = tmp_path / "snapshot_data.bin"
     snapshot_request.write_text(
-        "3,0,trace_accum,2,0,1,1,1,4,1,4,0,int32,1,architectural\n"
+        # fields: pc, event_index, node_name, buf_id, offset_units,
+        #         mem_rows, mem_cols, logical_rows, logical_cols,
+        #         full_rows, full_cols, row_start, dtype, scale, source
+        # mem_cols=16: ceil(4/16)*16=16 (1 tile) for a 4-element INT32 row
+        "3,0,trace_accum,2,0,1,16,1,4,1,4,0,int32,1,architectural\n"
     )
 
     proc = _run_runner(
@@ -266,8 +274,8 @@ def test_runner_snapshot_supports_retire_plus_1_phase(tmp_path: Path):
     snapshot_request.write_text(
         "\n".join(
             [
-                "4,0,trace_accum_cycle,2,0,1,1,1,4,1,4,0,int32,1,architectural,retire_cycle",
-                "4,1,trace_accum_plus1,2,0,1,1,1,4,1,4,0,int32,1,architectural,retire_plus_1",
+                "4,0,trace_accum_cycle,2,0,1,16,1,4,1,4,0,int32,1,architectural,retire_cycle",
+                "4,1,trace_accum_plus1,2,0,1,16,1,4,1,4,0,int32,1,architectural,retire_plus_1",
             ]
         ) + "\n"
     )

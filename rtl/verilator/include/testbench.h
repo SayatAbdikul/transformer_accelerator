@@ -693,6 +693,100 @@ inline std::vector<uint8_t> sram_read_bytes(Vtaccel_top* dut, int buf_id,
     return out;
 }
 
+// Read ACCUM buffer in logical row-major order.
+//
+// The RTL systolic drain stores results in a tile-major physical layout:
+//   physical_row = m * M_stride + n_tile * 4 + col_group
+// where M_stride = mem_cols / 4 = N_tiles * 4.
+//
+// This function reads all needed physical rows and rearranges them into the
+// logical (rows, cols) row-major layout matching the golden model's flat int32
+// array. Returns logical_rows * logical_cols * 4 bytes, little-endian int32.
+inline std::vector<uint8_t> accum_read_logical_i32(
+    Vtaccel_top* dut,
+    int offset_units, int mem_cols,
+    int logical_rows, int logical_cols
+) {
+    if (mem_cols < 16 || (mem_cols % 16) != 0) {
+        throw std::runtime_error(
+            "accum_read_logical_i32: mem_cols=" + std::to_string(mem_cols) +
+            " must be a positive multiple of 16");
+    }
+    const int m_stride = mem_cols / 4;  // N_tiles * 4 physical rows per logical row
+    const size_t total_phys_rows = size_t(logical_rows) * size_t(m_stride);
+    const size_t phys_start = size_t(offset_units) * 16u;
+
+    // One contiguous read covering all needed physical rows
+    const auto phys = sram_read_bytes(dut, BUF_ACCUM_ID,
+                                      phys_start,
+                                      total_phys_rows * 16u);
+
+    // Rearrange from tile-major to logical row-major
+    const size_t out_bytes = size_t(logical_rows) * size_t(logical_cols) * 4u;
+    std::vector<uint8_t> out(out_bytes, 0);
+
+    for (int m = 0; m < logical_rows; m++) {
+        for (int n = 0; n < logical_cols; n++) {
+            const int n_tile      = n / 16;
+            const int col_in_tile = n % 16;
+            const int col_group   = col_in_tile / 4;
+            const int col_in_grp  = col_in_tile % 4;
+            const int phys_row    = m * m_stride + n_tile * 4 + col_group;
+            const size_t phys_off = size_t(phys_row) * 16u + size_t(col_in_grp) * 4u;
+            const size_t log_off  = (size_t(m) * size_t(logical_cols) + size_t(n)) * 4u;
+            out[log_off + 0] = phys[phys_off + 0];
+            out[log_off + 1] = phys[phys_off + 1];
+            out[log_off + 2] = phys[phys_off + 2];
+            out[log_off + 3] = phys[phys_off + 3];
+        }
+    }
+    return out;
+}
+
+// Read a tile-padded int8 buffer (ABUF, WBUF) in logical row-major order.
+//
+// SFU operations (SOFTMAX, LAYERNORM, GELU) store results using a row-tile
+// layout:  physical_row = m * n_tiles + n / 16,  byte_offset = n % 16
+// where n_tiles = mem_cols / 16.  When logical_cols is not a multiple of 16
+// the last tile of each row contains padding that must be skipped.
+//
+// This function reads all needed physical rows and extracts only the valid
+// logical elements.  Returns logical_rows * logical_cols bytes.
+// When mem_cols == logical_cols the result is identical to a plain flat read.
+inline std::vector<uint8_t> sfu_read_logical_i8(
+    Vtaccel_top* dut,
+    int buf_id,
+    int offset_units, int mem_cols,
+    int logical_rows, int logical_cols
+) {
+    if (mem_cols < 16 || (mem_cols % 16) != 0) {
+        throw std::runtime_error(
+            "sfu_read_logical_i8: mem_cols=" + std::to_string(mem_cols) +
+            " must be a positive multiple of 16");
+    }
+    const int n_tiles = mem_cols / 16;
+    const size_t total_phys_rows = size_t(logical_rows) * size_t(n_tiles);
+    const size_t phys_start = size_t(offset_units) * 16u;
+
+    const auto phys = sram_read_bytes(dut, buf_id,
+                                      phys_start,
+                                      total_phys_rows * 16u);
+
+    const size_t out_bytes = size_t(logical_rows) * size_t(logical_cols);
+    std::vector<uint8_t> out(out_bytes, 0);
+
+    for (int m = 0; m < logical_rows; m++) {
+        for (int n = 0; n < logical_cols; n++) {
+            const int phys_row = m * n_tiles + n / 16;
+            const int byte_off = n % 16;
+            const size_t phys_pos = size_t(phys_row) * 16u + size_t(byte_off);
+            const size_t log_pos  = size_t(m) * size_t(logical_cols) + size_t(n);
+            out[log_pos] = phys[phys_pos];
+        }
+    }
+    return out;
+}
+
 inline std::vector<uint8_t> make_pattern(size_t size, uint8_t seed) {
     std::vector<uint8_t> data(size);
     for (size_t i = 0; i < size; ++i)

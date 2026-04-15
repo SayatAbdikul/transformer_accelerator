@@ -66,6 +66,11 @@ module blocking_helper_engine
   input  logic         sram_b_fault
 );
 
+  import "DPI-C" function real sfu_fp32_round(input real value_r);
+  import "DPI-C" function real sfu_fp32_mul(input real lhs_r, input real rhs_r);
+  import "DPI-C" function real sfu_fp32_add(input real lhs_r, input real rhs_r);
+  import "DPI-C" function int  sfu_fp32_quantize_i8(input real value_r, input real out_scale_r);
+
   // State groups:
   //   H_FLAT_*   : BUF_COPY flat copy / memmove
   //   H_TSRC_*   : BUF_COPY transpose source gather
@@ -333,6 +338,7 @@ module blocking_helper_engine
                        (1.0 + (real'(frac_bits) / 1024.0)) *
                        pow2_int(integer'(exp_bits) - 15);
       end
+      fp16_to_real = sfu_fp32_round(fp16_to_real);
     end
   endfunction
 
@@ -430,8 +436,11 @@ module blocking_helper_engine
           default: src_i32 = row3[(idx[1:0] * 32) +: 32];
         endcase
         skip_i8 = skip_row[(idx * 8) +: 8];
-        sum_r = real'(src_i32) * accum_scale_r + real'(skip_i8) * skip_scale_r;
-        q_i = round_half_even(sum_r);
+        sum_r = sfu_fp32_add(
+            sfu_fp32_mul(sfu_fp32_round(real'(src_i32)), accum_scale_r),
+            sfu_fp32_mul(sfu_fp32_round(real'(skip_i8)), skip_scale_r)
+        );
+        q_i = integer'(sfu_fp32_quantize_i8(sum_r, 1.0));
         if (q_i > 127)
           out_row[(idx * 8) +: 8] = 8'h7F;
         else if (q_i < -128)
