@@ -50,6 +50,11 @@ inline void append_load_sync(std::vector<uint64_t>& prog, int reg, uint64_t addr
   prog.push_back(insn::SYNC(0b001));
 }
 
+inline void append_prepare_a_tile(std::vector<uint64_t>& prog, int reg, uint64_t addr,
+                                  int abuf_off, int xfer_len = (SYS_DIM * SYS_DIM) / 16) {
+  append_load_sync(prog, reg, addr, BUF_ABUF_ID, abuf_off, xfer_len);
+}
+
 inline std::vector<uint8_t> flatten_16x16(const int8_t (&m)[16][16]) {
   std::vector<uint8_t> out(16 * 16);
   for (int r = 0; r < 16; ++r) {

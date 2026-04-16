@@ -119,6 +119,41 @@ def _collect_image_paths(args: argparse.Namespace) -> list[Path]:
     return paths
 
 
+def _rtl_execution_ok(runner_rc: int, rtl: dict[str, Any]) -> bool:
+    violations = rtl.get("violations") or []
+    return (
+        runner_rc == 0
+        and rtl.get("status") == "halted"
+        and not bool(rtl.get("fault", False))
+        and not bool(rtl.get("timeout", False))
+        and not violations
+    )
+
+
+def _compare_logits_with_execution(
+    golden_logits: list[int],
+    rtl_logits: list[int],
+    runner_rc: int,
+    rtl: dict[str, Any],
+) -> dict[str, Any]:
+    golden_top1 = int(np.argmax(golden_logits)) if golden_logits else -1
+    rtl_top1 = int(np.argmax(rtl_logits)) if rtl_logits else -1
+    raw_logits_exact = golden_logits == rtl_logits
+    raw_top1_match = golden_top1 == rtl_top1
+    execution_ok = _rtl_execution_ok(runner_rc, rtl)
+
+    return {
+        "golden_top1": golden_top1,
+        "rtl_top1": rtl_top1,
+        "raw_logits_exact_match": raw_logits_exact,
+        "raw_top1_match": raw_top1_match,
+        "execution_ok": execution_ok,
+        "logits_exact_match": execution_ok and raw_logits_exact,
+        "top1_match": execution_ok and raw_top1_match,
+        "rtl_violations": list(rtl.get("violations") or []),
+    }
+
+
 # ─── per-image runner ─────────────────────────────────────────────────────────
 
 def run_single_image(
@@ -203,18 +238,16 @@ def run_single_image(
 
     # ── 5. Compare ────────────────────────────────────────────────────────────
     rtl_logits = (rtl.get("logits") or [])[:num_classes]
-    golden_top1 = int(np.argmax(golden_logits_list))
-    rtl_top1    = int(np.argmax(rtl_logits)) if rtl_logits else -1
-
-    logits_exact = (golden_logits_list == rtl_logits)
-    top1_match   = (golden_top1 == rtl_top1)
+    compare_fields = _compare_logits_with_execution(
+        golden_logits=golden_logits_list,
+        rtl_logits=rtl_logits,
+        runner_rc=runner_rc,
+        rtl=rtl,
+    )
 
     result = {
         "image":              str(img_path),
-        "golden_top1":        golden_top1,
-        "rtl_top1":           rtl_top1,
-        "top1_match":         top1_match,
-        "logits_exact_match": logits_exact,
+        **compare_fields,
         "rtl_status":         rtl.get("status", "unknown"),
         "rtl_fault":          bool(rtl.get("fault", False)),
         "rtl_timeout":        bool(rtl.get("timeout", False)),
@@ -237,11 +270,15 @@ def _error_result(img_path: Path, msg: str) -> dict[str, Any]:
         "image":              str(img_path),
         "golden_top1":        -1,
         "rtl_top1":           -1,
+        "raw_top1_match":     False,
+        "raw_logits_exact_match": False,
+        "execution_ok":       False,
         "top1_match":         False,
         "logits_exact_match": False,
         "rtl_status":         "error",
         "rtl_fault":          False,
         "rtl_timeout":        False,
+        "rtl_violations":     [],
         "rtl_cycles":         0,
         "golden_cycles":      0,
         "runner_exit_code":   -1,
@@ -263,6 +300,12 @@ def _print_progress(idx: int, total: int, result: dict[str, Any]) -> None:
         note = "  [RTL FAULT]"
     elif result["rtl_timeout"]:
         note = "  [RTL TIMEOUT]"
+    elif result["runner_exit_code"] != 0:
+        note = f"  [RTL EXIT {result['runner_exit_code']}]"
+    elif result["rtl_status"] != "halted":
+        note = f"  [RTL STATUS {result['rtl_status']}]"
+    elif result.get("rtl_violations"):
+        note = f"  [RTL VIOLATIONS: {','.join(result['rtl_violations'])}]"
     elif not result["logits_exact_match"] and not result["top1_match"]:
         note = f"  [golden={result['golden_top1']} rtl={result['rtl_top1']}]"
     elif not result["logits_exact_match"]:
@@ -276,6 +319,7 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
     n = len(results)
     exact    = sum(1 for r in results if r["logits_exact_match"])
     top1     = sum(1 for r in results if r["top1_match"])
+    clean    = sum(1 for r in results if r.get("execution_ok"))
     faults   = sum(1 for r in results if r["rtl_fault"])
     timeouts = sum(1 for r in results if r["rtl_timeout"])
     errors   = sum(1 for r in results if r["error"])
@@ -285,6 +329,7 @@ def _print_summary(results: list[dict[str, Any]]) -> None:
     print("          Batch Summary")
     print("=" * 45)
     print(f"  Images tested:        {n}")
+    print(f"  Clean RTL executions: {clean}/{n}  ({100*clean/n:.1f}%)")
     print(f"  Logits exact match:   {exact}/{n}  ({100*exact/n:.1f}%)")
     print(f"  Top-1 agreement:      {top1}/{n}  ({100*top1/n:.1f}%)")
     if faults:
@@ -413,6 +458,7 @@ def main() -> None:
         n = len(results)
         summary = {
             "total_images":       n,
+            "execution_ok":       sum(1 for r in results if r.get("execution_ok")),
             "logits_exact_match": sum(1 for r in results if r["logits_exact_match"]),
             "top1_agreement":     sum(1 for r in results if r["top1_match"]),
             "rtl_faults":         sum(1 for r in results if r["rtl_fault"]),
