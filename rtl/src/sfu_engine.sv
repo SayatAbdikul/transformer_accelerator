@@ -25,6 +25,7 @@
 
 module sfu_engine
   import taccel_pkg::*;
+  import fp32_prim_pkg::*;
 (
   input  logic         clk,
   input  logic         rst_n,
@@ -64,10 +65,6 @@ module sfu_engine
   input  logic         sram_b_fault
 );
 
-  import "DPI-C" function real sfu_fp32_round(input real value_r);
-  import "DPI-C" function real sfu_fp32_add(input real lhs_r, input real rhs_r);
-  import "DPI-C" function real sfu_fp32_sub(input real lhs_r, input real rhs_r);
-  import "DPI-C" function real sfu_fp32_mul(input real lhs_r, input real rhs_r);
   import "DPI-C" function real sfu_fp32_div(input real lhs_r, input real rhs_r);
   import "DPI-C" function real sfu_fp32_exp(input real value_r);
   import "DPI-C" function real sfu_fp32_sqrt(input real value_r);
@@ -233,7 +230,7 @@ module sfu_engine
                        (1.0 + (real'(frac_bits) / 1024.0)) *
                        pow2_int(integer'(exp_bits) - 15);
       end
-      fp16_to_real = sfu_fp32_round(fp16_to_real);
+      fp16_to_real = fp32_round_real(fp16_to_real);
     end
   endfunction
 
@@ -437,17 +434,17 @@ module sfu_engine
       if (idx < integer'(n_elems_q))
         row_write_data_w[(lane * 8) +: 8] = out_bytes_q[idx];
 
-      x_r = sfu_fp32_mul(real'(get_i8(gelu_i8_row_q, lane)), scale0_q);
+      x_r = fp32_mul_real(real'(get_i8(gelu_i8_row_q, lane)), scale0_q);
       gelu_i8_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
 
       if (lane < 4) begin
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row0_q, lane)), scale0_q);
+        x_r = fp32_mul_real(real'(get_i32(gelu_row0_q, lane)), scale0_q);
         gelu_i32_write_data_w[(lane * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row1_q, lane)), scale0_q);
+        x_r = fp32_mul_real(real'(get_i32(gelu_row1_q, lane)), scale0_q);
         gelu_i32_write_data_w[((lane + 4) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row2_q, lane)), scale0_q);
+        x_r = fp32_mul_real(real'(get_i32(gelu_row2_q, lane)), scale0_q);
         gelu_i32_write_data_w[((lane + 8) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
-        x_r = sfu_fp32_mul(real'(get_i32(gelu_row3_q, lane)), scale0_q);
+        x_r = fp32_mul_real(real'(get_i32(gelu_row3_q, lane)), scale0_q);
         gelu_i32_write_data_w[((lane + 12) * 8) +: 8] = quantize_to_i8(gelu_real(x_r), scale1_q);
       end
 
@@ -627,7 +624,7 @@ module sfu_engine
           for (int lane = 0; lane < 16; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i8(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_real(real'(get_i8(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < {2'h0, n_tiles_q}) begin
@@ -654,7 +651,7 @@ module sfu_engine
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(n_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_real(real'(get_i32(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < n_chunks_i32_q) begin
@@ -680,14 +677,14 @@ module sfu_engine
             exp_sum_r = 0.0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
-                exp_sum_r = sfu_fp32_add(exp_sum_r, exp_r);
+                exp_r = sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r));
+                exp_sum_r = fp32_add_real(exp_sum_r, exp_r);
               end
             end
 
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
-                exp_r = sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r));
+                exp_r = sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r));
                 out_bytes_q[i] <= quantize_to_i8(sfu_fp32_div(exp_r, exp_sum_r), scale1_q);
               end
             end
@@ -699,7 +696,7 @@ module sfu_engine
             sum_r = 0.0;
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q))
-                sum_r = sfu_fp32_add(sum_r, row_data_q[i]);
+                sum_r = fp32_add_real(sum_r, row_data_q[i]);
             end
             mean_r = sfu_fp32_div(sum_r, real'(n_elems_q));
 
@@ -707,12 +704,12 @@ module sfu_engine
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               if (i < integer'(n_elems_q)) begin
                 real diff_r;
-                diff_r = sfu_fp32_sub(row_data_q[i], mean_r);
-                var_r = sfu_fp32_add(var_r, sfu_fp32_mul(diff_r, diff_r));
+                diff_r = fp32_sub_real(row_data_q[i], mean_r);
+                var_r = fp32_add_real(var_r, fp32_mul_real(diff_r, diff_r));
               end
             end
             var_r = sfu_fp32_div(var_r, real'(n_elems_q));
-            denom_r = sfu_fp32_sqrt(sfu_fp32_add(var_r, LN_EPS));
+            denom_r = sfu_fp32_sqrt(fp32_add_real(var_r, LN_EPS));
             ln_debug_mean_q <= mean_r;
             ln_debug_var_q <= var_r;
             ln_debug_denom_q <= denom_r;
@@ -720,9 +717,9 @@ module sfu_engine
             for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
               real y_r;
               if (i < integer'(n_elems_q)) begin
-                y_r = sfu_fp32_add(
-                    sfu_fp32_mul(
-                        sfu_fp32_div(sfu_fp32_sub(row_data_q[i], mean_r), denom_r),
+                y_r = fp32_add_real(
+                    fp32_mul_real(
+                        sfu_fp32_div(fp32_sub_real(row_data_q[i], mean_r), denom_r),
                         gamma_q[i]),
                     beta_q[i]);
                 out_bytes_q[i] <= quantize_to_i8(y_r, scale1_q);
@@ -849,7 +846,7 @@ module sfu_engine
           for (int lane = 0; lane < 4; lane++) begin
             if ((base_idx + lane) < integer'(k_elems_q))
               row_data_q[base_idx + lane] <=
-                  sfu_fp32_mul(real'(get_i32(sram_b_rdata, lane)), scale0_q);
+                  fp32_mul_real(real'(get_i32(sram_b_rdata, lane)), scale0_q);
           end
 
           if (read_idx_q + 13'd1 < k_chunks_i32_q) begin
@@ -872,8 +869,8 @@ module sfu_engine
           exp_sum_r = 0.0;
           for (int i = 0; i < SFU_MAX_ROW_ELEMS; i++) begin
             if (i < integer'(k_elems_q))
-              exp_sum_r = sfu_fp32_add(
-                  exp_sum_r, sfu_fp32_exp(sfu_fp32_sub(row_data_q[i], row_max_r)));
+              exp_sum_r = fp32_add_real(
+                  exp_sum_r, sfu_fp32_exp(fp32_sub_real(row_data_q[i], row_max_r)));
             if (i < integer'(n_elems_q))
               attn_accum_q[i] <= 0.0;
           end
@@ -898,16 +895,16 @@ module sfu_engine
         F_ATTN_V_LATCH: begin
           real weight_r;
           weight_r = sfu_fp32_div(
-              sfu_fp32_exp(sfu_fp32_sub(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
+              sfu_fp32_exp(fp32_sub_real(row_data_q[integer'(attn_k_idx_q)], attn_row_max_q)),
               attn_exp_sum_q);
           for (int lane = 0; lane < 16; lane++) begin
             integer idx;
             idx = integer'(read_idx_q) * 16 + lane;
             if (idx < integer'(n_elems_q))
-              attn_accum_q[idx] <= sfu_fp32_add(
+              attn_accum_q[idx] <= fp32_add_real(
                   attn_accum_q[idx],
-                  sfu_fp32_mul(
-                      sfu_fp32_mul(weight_r, real'(get_i8(sram_b_rdata, lane))),
+                  fp32_mul_real(
+                      fp32_mul_real(weight_r, real'(get_i8(sram_b_rdata, lane))),
                       scale1_q));
           end
 

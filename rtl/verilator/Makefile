@@ -29,8 +29,10 @@ BUILD_DIR     := build
 
 # Source file lists
 PKG           := $(INCLUDE_DIR)/taccel_pkg.sv
+FP32_PKG      := $(INCLUDE_DIR)/fp32_prim_pkg.sv
 DECODE_SV     := $(PKG) $(SRC_DIR)/decode_unit.sv $(TB_DIR)/tb_decode_unit.sv
 CONTROL_SV    := $(PKG) \
+                 $(FP32_PKG) \
                  $(SRC_DIR)/decode_unit.sv \
                  $(SRC_DIR)/fetch_unit.sv \
                  $(SRC_DIR)/control_unit.sv \
@@ -45,11 +47,11 @@ CONTROL_SV    := $(PKG) \
                  $(SRC_DIR)/dma_engine.sv \
                  $(SRC_DIR)/taccel_top.sv
 
-.PHONY: all run_program test_decode test_control test_dma test_helpers test_sfu \
+.PHONY: all run_program test_decode test_control test_dma test_helpers test_fp32_prims test_sfu \
         test_systolic test_systolic_array_chained test_systolic_chained \
         test_systolic_query test_systolic_qkt clean
 
-all: test_decode test_control test_dma test_helpers test_sfu test_systolic
+all: test_decode test_control test_dma test_helpers test_fp32_prims test_sfu test_systolic
 
 # -----------------------------------------------------------------------
 # run_program: build the full-program Verilator runner
@@ -142,6 +144,25 @@ $(BUILD_DIR)/test_helpers/Vtaccel_top: $(CONTROL_SV) test_helpers.cpp
 test_helpers: $(BUILD_DIR)/test_helpers/Vtaccel_top
 	@echo "--- Running helper engine tests ---"
 	$(BUILD_DIR)/test_helpers/Vtaccel_top
+
+# -----------------------------------------------------------------------
+# test_fp32_prims: verilate standalone FP32 primitive package exerciser
+# -----------------------------------------------------------------------
+$(BUILD_DIR)/test_fp32_prims/Vtb_fp32_prim: $(FP32_PKG) $(TB_DIR)/tb_fp32_prim.sv test_fp32_prims.cpp
+	mkdir -p $(BUILD_DIR)/test_fp32_prims
+	$(VERILATOR) $(VFLAGS) \
+	  -I$(INCLUDE_DIR) \
+	  --top-module tb_fp32_prim \
+	  --Mdir $(BUILD_DIR)/test_fp32_prims \
+	  $(FP32_PKG) \
+	  $(TB_DIR)/tb_fp32_prim.sv \
+	  test_fp32_prims.cpp \
+	  -CFLAGS "-I$(CURDIR)/include $(CXXFLAGS)"
+	$(MAKE) -C $(BUILD_DIR)/test_fp32_prims -f Vtb_fp32_prim.mk
+
+test_fp32_prims: $(BUILD_DIR)/test_fp32_prims/Vtb_fp32_prim
+	@echo "--- Running FP32 primitive tests ---"
+	$(BUILD_DIR)/test_fp32_prims/Vtb_fp32_prim
 
 # -----------------------------------------------------------------------
 # test_sfu: verilate taccel_top (with Stage D SFU) + compile + run

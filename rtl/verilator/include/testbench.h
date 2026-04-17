@@ -45,22 +45,6 @@ inline int sfu_round_half_even_fp32_scalar(float x) {
     return static_cast<int>(floor_i);
 }
 
-extern "C" double sfu_fp32_round(double value_r) {
-    return static_cast<double>(static_cast<float>(value_r));
-}
-
-extern "C" double sfu_fp32_add(double lhs_r, double rhs_r) {
-    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) + static_cast<float>(rhs_r)));
-}
-
-extern "C" double sfu_fp32_sub(double lhs_r, double rhs_r) {
-    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) - static_cast<float>(rhs_r)));
-}
-
-extern "C" double sfu_fp32_mul(double lhs_r, double rhs_r) {
-    return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) * static_cast<float>(rhs_r)));
-}
-
 extern "C" double sfu_fp32_div(double lhs_r, double rhs_r) {
     return static_cast<double>(static_cast<float>(static_cast<float>(lhs_r) / static_cast<float>(rhs_r)));
 }
